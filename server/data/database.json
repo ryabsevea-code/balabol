@@ -1,0 +1,112 @@
+{
+  "users": [
+    {
+      "id": "u-alex",
+      "username": "Alex_Gamer",
+      "email": "alex@balabol.local",
+      "passwordHash": "$2b$08$qX/ZCr4EtRsuUHlZkhd7BeabqRIbqy1nM4q.2Ywdf.w/uEJUNbppS",
+      "avatar": "https://api.dicebear.com/7.x/bottts/svg?seed=Alex",
+      "status": "online",
+      "customStatus": "Играет в Balabol",
+      "createdAt": "2026-09-21T16:05:06.500Z"
+    },
+    {
+      "id": "u-dmitry",
+      "username": "Dmitry_PRO",
+      "email": "dmitry@balabol.local",
+      "passwordHash": "$2b$08$qX/ZCr4EtRsuUHlZkhd7BeabqRIbqy1nM4q.2Ywdf.w/uEJUNbppS",
+      "avatar": "https://api.dicebear.com/7.x/bottts/svg?seed=Dmitry",
+      "status": "online",
+      "customStatus": "В голосовом канале",
+      "createdAt": "2026-09-21T16:05:06.500Z"
+    },
+    {
+      "id": "u-elena",
+      "username": "Elena_Streamer",
+      "email": "elena@balabol.local",
+      "passwordHash": "$2b$08$qX/ZCr4EtRsuUHlZkhd7BeabqRIbqy1nM4q.2Ywdf.w/uEJUNbppS",
+      "avatar": "https://api.dicebear.com/7.x/bottts/svg?seed=Elena",
+      "status": "idle",
+      "customStatus": "Отошла за чаем",
+      "createdAt": "2026-09-21T16:05:06.500Z"
+    }
+  ],
+  "servers": [
+    {
+      "id": "s-main",
+      "name": "Сервер Балаболов",
+      "icon": "https://api.dicebear.com/7.x/identicon/svg?seed=Balabol",
+      "ownerId": "u-alex",
+      "channelIds": [
+        "c-general",
+        "c-gaming",
+        "c-memes",
+        "v-lounge",
+        "v-gaming-1",
+        "v-chill"
+      ]
+    }
+  ],
+  "channels": [
+    {
+      "id": "c-general",
+      "serverId": "s-main",
+      "name": "общий-чат",
+      "type": "text",
+      "description": "Главный текстовый канал для общения"
+    },
+    {
+      "id": "c-gaming",
+      "serverId": "s-main",
+      "name": "игры",
+      "type": "text",
+      "description": "Обсуждение игр, стратегий и пати"
+    },
+    {
+      "id": "c-memes",
+      "serverId": "s-main",
+      "name": "мемы-и-флуд",
+      "type": "text",
+      "description": "Картинки, приколы и свободное общение"
+    },
+    {
+      "id": "v-lounge",
+      "serverId": "s-main",
+      "name": "Гостиная",
+      "type": "voice",
+      "description": "Основной голосовой канал"
+    },
+    {
+      "id": "v-gaming-1",
+      "serverId": "s-main",
+      "name": "Катка 1",
+      "type": "voice",
+      "description": "Тактический голосовой канал"
+    },
+    {
+      "id": "v-chill",
+      "serverId": "s-main",
+      "name": "Чиллаут",
+      "type": "voice",
+      "description": "Голос для спокойных бесед"
+    }
+  ],
+  "messages": [
+    {
+      "id": "m-1",
+      "channelId": "c-general",
+      "authorId": "u-alex",
+      "content": "Добро пожаловать в Balabol! Это наш собственный независимый голосовой и текстовый сервер.",
+      "createdAt": "2026-09-21T15:05:06.500Z"
+    },
+    {
+      "id": "m-2",
+      "channelId": "c-general",
+      "authorId": "u-dmitry",
+      "content": "Привет! Качество звука в WebRTC отличное, и теперь можно регулировать громкость каждого тиммейта прямо тут!",
+      "createdAt": "2026-09-21T15:35:06.500Z"
+    }
+  ],
+  "dms": [],
+  "dmMessages": []
+}

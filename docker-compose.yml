@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  balabol:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: balabol-app
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./server/data:/app/server/data
+    environment:
+      - PORT=3001
+      - NODE_ENV=production
+      - JWT_SECRET=balabol-super-secret-key-change-in-production
+
+  # Опциональный автоматический HTTPS через Caddy (получает SSL-сертификат сам)
+  # Раскомментируйте, когда привяжете домен к вашему статическому IP
+  # caddy:
+  #   image: caddy:alpine
+  #   container_name: balabol-caddy
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile
+  #     - caddy_data:/data
+  #     - caddy_config:/config
+  #   depends_on:
+  #     - balabol
+
+# volumes:
+#   caddy_data:
+#   caddy_config:
