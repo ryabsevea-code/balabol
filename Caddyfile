@@ -1,0 +1,6 @@
+# Замените your-domain.com на ваш домен (или бесплатный DuckDNS)
+# Caddy автоматически сам получит и обновит бесплатный SSL-сертификат Let's Encrypt!
+
+# your-domain.com {
+#     reverse_proxy balabol:3001
+# }
