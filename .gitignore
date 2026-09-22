@@ -1,12 +1,23 @@
-# Dependencies
-node_modules/
-client/node_modules/
-server/node_modules/
+# Rust build artifacts
+target/
+**/target/
+Cargo.lock
 
-# Production builds
+# Node / Frontend
+node_modules/
+**/node_modules/
 dist/
-client/dist/
-server/dist/
+**/dist/
+
+# SQLite runtime databases
+*.db
+*.db-wal
+*.db-shm
+balabol_data.db*
+
+# Tauri bundle artifacts
+**/gen/
+**/src-tauri/target/
 
 # Environment variables
 .env
@@ -14,10 +25,9 @@ server/dist/
 .env.*.local
 
 # Logs
+*.log
 npm-debug.log*
 yarn-debug.log*
-yarn-error.log*
-*.log
 
 # Editor & OS files
 .vscode/
@@ -25,5 +35,5 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
-# Optional: User database runtime data (exclude local data if personal)
-# server/data/database.json
+# Pending deletion / temporary
+client_delete_pending/

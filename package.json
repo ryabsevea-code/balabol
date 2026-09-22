@@ -1,9 +1,0 @@
-{
-  "name": "balabol",
-  "version": "1.0.0",
-  "description": "Balabol - Self-hosted Discord Analog with WebRTC Voice, Text, and Noise Suppression",
-  "scripts": {
-    "dev:server": "cd server && npm run dev",
-    "dev:client": "cd client && npm run dev"
-  }
-}
