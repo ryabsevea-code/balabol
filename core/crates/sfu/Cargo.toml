@@ -1,0 +1,15 @@
+[package]
+name = "balabol-sfu"
+version = "0.1.0"
+edition = "2021"
+description = "Selective Forwarding Unit (SFU) router and Raft-like supernode election for Balabol"
+
+[dependencies]
+balabol-crypto = { path = "../crypto" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }
