@@ -442,13 +442,15 @@ impl BalabolEngine {
                                         bio: Some(src.to_string()),
                                     });
 
-                                    // Reply with our own InviteExchange so remote side registers us
+                                    // Make sure we reply with our own InviteExchange so remote side registers us
                                     let my_ep = if let Some(ext) = *pub_ep_lock.read() {
                                         ext.to_string()
                                     } else {
                                         let lan_ip = balabol_net::detect_local_lan_ip();
                                         format!("{}:{}", lan_ip, *udp_port_lock.read())
                                     };
+
+                                    // Ensure we reply multiple times so UDP NAT hole punching is robust
                                     let reply = BalabolPacket::new(
                                         my_id.clone(),
                                         PacketPayload::InviteExchange {
@@ -458,7 +460,13 @@ impl BalabolEngine {
                                         },
                                     );
                                     if let Ok(reply_bytes) = reply.to_bytes() {
-                                        let _ = sock_clone.send_to(&reply_bytes, src).await;
+                                        let sock_clone_for_reply = sock_clone.clone();
+                                        tokio::spawn(async move {
+                                            for _ in 0..5 {
+                                                let _ = sock_clone_for_reply.send_to(&reply_bytes, src).await;
+                                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                            }
+                                        });
                                     }
                                 }
                                 PacketPayload::RoomInvite {
@@ -1152,6 +1160,11 @@ impl BalabolEngine {
         };
         self.storage.save_channel(&text_ch)?;
         self.storage.save_channel(&voice_ch)?;
+
+        // Ensure local user is added to the newly created room
+        let my_id = self.user_id();
+        let _ = self.storage.add_room_member(&room.id, &my_id, "owner");
+
         Ok(room)
     }
 
