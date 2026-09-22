@@ -300,10 +300,13 @@
     const target = directCode || friendInviteInput.trim();
     if (!target) return;
     try {
+      // 1. Actually add the friend to local database so they appear in contacts.
+      // Even if friendNameInput is empty, we should still register them with a default name.
+      await invoke('add_friend', { name: friendNameInput.trim() || 'Новый друг', inviteOrId: target });
+
+      // 2. Try to connect to them.
       await invoke('connect_direct', { endpointOrInvite: target });
-      if (friendNameInput.trim()) {
-        await invoke('add_friend', { name: friendNameInput.trim(), inviteOrId: target });
-      }
+
       friendInviteInput = '';
       friendNameInput = '';
       showAddFriendModal = false;

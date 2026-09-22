@@ -257,11 +257,29 @@ fn leave_room_voice(room_id: String, state: State<'_, AppState>) -> Result<(), S
     state.engine.leave_room_voice(&room_id).map_err(|e| e.to_string())
 }
 
+use std::fs;
+use balabol_engine::Identity;
+
 pub fn run() {
     tracing_subscriber::fmt::init();
 
-    let app_data_dir = std::env::current_dir().unwrap().join("balabol_data.db");
-    let engine = BalabolEngine::init(None, app_data_dir).expect("Failed to initialize Balabol Engine");
+    let app_dir = std::env::current_dir().unwrap();
+    let app_data_dir = app_dir.join("balabol_data.db");
+    let identity_file = app_dir.join("identity.hex");
+
+    let identity = if identity_file.exists() {
+        let hex = fs::read_to_string(&identity_file).unwrap_or_default();
+        Identity::from_seed_hex(hex.trim()).ok()
+    } else {
+        None
+    };
+
+    let engine = BalabolEngine::init(identity, app_data_dir).expect("Failed to initialize Balabol Engine");
+
+    // Save the identity if it was newly generated
+    let new_hex = engine.identity.to_seed_hex();
+    let _ = fs::write(&identity_file, new_hex);
+
     engine.ensure_network_started();
 
     tauri::Builder::default()
