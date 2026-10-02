@@ -130,6 +130,7 @@ pub struct P2pNode {
     peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
     active_socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
     active_peer_addr: Arc<RwLock<Option<SocketAddr>>>,
+    relay_sender: Arc<RwLock<Option<tokio::sync::mpsc::Sender<Packet>>>>,
     chat_messages: Arc<RwLock<Vec<ChatMessage>>>,
     seen_msg_ids: Arc<RwLock<HashSet<u64>>>,
     pending_acks: Arc<RwLock<HashMap<u64, oneshot::Sender<()>>>>,
@@ -146,6 +147,7 @@ impl P2pNode {
             peers: Arc::new(RwLock::new(HashMap::new())),
             active_socket: Arc::new(RwLock::new(None)),
             active_peer_addr: Arc::new(RwLock::new(None)),
+            relay_sender: Arc::new(RwLock::new(None)),
             chat_messages: Arc::new(RwLock::new(Vec::new())),
             seen_msg_ids: Arc::new(RwLock::new(HashSet::new())),
             pending_acks: Arc::new(RwLock::new(HashMap::new())),
@@ -189,10 +191,19 @@ impl P2pNode {
                 }
             }
         }
+        if let Some(relay_tx) = self.relay_sender.read().clone() {
+            let disc = Packet::Disconnect {
+                reason: "Пользователь вышел из комнаты".into(),
+            };
+            tokio::spawn(async move {
+                let _ = relay_tx.send(disc).await;
+            });
+        }
 
         self.logger.info("Отключение P2P соединения...");
         *self.active_socket.write() = None;
         *self.active_peer_addr.write() = None;
+        *self.relay_sender.write() = None;
         self.peers.write().clear();
         self.seen_msg_ids.write().clear();
         self.pending_acks.write().clear();
@@ -200,23 +211,20 @@ impl P2pNode {
         self.logger.info("Состояние сброшено в Disconnected");
     }
 
-    /// Send a text message to the connected peer over P2P with guaranteed delivery (ACK retry loop)
+    /// Send a text message to the connected peer over P2P/Relay with guaranteed delivery (ACK retry loop)
     pub async fn send_chat_message(&self, text: String, my_name: String) -> Result<ChatMessage, String> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Err("Сообщение не может быть пустым".into());
         }
 
-        let sock = self
-            .active_socket
-            .read()
-            .clone()
-            .ok_or_else(|| "Нет активного сокета (вы не подключены)".to_string())?;
+        let sock_opt = self.active_socket.read().clone();
+        let peer_addr_opt = *self.active_peer_addr.read();
+        let relay_tx_opt = self.relay_sender.read().clone();
 
-        let peer_addr = self
-            .active_peer_addr
-            .read()
-            .ok_or_else(|| "Нет подключенного собеседника".to_string())?;
+        if peer_addr_opt.is_none() && relay_tx_opt.is_none() {
+            return Err("Нет подключенного собеседника".to_string());
+        }
 
         // Generate globally unique message ID using random 63-bit integer to prevent any peer collisions
         let id = (rand::random::<u64>() & 0x7FFF_FFFF_FFFF_FFFF).max(1);
@@ -232,31 +240,50 @@ impl P2pNode {
             timestamp_ms,
         };
 
-        let encoded = packet
-            .encode()
-            .map_err(|e| format!("Ошибка кодирования сообщения: {}", e))?;
+        if let (Some(sock), Some(peer_addr)) = (sock_opt, peer_addr_opt) {
+            let encoded = packet
+                .encode()
+                .map_err(|e| format!("Ошибка кодирования сообщения: {}", e))?;
 
-        // Register ACK oneshot
-        let (ack_tx, mut ack_rx) = oneshot::channel();
-        self.pending_acks.write().insert(id, ack_tx);
+            // Register ACK oneshot
+            let (ack_tx, mut ack_rx) = oneshot::channel();
+            self.pending_acks.write().insert(id, ack_tx);
 
-        // Spawn retry loop in background: sends up to 6 times (every 200ms) until ACK is received
-        let sock_clone = sock.clone();
-        let enc_clone = encoded.clone();
-        let pending_clone = self.pending_acks.clone();
-        tokio::spawn(async move {
-            for _ in 0..6 {
-                let _ = sock_clone.send_to(&enc_clone, peer_addr).await;
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(200)) => {},
-                    _ = &mut ack_rx => {
-                        return;
+            // Spawn retry loop in background: sends up to 6 times (every 200ms) until ACK is received
+            let sock_clone = sock.clone();
+            let enc_clone = encoded.clone();
+            let pending_clone = self.pending_acks.clone();
+            tokio::spawn(async move {
+                for _ in 0..6 {
+                    let _ = sock_clone.send_to(&enc_clone, peer_addr).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => {},
+                        _ = &mut ack_rx => {
+                            return;
+                        }
                     }
                 }
-            }
-            pending_clone.write().remove(&id);
-        });
+                pending_clone.write().remove(&id);
+            });
+        } else if let Some(relay_tx) = relay_tx_opt {
+            let (ack_tx, mut ack_rx) = oneshot::channel();
+            self.pending_acks.write().insert(id, ack_tx);
 
+            let pending_clone = self.pending_acks.clone();
+            let pkt_clone = packet.clone();
+            tokio::spawn(async move {
+                for _ in 0..4 {
+                    let _ = relay_tx.send(pkt_clone.clone()).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(400)) => {},
+                        _ = &mut ack_rx => {
+                            return;
+                        }
+                    }
+                }
+                pending_clone.write().remove(&id);
+            });
+        }
 
         let msg = ChatMessage {
             id,
@@ -291,13 +318,13 @@ impl P2pNode {
         let socket = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(|e| format!("Не удалось создать UDP сокет: {}", e))?;
-        configure_socket_physical_if(&socket, &self.logger);
+        let opt_physical_ip = configure_socket_physical_if(&socket, &self.logger);
         let actual_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
         let arc_socket = Arc::new(socket);
         *self.active_socket.write() = Some(arc_socket.clone());
 
         // 2. Gather candidates (LAN + STUN)
-        let candidates = gather_candidates(arc_socket.clone(), actual_port, &self.logger).await;
+        let candidates = gather_candidates(arc_socket.clone(), actual_port, opt_physical_ip, &self.logger).await;
 
         let local_str = candidates.first().map(|a| a.to_string());
         let pub_str = candidates.iter().find(|a| !a.ip().is_loopback() && a.to_string() != local_str.clone().unwrap_or_default()).map(|a| a.to_string());
@@ -318,6 +345,7 @@ impl P2pNode {
         let status_clone = self.status.clone();
         let peers_clone = self.peers.clone();
         let active_peer_clone = self.active_peer_addr.clone();
+        let relay_sender_clone = self.relay_sender.clone();
         let chat_clone = self.chat_messages.clone();
         let seen_msg_clone = self.seen_msg_ids.clone();
         let pending_clone = self.pending_acks.clone();
@@ -346,12 +374,14 @@ impl P2pNode {
                                 sock_clone,
                                 host_name,
                                 room_name,
+                                code_for_task,
                                 answer.name,
                                 answer.candidates,
                                 my_candidates,
                                 status_clone,
                                 peers_clone,
                                 active_peer_clone,
+                                relay_sender_clone,
                                 chat_clone,
                                 seen_msg_clone,
                                 pending_clone,
@@ -403,13 +433,13 @@ impl P2pNode {
         let socket = UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(|e| format!("Не удалось создать UDP сокет: {}", e))?;
-        configure_socket_physical_if(&socket, &self.logger);
+        let opt_physical_ip = configure_socket_physical_if(&socket, &self.logger);
         let actual_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
         let arc_socket = Arc::new(socket);
         *self.active_socket.write() = Some(arc_socket.clone());
 
         // 2. Gather candidates (LAN + STUN)
-        let candidates = gather_candidates(arc_socket.clone(), actual_port, &self.logger).await;
+        let candidates = gather_candidates(arc_socket.clone(), actual_port, opt_physical_ip, &self.logger).await;
         let answer_link = create_answer_link(&nickname, candidates.clone());
 
         // 3. Exchange via Signaling broker
@@ -418,6 +448,7 @@ impl P2pNode {
         let status_clone = self.status.clone();
         let peers_clone = self.peers.clone();
         let active_peer_clone = self.active_peer_addr.clone();
+        let relay_sender_clone = self.relay_sender.clone();
         let chat_clone = self.chat_messages.clone();
         let seen_msg_clone = self.seen_msg_ids.clone();
         let pending_clone = self.pending_acks.clone();
@@ -425,9 +456,10 @@ impl P2pNode {
         let client_name = nickname.clone();
         let next_id = self.next_peer_id.clone();
         let my_candidates = candidates.clone();
+        let code_for_task = clean_code.clone();
 
         let task = tokio::spawn(async move {
-            let offer_res = MqttSignaling::client_exchange(&clean_code, &answer_link, Duration::from_secs(45), &logger_clone).await;
+            let offer_res = MqttSignaling::client_exchange(&code_for_task, &answer_link, Duration::from_secs(45), &logger_clone).await;
 
             if shutdown_clone.load(Ordering::Relaxed) {
                 return;
@@ -442,12 +474,14 @@ impl P2pNode {
                                 sock_clone,
                                 client_name,
                                 offer.room,
+                                code_for_task,
                                 offer.name,
                                 offer.candidates,
                                 my_candidates,
                                 status_clone,
                                 peers_clone,
                                 active_peer_clone,
+                                relay_sender_clone,
                                 chat_clone,
                                 seen_msg_clone,
                                 pending_clone,
@@ -478,18 +512,19 @@ impl P2pNode {
 async fn gather_candidates(
     socket: Arc<UdpSocket>,
     port: u16,
+    opt_physical_ip: Option<Ipv4Addr>,
     logger: &AppLogger,
 ) -> Vec<SocketAddr> {
     let mut list = Vec::new();
 
-    // 1. Local LAN IP
-    let lan_ip = detect_local_lan_ip();
+    // 1. Local LAN IP: prioritize chosen physical interface IP, fallback to auto-detection
+    let lan_ip = opt_physical_ip.map(IpAddr::V4).unwrap_or_else(detect_local_lan_ip);
     let local_addr = SocketAddr::new(lan_ip, port);
     list.push(local_addr);
     logger.info(&format!("Локальный адрес кандидата: {}", local_addr));
 
     // 2. STUN Public IP
-    if let Some(pub_addr) = discover_public_ip_via_stun(socket).await {
+    if let Some(pub_addr) = discover_public_ip_via_stun(socket, logger).await {
         logger.info(&format!("STUN публичный адрес кандидата: {}", pub_addr));
         if !list.contains(&pub_addr) {
             list.push(pub_addr);
@@ -508,7 +543,7 @@ fn expand_candidates_with_port_spray(candidates: &[SocketAddr]) -> Vec<SocketAdd
         targets.push(addr);
         if let SocketAddr::V4(v4) = addr {
             let port = v4.port();
-            for delta in [-3i32, -2, -1, 1, 2, 3] {
+            for delta in [-5i32, -4, -3, -2, -1, 1, 2, 3, 4, 5] {
                 let p = port as i32 + delta;
                 if (1024..=65535).contains(&p) {
                     let sprayed = SocketAddr::new(IpAddr::V4(*v4.ip()), p as u16);
@@ -527,12 +562,14 @@ async fn run_simultaneous_punching_flow(
     socket: Arc<UdpSocket>,
     my_name: String,
     room_name: String,
+    room_code: String,
     peer_name_expected: String,
     remote_candidates: Vec<SocketAddr>,
     _my_candidates: Vec<SocketAddr>,
     status: Arc<RwLock<ConnectionStatus>>,
     peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
     active_peer: Arc<RwLock<Option<SocketAddr>>>,
+    relay_sender: Arc<RwLock<Option<tokio::sync::mpsc::Sender<Packet>>>>,
     chat_messages: Arc<RwLock<Vec<ChatMessage>>>,
     seen_msg_ids: Arc<RwLock<HashSet<u64>>>,
     pending_acks: Arc<RwLock<HashMap<u64, oneshot::Sender<()>>>>,
@@ -550,8 +587,8 @@ async fn run_simultaneous_punching_flow(
     *status.write() = ConnectionStatus::Connecting {
         target_str: peer_name_expected.clone(),
         attempt: 1,
-        max_attempts: 1,
-        mode: "Пробитие NAT / Рукопожатие...".into(),
+        max_attempts: 2,
+        mode: "Пробитие прямого NAT / Рукопожатие...".into(),
     };
 
     let punch_pkt = Packet::Punch {
@@ -568,12 +605,12 @@ async fn run_simultaneous_punching_flow(
 
     let mut buf = [0u8; 4096];
     let punch_start = Instant::now();
-    let punch_timeout = Duration::from_secs(12); // Extended timeout for mobile networks
+    let punch_timeout = Duration::from_secs(7);
     let mut last_blast = Instant::now() - Duration::from_secs(1);
     let mut connected_endpoint: Option<SocketAddr> = None;
     let mut resolved_peer_name = peer_name_expected.clone();
 
-    // PHASE 1: SIMULTANEOUS HOLE PUNCHING (up to 12 seconds)
+    // PHASE 1: SIMULTANEOUS HOLE PUNCHING (up to 7 seconds)
     while punch_start.elapsed() < punch_timeout && !shutdown.load(Ordering::Relaxed) {
         // Send punch packets to all targets every 80ms
         if last_blast.elapsed() >= Duration::from_millis(80) {
@@ -641,18 +678,82 @@ async fn run_simultaneous_punching_flow(
     let active_addr = match connected_endpoint {
         Some(addr) => addr,
         None => {
-            let err = format!(
-                "Не удалось пробить NAT с собеседником '{}' после 12 секунд встречных попыток. Проверьте соединение и попробуйте снова.",
-                peer_name_expected
-            );
-            logger.error(&err);
-            *status.write() = ConnectionStatus::Failed { error: err };
-            return;
+            logger.warn(&format!(
+                "Прямое UDP пробитие NAT не удалось после {}с (возможно, блокировка UDP провайдером или Symmetric NAT). Включаем резервный WSS релей...",
+                punch_timeout.as_secs()
+            ));
+
+            *status.write() = ConnectionStatus::Connecting {
+                target_str: peer_name_expected.clone(),
+                attempt: 2,
+                max_attempts: 2,
+                mode: "Подключение через WSS релей...".into(),
+            };
+
+            match crate::signaling::MqttSignaling::start_relay_session(&room_code, &my_name, &logger).await {
+                Ok(relay_session) => {
+                    logger.info("Резервный релейный канал успешно активирован!");
+                    *active_peer.write() = None;
+                    *relay_sender.write() = Some(relay_session.outgoing_tx.clone());
+
+                    let peer_id = next_peer_id.fetch_add(1, Ordering::SeqCst);
+                    let relay_virtual_addr = "127.0.0.1:443".parse::<SocketAddr>().unwrap();
+
+                    peers.write().insert(
+                        relay_virtual_addr,
+                        PeerInfo {
+                            id: peer_id,
+                            name: peer_name_expected.clone(),
+                            addr: "Релей (WSS TLS/443)".into(),
+                            ping_ms: 35,
+                            last_seen_ms: now_ms(),
+                        },
+                    );
+
+                    *status.write() = ConnectionStatus::Connected {
+                        peer_name: peer_name_expected.clone(),
+                        peer_addr: "Релей (WSS TLS/443)".into(),
+                        room_name: room_name.clone(),
+                        ping_ms: 35,
+                    };
+
+                    logger.info("============================================================");
+                    logger.info(&format!(
+                        "P2P СОЕДИНЕНИЕ УСТАНОВЛЕНО ЧЕРЕЗ WSS-РЕЛЕЙ! Собеседник: '{}'",
+                        peer_name_expected
+                    ));
+                    logger.info("============================================================");
+
+                    run_relay_connected_loop(
+                        relay_session,
+                        my_name,
+                        peer_name_expected,
+                        status,
+                        peers,
+                        chat_messages,
+                        seen_msg_ids,
+                        pending_acks,
+                        shutdown,
+                        logger,
+                    ).await;
+                    return;
+                }
+                Err(e) => {
+                    let err = format!(
+                        "Не удалось установить ни прямое P2P соединение, ни подключение через релей: {}",
+                        e
+                    );
+                    logger.error(&err);
+                    *status.write() = ConnectionStatus::Failed { error: err };
+                    return;
+                }
+            }
         }
     };
 
-    // PHASE 2: CONNECTED STATE
+    // PHASE 2: DIRECT UDP CONNECTED STATE
     *active_peer.write() = Some(active_addr);
+    *relay_sender.write() = None;
     let peer_id = next_peer_id.fetch_add(1, Ordering::SeqCst);
 
     peers.write().insert(
@@ -829,6 +930,126 @@ async fn run_simultaneous_punching_flow(
     }
 }
 
+/// Active session loop for Relay (Nostr WSS TLS/443) fallback
+async fn run_relay_connected_loop(
+    mut relay_session: crate::signaling::RelaySession,
+    my_name: String,
+    _peer_name_expected: String,
+    status: Arc<RwLock<ConnectionStatus>>,
+    peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
+    chat_messages: Arc<RwLock<Vec<ChatMessage>>>,
+    seen_msg_ids: Arc<RwLock<HashSet<u64>>>,
+    pending_acks: Arc<RwLock<HashMap<u64, oneshot::Sender<()>>>>,
+    shutdown: Arc<AtomicBool>,
+    logger: AppLogger,
+) {
+    let mut last_ping_sent = Instant::now();
+    let mut ping_seq = 0u64;
+    let relay_virtual_addr = "127.0.0.1:443".parse::<SocketAddr>().unwrap();
+
+    // Send initial Punch packet through relay to guarantee mutual session activation
+    let init_punch = Packet::Punch {
+        nonce: rand::random(),
+        sender_name: my_name.clone(),
+    };
+    let _ = relay_session.outgoing_tx.send(init_punch).await;
+
+    while !shutdown.load(Ordering::Relaxed) {
+        // Send Ping every 2 seconds over relay to measure latency and keep alive
+        if last_ping_sent.elapsed() >= Duration::from_millis(2000) {
+            ping_seq += 1;
+            let ping_pkt = Packet::Ping {
+                seq: ping_seq,
+                timestamp_ms: now_ms(),
+            };
+            let _ = relay_session.outgoing_tx.send(ping_pkt).await;
+            last_ping_sent = Instant::now();
+        }
+
+        tokio::select! {
+            recv_opt = relay_session.incoming_rx.recv() => {
+                match recv_opt {
+                    Some(pkt) => {
+                        match pkt {
+                            Packet::Ping { seq, timestamp_ms } => {
+                                let pong = Packet::Pong { seq, timestamp_ms };
+                                let _ = relay_session.outgoing_tx.send(pong).await;
+                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
+                                    p.last_seen_ms = now_ms();
+                                }
+                            }
+                            Packet::Pong { timestamp_ms, .. } => {
+                                let rtt = (now_ms().saturating_sub(timestamp_ms) as u32).max(1);
+                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
+                                    p.ping_ms = rtt;
+                                    p.last_seen_ms = now_ms();
+                                }
+                                let mut st = status.write();
+                                if let ConnectionStatus::Connected { ping_ms, .. } = &mut *st {
+                                    *ping_ms = rtt;
+                                }
+                            }
+                            Packet::TextMessage { id, text, sender_name, timestamp_ms } => {
+                                // Send TextAck back through relay
+                                let ack = Packet::TextAck { id };
+                                let _ = relay_session.outgoing_tx.send(ack).await;
+
+                                let is_new = seen_msg_ids.write().insert(id);
+                                if is_new {
+                                    logger.info(&format!("[ЧАТ Релей] {}: {}", sender_name, text));
+                                    chat_messages.write().push(ChatMessage {
+                                        id,
+                                        sender: sender_name,
+                                        text,
+                                        timestamp_ms,
+                                        is_me: false,
+                                    });
+                                }
+                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
+                                    p.last_seen_ms = now_ms();
+                                }
+                            }
+                            Packet::TextAck { id } => {
+                                if let Some(tx) = pending_acks.write().remove(&id) {
+                                    let _ = tx.send(());
+                                }
+                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
+                                    p.last_seen_ms = now_ms();
+                                }
+                            }
+                            Packet::Punch { nonce, .. } => {
+                                let ack = Packet::PunchAck { nonce, sender_name: my_name.clone() };
+                                let _ = relay_session.outgoing_tx.send(ack).await;
+                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
+                                    p.last_seen_ms = now_ms();
+                                }
+                            }
+                            Packet::PunchAck { .. } => {
+                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
+                                    p.last_seen_ms = now_ms();
+                                }
+                            }
+                            Packet::Disconnect { reason } => {
+                                logger.warn(&format!("Собеседник отключил связь (релей): {}", reason));
+                                *status.write() = ConnectionStatus::Failed {
+                                    error: format!("Собеседник отключился: {}", reason),
+                                };
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    None => {
+                        logger.warn("Канал релея закрыт");
+                        break;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+}
+
 pub fn detect_local_lan_ip() -> IpAddr {
     if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
         if socket.connect("8.8.8.8:80").is_ok() {
@@ -842,11 +1063,18 @@ pub fn detect_local_lan_ip() -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
 }
 
-async fn discover_public_ip_via_stun(socket: Arc<UdpSocket>) -> Option<SocketAddr> {
+async fn discover_public_ip_via_stun(socket: Arc<UdpSocket>, logger: &AppLogger) -> Option<SocketAddr> {
     const STUN_SERVERS: &[&str] = &[
+        "stun.cloudflare.com:3478",
+        "stun.syncthing.net:3478",
+        "stun.miwifi.com:3478",
+        "stun.chat.bilibili.com:3478",
+        "stun.nextcloud.com:3478",
+        "stun.sipnet.ru:3478",
         "stun.l.google.com:19302",
         "stun1.l.google.com:19302",
-        "stun.cloudflare.com:3478",
+        "stun2.l.google.com:19302",
+        "stun.voip.blackberry.com:3478",
     ];
 
     let mut tx_id = [0u8; 12];
@@ -861,29 +1089,70 @@ async fn discover_public_ip_via_stun(socket: Arc<UdpSocket>) -> Option<SocketAdd
     req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes()); // Magic Cookie
     req[8..20].copy_from_slice(&tx_id);
 
-    let mut buf = [0u8; 512];
+    // 1. Resolve hostnames in parallel with short timeout
+    let mut resolve_tasks = Vec::new();
+    for &server in STUN_SERVERS {
+        resolve_tasks.push(async move {
+            tokio::time::timeout(Duration::from_millis(800), tokio::net::lookup_host(server)).await
+        });
+    }
 
-    for server in STUN_SERVERS {
-        if let Ok(addrs) = tokio::net::lookup_host(server).await {
-            for target in addrs {
-                let _ = socket.send_to(&req, target).await;
-
-                let timeout = tokio::time::sleep(Duration::from_millis(600));
-                tokio::pin!(timeout);
-
-                tokio::select! {
-                    res = socket.recv_from(&mut buf) => {
-                        if let Ok((len, from)) = res {
-                            if from == target && len >= 20 {
-                                if let Some(pub_addr) = parse_stun_response(&buf[..len], &tx_id) {
-                                    return Some(pub_addr);
-                                }
-                            }
-                        }
+    let mut targets = Vec::new();
+    let results = futures_util::future::join_all(resolve_tasks).await;
+    for res in results {
+        if let Ok(Ok(addrs)) = res {
+            for addr in addrs {
+                // IMPORTANT: Filter out IPv6 to prevent WSAEAFNOSUPPORT error on IPv4 socket
+                if let SocketAddr::V4(_) = addr {
+                    if !targets.contains(&addr) {
+                        targets.push(addr);
                     }
-                    _ = &mut timeout => {}
                 }
             }
+        }
+    }
+
+    if targets.is_empty() {
+        logger.warn("STUN: Не удалось разрешить STUN-серверы (проверьте интернет)");
+        return None;
+    }
+
+    targets.truncate(8);
+
+    // 2. Parallel blast to all targets
+    for &t in &targets {
+        let _ = socket.send_to(&req, t).await;
+    }
+
+    let mut buf = [0u8; 512];
+    let start_time = Instant::now();
+    let mut last_reblast = Instant::now();
+    let overall_timeout = Duration::from_millis(2500);
+
+    // 3. Fast response collection with 400ms retry
+    while start_time.elapsed() < overall_timeout {
+        if last_reblast.elapsed() >= Duration::from_millis(400) {
+            for &t in &targets {
+                let _ = socket.send_to(&req, t).await;
+            }
+            last_reblast = Instant::now();
+        }
+
+        let recv_timeout = tokio::time::sleep(Duration::from_millis(150));
+        tokio::pin!(recv_timeout);
+
+        tokio::select! {
+            res = socket.recv_from(&mut buf) => {
+                if let Ok((len, from)) = res {
+                    if len >= 20 {
+                        if let Some(pub_addr) = parse_stun_response(&buf[..len], &tx_id) {
+                            logger.info(&format!("STUN: получен ответ от {} -> публичный адрес: {}", from, pub_addr));
+                            return Some(pub_addr);
+                        }
+                    }
+                }
+            }
+            _ = &mut recv_timeout => {}
         }
     }
 
@@ -934,6 +1203,14 @@ fn parse_stun_response(buf: &[u8], tx_id: &[u8; 12]) -> Option<SocketAddr> {
                     port,
                 ));
             }
+        } else if attr_type == 0x0001 && attr_len >= 8 {
+            // Standard MAPPED-ADDRESS (0x0001)
+            let family = buf[offset + 1];
+            let port = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
+            if family == 0x01 {
+                let ip = Ipv4Addr::new(buf[offset + 4], buf[offset + 5], buf[offset + 6], buf[offset + 7]);
+                return Some(SocketAddr::new(IpAddr::V4(ip), port));
+            }
         }
 
         offset += attr_len;
@@ -943,9 +1220,9 @@ fn parse_stun_response(buf: &[u8], tx_id: &[u8; 12]) -> Option<SocketAddr> {
 }
 
 #[cfg(windows)]
-pub fn configure_socket_physical_if(socket: &UdpSocket, logger: &AppLogger) {
+pub fn configure_socket_physical_if(socket: &UdpSocket, logger: &AppLogger) -> Option<Ipv4Addr> {
     use std::os::windows::io::AsRawSocket;
-    if let Some(if_idx) = find_best_physical_interface_index() {
+    if let Some((if_idx, opt_ip)) = find_best_physical_interface() {
         let raw_sock = socket.as_raw_socket() as usize;
         let if_index_be: u32 = if_idx.to_be(); // network byte order for Winsock IP_UNICAST_IF
         unsafe {
@@ -961,8 +1238,9 @@ pub fn configure_socket_physical_if(socket: &UdpSocket, logger: &AppLogger) {
             );
             if res == 0 {
                 logger.info(&format!(
-                    "UDP сокет привязан к физическому интерфейсу #{} (обход VPN)",
-                    if_idx
+                    "UDP сокет привязан к физическому интерфейсу #{} (обход VPN, LAN IP: {:?})",
+                    if_idx,
+                    opt_ip.unwrap_or(Ipv4Addr::UNSPECIFIED)
                 ));
             } else {
                 logger.warn(&format!(
@@ -971,20 +1249,24 @@ pub fn configure_socket_physical_if(socket: &UdpSocket, logger: &AppLogger) {
                 ));
             }
         }
+        return opt_ip;
     }
+    None
 }
 
 #[cfg(not(windows))]
-pub fn configure_socket_physical_if(_socket: &UdpSocket, _logger: &AppLogger) {}
+pub fn configure_socket_physical_if(_socket: &UdpSocket, _logger: &AppLogger) -> Option<Ipv4Addr> {
+    None
+}
 
 #[cfg(windows)]
-pub fn find_best_physical_interface_index() -> Option<u32> {
+pub fn find_best_physical_interface() -> Option<(u32, Option<Ipv4Addr>)> {
     use std::ptr::null_mut;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
         GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
     };
-    use windows_sys::Win32::Networking::WinSock::AF_INET;
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
 
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
     let mut buf_len: u32 = 15000;
@@ -1004,44 +1286,84 @@ pub fn find_best_physical_interface_index() -> Option<u32> {
         return None;
     }
 
+    unsafe fn pwstr_to_string(ptr: *const u16) -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        let mut len = 0;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        String::from_utf16_lossy(slice)
+    }
+
+    let blacklist = &[
+        "tap", "tun", "wireguard", "wintun", "v2ray", "sing-box", "openvpn", "tailscale",
+        "vethernet", "hyper-v", "virtual", "docker", "vmware", "virtualbox", "wsl",
+        "loopback", "bluetooth", "pseudo", "teredo", "isatap", "npcap", "pcap",
+    ];
+
     let mut curr = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
-    let mut best_index: Option<u32> = None;
+    let mut best: Option<(u32, Option<Ipv4Addr>)> = None;
+    let mut best_score: i32 = i32::MIN;
 
     while !curr.is_null() {
         unsafe {
             let adapter = &*curr;
-            // Filter: must be OperStatus Up (1 = IfOperStatusUp)
-            // IfType: 6 = Ethernet, 71 = 802.11 WiFi, 243/244 = WWAN / 4G Cellular
-            let is_physical_type = adapter.IfType == 6
-                || adapter.IfType == 71
-                || adapter.IfType == 243
-                || adapter.IfType == 244;
-            let is_up = adapter.OperStatus == 1;
+            let desc = pwstr_to_string(adapter.Description as _).to_lowercase();
+            let friendly = pwstr_to_string(adapter.FriendlyName as _).to_lowercase();
+            let is_up = adapter.OperStatus == 1; // IfOperStatusUp
+            let if_index = adapter.Anonymous1.Anonymous.IfIndex;
 
-            // Check description for common VPN keywords to avoid virtual adapters
-            let mut desc_str = String::new();
-            if !adapter.Description.is_null() {
-                let mut p = adapter.Description;
-                while *p != 0 {
-                    desc_str.push((*p as u8) as char);
-                    p = p.add(1);
+            if is_up && if_index > 0 {
+                let mut score = 0i32;
+
+                // Physical interface type: 6 = Ethernet, 71 = Wi-Fi, 243/244 = WWAN
+                let is_physical = adapter.IfType == 6
+                    || adapter.IfType == 71
+                    || adapter.IfType == 243
+                    || adapter.IfType == 244;
+
+                if is_physical {
+                    score += 200;
                 }
-            }
-            let desc_lower = desc_str.to_lowercase();
-            let is_vpn = desc_lower.contains("tap")
-                || desc_lower.contains("tun")
-                || desc_lower.contains("wireguard")
-                || desc_lower.contains("wintun")
-                || desc_lower.contains("v2ray")
-                || desc_lower.contains("sing-box")
-                || desc_lower.contains("openvpn")
-                || desc_lower.contains("tailscale");
 
-            if is_physical_type && is_up && !is_vpn {
-                let if_index = adapter.Anonymous1.Anonymous.IfIndex;
-                if if_index > 0 {
-                    best_index = Some(if_index);
-                    break;
+                // Check default gateway (real physical internet interface has gateway)
+                if !adapter.FirstGatewayAddress.is_null() {
+                    score += 1000;
+                }
+
+                // Check blacklist
+                let is_blacklisted = blacklist.iter().any(|&w| desc.contains(w) || friendly.contains(w));
+                if is_blacklisted {
+                    score -= 5000;
+                }
+
+                // Extract IPv4 address if available
+                let mut ipv4_addr = None;
+                let mut unicast = adapter.FirstUnicastAddress;
+                while !unicast.is_null() {
+                    let u = &*unicast;
+                    let lp_sock = u.Address.lpSockaddr;
+                    if !lp_sock.is_null() && (*lp_sock).sa_family == AF_INET {
+                        let sin = &*(lp_sock as *const SOCKADDR_IN);
+                        let ip_u32 = u32::from_be(sin.sin_addr.S_un.S_addr);
+                        let ip = Ipv4Addr::from(ip_u32);
+                        if !ip.is_loopback() && !ip.is_link_local() {
+                            if !(ip.octets()[0] == 172 && (16..=31).contains(&ip.octets()[1])) {
+                                score += 100;
+                            }
+                            ipv4_addr = Some(ip);
+                            break;
+                        }
+                    }
+                    unicast = (*unicast).Next;
+                }
+
+                if score > best_score && score > 0 {
+                    best_score = score;
+                    best = Some((if_index, ipv4_addr));
                 }
             }
 
@@ -1049,11 +1371,11 @@ pub fn find_best_physical_interface_index() -> Option<u32> {
         }
     }
 
-    best_index
+    best
 }
 
 #[cfg(not(windows))]
-pub fn find_best_physical_interface_index() -> Option<u32> {
+pub fn find_best_physical_interface() -> Option<(u32, Option<Ipv4Addr>)> {
     None
 }
 
@@ -1122,10 +1444,10 @@ mod tests {
 
     #[test]
     fn test_find_physical_interface() {
-        let idx = find_best_physical_interface_index();
-        println!("Found physical interface index: {:?}", idx);
+        let best = find_best_physical_interface();
+        println!("Found physical interface: {:?}", best);
         #[cfg(windows)]
-        assert!(idx.is_some(), "Should find a physical interface on Windows");
+        assert!(best.is_some(), "Should find a physical interface on Windows");
     }
 
     #[test]
@@ -1134,5 +1456,16 @@ mod tests {
         let enc = ack.encode().expect("Failed to encode TextAck");
         let dec = Packet::decode(&enc).expect("Failed to decode TextAck");
         assert_eq!(dec, Packet::TextAck { id: 12345 });
+    }
+
+    #[tokio::test]
+    async fn test_fast_parallel_stun() {
+        let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        let logger = AppLogger::init();
+        let start = Instant::now();
+        let pub_addr = discover_public_ip_via_stun(sock, &logger).await;
+        let elapsed = start.elapsed();
+        println!("STUN discovered: {:?} in {:?}", pub_addr, elapsed);
+        assert!(pub_addr.is_some(), "STUN must discover public IP");
     }
 }

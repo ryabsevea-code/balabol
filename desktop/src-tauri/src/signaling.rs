@@ -1,4 +1,7 @@
 use crate::logger::AppLogger;
+use crate::p2p::Packet;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use secp256k1::Keypair;
 use serde_json::{json, Value};
@@ -21,6 +24,18 @@ pub const RELAYS: &[&str] = &[
     "wss://eden.nostr.land",
     "wss://relay.nostr.bg",
 ];
+
+pub struct RelaySession {
+    pub outgoing_tx: tokio::sync::mpsc::Sender<Packet>,
+    pub incoming_rx: tokio::sync::mpsc::Receiver<Packet>,
+    pub abort_handle: tokio::task::AbortHandle,
+}
+
+impl Drop for RelaySession {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
+    }
+}
 
 pub struct Signaling;
 
@@ -254,6 +269,132 @@ impl Signaling {
             }
             _ => Err("Хост с таким кодом комнаты не найден в сети. Убедитесь, что комната создана.".into()),
         }
+    }
+
+    /// Starts a real-time Relay session across connected WSS relays for fallback communication.
+    pub async fn start_relay_session(
+        room_code: &str,
+        my_name: &str,
+        logger: &AppLogger,
+    ) -> Result<RelaySession, String> {
+        let clean_code = sanitize_room_code(room_code);
+        let relay_tag = format!("balabol_p2p_{}", clean_code);
+
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Packet>(64);
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Packet>(64);
+
+        let keypair = {
+            let mut rng = secp256k1::rand::rng();
+            Keypair::new(&mut rng)
+        };
+        let (my_xonly, _) = keypair.x_only_public_key();
+        let my_pubkey_hex = hex::encode(my_xonly.to_byte_array());
+
+        let logger_clone = logger.clone();
+        let my_name = my_name.to_string();
+
+        let task = tokio::spawn(async move {
+            // Connect to available relays (top 4 fast relays from pool)
+            let mut connected_ws_list = Vec::new();
+            for &relay in &RELAYS[..5.min(RELAYS.len())] {
+                let connect_fut = connect_async(relay);
+                if let Ok(Ok((mut ws, _))) = tokio::time::timeout(Duration::from_millis(2500), connect_fut).await {
+                    let sub_id = format!("sub_r_{}", rand::random::<u32>());
+                    let sub_filter = json!(["REQ", sub_id, {
+                        "#t": [relay_tag],
+                        "limit": 0
+                    }]);
+                    if ws.send(WsMessage::Text(sub_filter.to_string().into())).await.is_ok() {
+                        connected_ws_list.push(ws);
+                    }
+                }
+            }
+
+            if connected_ws_list.is_empty() {
+                logger_clone.error("Релей-сессия: не удалось подключиться ни к одному WSS-релею");
+                return;
+            }
+
+            logger_clone.info(&format!(
+                "Релей-сессия активна через {} WSS-релеев (комната '{}')",
+                connected_ws_list.len(),
+                clean_code
+            ));
+
+            let mut last_ping = tokio::time::Instant::now();
+
+            loop {
+                // Keep-alive ping every 10s
+                if last_ping.elapsed() >= Duration::from_secs(10) {
+                    for ws in &mut connected_ws_list {
+                        let _ = ws.send(WsMessage::Ping(vec![].into())).await;
+                    }
+                    last_ping = tokio::time::Instant::now();
+                }
+
+                // Check outgoing packets to send
+                tokio::select! {
+                    Some(packet) = out_rx.recv() => {
+                        if let Ok(bytes) = packet.encode() {
+                            let b64 = BASE64.encode(&bytes);
+                            let payload = format!("bala://pkt/{}", b64);
+                            let evt = create_signed_event(
+                                &keypair,
+                                20001,
+                                vec![
+                                    vec!["t".into(), relay_tag.clone()],
+                                    vec!["s".into(), my_name.clone()],
+                                ],
+                                &payload,
+                            );
+                            let pub_msg = json!(["EVENT", evt]).to_string();
+                            for ws in &mut connected_ws_list {
+                                let _ = ws.send(WsMessage::Text(pub_msg.clone().into())).await;
+                            }
+                        }
+                    }
+                    // Read incoming from any active websocket
+                    _ = tokio::time::sleep(Duration::from_millis(15)) => {
+                        let mut i = 0;
+                        while i < connected_ws_list.len() {
+                            let read_fut = tokio::time::timeout(Duration::from_millis(10), connected_ws_list[i].next());
+                            if let Ok(Some(Ok(msg))) = read_fut.await {
+                                if let WsMessage::Text(txt) = msg {
+                                    if let Ok(parsed) = serde_json::from_str::<Value>(&txt) {
+                                        if let Some(arr) = parsed.as_array() {
+                                            if arr.len() >= 3 && arr[0] == "EVENT" {
+                                                let sender_pubkey = arr[2].get("pubkey").and_then(|p| p.as_str()).unwrap_or_default();
+                                                // Ignore own events
+                                                if sender_pubkey != my_pubkey_hex {
+                                                    if let Some(content) = arr[2].get("content").and_then(|c| c.as_str()) {
+                                                        if let Some(stripped) = content.strip_prefix("bala://pkt/") {
+                                                            if let Ok(bytes) = BASE64.decode(stripped) {
+                                                                if let Ok(pkt) = Packet::decode(&bytes) {
+                                                                    let _ = in_tx.send(pkt).await;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                i += 1;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(RelaySession {
+            outgoing_tx: out_tx,
+            incoming_rx: in_rx,
+            abort_handle: task.abort_handle(),
+        })
     }
 }
 
