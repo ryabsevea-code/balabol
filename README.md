@@ -6,10 +6,9 @@
 
 ## ⚡ Быстрый старт (Windows)
 
-### Вариант 1: Готовый установщик (Installer) или Portable EXE
-В папке [`dist-release/`](file:///c:/Users/ryabs/Desktop/Balabol/dist-release) собраны свежие релизные файлы:
-* **Установщик Windows**: [`dist-release/Balabol_1.0.0_x64-setup.exe`](file:///c:/Users/ryabs/Desktop/Balabol/dist-release/Balabol_1.0.0_x64-setup.exe) — **~4.0 МБ** (создает ярлыки на рабочем столе и в меню Пуск).
-* **Портативная версия**: [`dist-release/balabol-desktop.exe`](file:///c:/Users/ryabs/Desktop/Balabol/dist-release/balabol-desktop.exe) — **~15.9 МБ** (запуск без установки).
+### Вариант 1: Запуск исполняемого файла
+В папке [`dist-release/`](file:///c:/Users/ryabs/Desktop/Balabol/dist-release) собран готовый файл:
+* **Исполняемый файл**: [`dist-release/balabol.exe`](file:///c:/Users/ryabs/Desktop/Balabol/dist-release/balabol.exe) (автономный запуск без установки).
 
 ### Вариант 2: Запуск в режиме разработки
 Запустите файл [`start-p2p-dev.bat`](file:///c:/Users/ryabs/Desktop/Balabol/start-p2p-dev.bat) двойным кликом:
@@ -76,8 +75,8 @@ cd core
 cargo test -j 2
 ```
 
-Для сборки десктопного фронтенда:
+Для сборки `balabol.exe` в папку `dist-release`:
 ```powershell
 cd desktop
-npm run build
+npm run build:dist
 ```
