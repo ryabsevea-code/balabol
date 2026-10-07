@@ -37,11 +37,140 @@ impl Drop for RelaySession {
     }
 }
 
+pub struct HostSignalingSession {
+    pub incoming_answers: tokio::sync::mpsc::Receiver<String>,
+    pub abort_handle: tokio::task::AbortHandle,
+}
+
+impl Drop for HostSignalingSession {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
+    }
+}
+
 pub struct Signaling;
 
 pub type MqttSignaling = Signaling; // Backward compatibility alias
 
 impl Signaling {
+    /// Starts continuous multi-guest host signaling session for Star-SFU
+    pub async fn start_host_session(
+        room_code: &str,
+        offer_payload: &str,
+        logger: &AppLogger,
+    ) -> Result<HostSignalingSession, String> {
+        let clean_code = sanitize_room_code(room_code);
+        let room_tag = format!("balabol_v4_{}", clean_code);
+
+        logger.info(&format!(
+            "Защищенный SFU сигналинг (Хост): параллельный запуск пула из {} WSS-релеев для комнаты '{}'...",
+            RELAYS.len(),
+            clean_code
+        ));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let seen_answers = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::<String>::new()));
+
+        let keypair = {
+            let mut rng = secp256k1::rand::rng();
+            Keypair::new(&mut rng)
+        };
+
+        let mut join_handles = Vec::new();
+
+        for &relay in RELAYS {
+            let tx = tx.clone();
+            let shutdown = shutdown.clone();
+            let room_tag = room_tag.clone();
+            let offer_payload = offer_payload.to_string();
+            let logger = logger.clone();
+            let keypair = keypair;
+            let seen_answers = seen_answers.clone();
+
+            let handle = tokio::spawn(async move {
+                let connect_fut = connect_async(relay);
+                let Ok(Ok((mut ws, _))) = tokio::time::timeout(Duration::from_secs(4), connect_fut).await else {
+                    return;
+                };
+
+                logger.info(&format!("SFU Хост подключен к WSS-релею {}, непрерывное ожидание гостей...", relay));
+
+                let sub_id = format!("sub_sfu_{}", rand::random::<u32>());
+                let sub_filter = json!(["REQ", sub_id, {
+                    "#t": [room_tag],
+                    "limit": 20
+                }]);
+                if ws.send(WsMessage::Text(sub_filter.to_string().into())).await.is_err() {
+                    return;
+                }
+
+                let mut last_pub = tokio::time::Instant::now() - Duration::from_secs(10);
+                let mut last_ping = tokio::time::Instant::now();
+
+                while !shutdown.load(Ordering::Relaxed) {
+                    // Periodic broadcast of Offer so new guests can find the room
+                    if last_pub.elapsed() >= Duration::from_millis(2500) {
+                        let evt = create_signed_event(
+                            &keypair,
+                            1,
+                            vec![
+                                vec!["t".into(), room_tag.clone()],
+                                vec!["type".into(), "offer".into()],
+                            ],
+                            &offer_payload,
+                        );
+                        let pub_msg = json!(["EVENT", evt]).to_string();
+                        if ws.send(WsMessage::Text(pub_msg.into())).await.is_err() {
+                            break;
+                        }
+                        last_pub = tokio::time::Instant::now();
+                    }
+
+                    if last_ping.elapsed() >= Duration::from_secs(12) {
+                        let _ = ws.send(WsMessage::Ping(vec![].into())).await;
+                        last_ping = tokio::time::Instant::now();
+                    }
+
+                    let read_fut = tokio::time::timeout(Duration::from_millis(150), ws.next());
+                    if let Ok(Some(Ok(msg))) = read_fut.await {
+                        if let WsMessage::Text(txt) = msg {
+                            if let Ok(parsed) = serde_json::from_str::<Value>(&txt) {
+                                if let Some(arr) = parsed.as_array() {
+                                    if arr.len() >= 3 && arr[0] == "EVENT" {
+                                        if let Some(content) = arr[2].get("content").and_then(|c| c.as_str()) {
+                                            if content.starts_with("bala://answer/") {
+                                                let is_new = seen_answers.lock().insert(content.to_string());
+                                                if is_new {
+                                                    logger.info(&format!(
+                                                        "SFU Хост: получен новый гость через WSS-релей {}!",
+                                                        relay
+                                                    ));
+                                                    let _ = tx.send(content.to_string()).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            join_handles.push(handle);
+        }
+
+        let shutdown_clone = shutdown.clone();
+        let supervisor_task = tokio::spawn(async move {
+            futures_util::future::join_all(join_handles).await;
+            shutdown_clone.store(true, Ordering::Relaxed);
+        });
+
+        Ok(HostSignalingSession {
+            incoming_answers: rx,
+            abort_handle: supervisor_task.abort_handle(),
+        })
+    }
     /// Host starts room: connects in parallel to all WSS relays,
     /// publishes Offer every 2.5s, and waits for Answer from guest.
     pub async fn host_exchange(

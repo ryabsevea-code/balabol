@@ -1,8 +1,8 @@
 use crate::invite::{
-    create_answer_link, create_offer_link, parse_answer_link, parse_offer_link,
+    create_answer_link_with_id, create_offer_link_with_id, parse_answer_link, parse_offer_link,
 };
 use crate::logger::AppLogger;
-use crate::signaling::MqttSignaling;
+use crate::signaling::{HostSignalingSession, MqttSignaling};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -14,41 +14,49 @@ use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 
 #[allow(dead_code)]
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Packet {
     Punch {
         nonce: u64,
         sender_name: String,
+        sender_id: u32,
     },
     PunchAck {
         nonce: u64,
         sender_name: String,
+        sender_id: u32,
     },
     ConnectRequest {
         client_name: String,
         protocol_version: u32,
         client_nonce: u64,
+        client_id: u32,
     },
     ConnectAccept {
         assigned_id: u32,
+        host_id: u32,
         host_name: String,
         room_name: String,
+        peers: Vec<PeerInfo>,
     },
     ConnectReject {
         reason: String,
     },
     Ping {
+        sender_id: u32,
         seq: u64,
         timestamp_ms: u64,
     },
     Pong {
+        sender_id: u32,
         seq: u64,
         timestamp_ms: u64,
     },
     TextMessage {
         id: u64,
+        sender_id: u32,
         text: String,
         sender_name: String,
         timestamp_ms: u64,
@@ -57,13 +65,16 @@ pub enum Packet {
         id: u64,
     },
     Disconnect {
+        sender_id: u32,
         reason: String,
     },
     AudioData {
+        sender_id: u32,
         seq: u64,
         data: Vec<u8>,
     },
     VideoChunk {
+        sender_id: u32,
         frame_id: u32,
         chunk_idx: u16,
         chunk_total: u16,
@@ -71,10 +82,28 @@ pub enum Packet {
         data: Vec<u8>,
     },
     MediaState {
+        sender_id: u32,
         mic_muted: bool,
         deafened: bool,
         video_active: bool,
         screen_active: bool,
+    },
+    PeerListUpdate {
+        host_id: u32,
+        backup_host_id: Option<u32>,
+        peers: Vec<PeerInfo>,
+    },
+    HostHandover {
+        old_host_id: u32,
+        new_host_id: u32,
+    },
+    ClaimHost {
+        candidate_id: u32,
+        reason: String,
+    },
+    NicknameUpdate {
+        sender_id: u32,
+        new_nickname: String,
     },
 }
 
@@ -104,17 +133,24 @@ pub struct ChatMessage {
     pub is_me: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PeerInfo {
     pub id: u32,
     pub name: String,
     pub addr: String,
     pub ping_ms: u32,
     pub last_seen_ms: u64,
+    pub is_host: bool,
+    pub is_speaking: bool,
+    pub mic_muted: bool,
+    pub deafened: bool,
+    pub video_active: bool,
+    pub screen_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteVideoFrame {
+    pub sender_id: u32,
     pub frame_id: u32,
     pub is_screen: bool,
     pub jpeg_base64: String,
@@ -164,33 +200,50 @@ pub enum ConnectionStatus {
         mode: String,
     },
     Connected {
+        my_id: u32,
+        is_host: bool,
+        host_name: String,
         peer_name: String,
         peer_addr: String,
         room_name: String,
+        room_code: Option<String>,
         ping_ms: u32,
+        connected_count: usize,
     },
     Failed {
         error: String,
     },
 }
 
+#[derive(Clone)]
 pub struct P2pNode {
     logger: AppLogger,
     status: Arc<RwLock<ConnectionStatus>>,
-    peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
-    active_socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
-    active_peer_addr: Arc<RwLock<Option<SocketAddr>>>,
-    relay_sender: Arc<RwLock<Option<tokio::sync::mpsc::Sender<Packet>>>>,
-    chat_messages: Arc<RwLock<Vec<ChatMessage>>>,
-    seen_msg_ids: Arc<RwLock<HashSet<u64>>>,
-    pending_acks: Arc<RwLock<HashMap<u64, oneshot::Sender<()>>>>,
-    session_abort: Arc<RwLock<Option<tokio::task::AbortHandle>>>,
-    shutdown_signal: Arc<AtomicBool>,
-    next_peer_id: Arc<AtomicU32>,
-    audio_engine: Arc<crate::audio::AudioEngine>,
-    latest_remote_video: Arc<RwLock<Option<RemoteVideoFrame>>>,
-    remote_media_state: Arc<RwLock<RemoteMediaState>>,
-    video_frame_seq: Arc<AtomicU32>,
+    pub my_peer_id: Arc<AtomicU32>,
+    pub my_nickname: Arc<RwLock<String>>,
+    pub is_host: Arc<AtomicBool>,
+    pub current_host_id: Arc<AtomicU32>,
+    pub backup_host_id: Arc<RwLock<Option<u32>>>,
+
+    pub peers: Arc<RwLock<HashMap<u32, PeerInfo>>>,
+    pub peer_addrs: Arc<RwLock<HashMap<SocketAddr, u32>>>,
+    pub client_endpoints: Arc<RwLock<HashMap<u32, SocketAddr>>>,
+
+    pub active_socket: Arc<RwLock<Option<Arc<UdpSocket>>>>,
+    pub host_socket_addr: Arc<RwLock<Option<SocketAddr>>>,
+    pub relay_sender: Arc<RwLock<Option<tokio::sync::mpsc::Sender<Packet>>>>,
+
+    pub chat_messages: Arc<RwLock<Vec<ChatMessage>>>,
+    pub seen_msg_ids: Arc<RwLock<HashSet<u64>>>,
+    pub pending_acks: Arc<RwLock<HashMap<u64, oneshot::Sender<()>>>>,
+    pub session_abort: Arc<RwLock<Option<tokio::task::AbortHandle>>>,
+    pub shutdown_signal: Arc<AtomicBool>,
+    pub next_peer_id: Arc<AtomicU32>,
+    pub audio_engine: Arc<crate::audio::AudioEngine>,
+    pub latest_remote_video: Arc<RwLock<Option<RemoteVideoFrame>>>,
+    pub remote_media_state: Arc<RwLock<RemoteMediaState>>,
+    pub video_frame_seq: Arc<AtomicU32>,
+    pub current_room_code: Arc<RwLock<Option<String>>>,
 }
 
 impl P2pNode {
@@ -198,20 +251,31 @@ impl P2pNode {
         Self {
             logger,
             status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
+            my_peer_id: Arc::new(AtomicU32::new(1)),
+            my_nickname: Arc::new(RwLock::new("Узел".into())),
+            is_host: Arc::new(AtomicBool::new(false)),
+            current_host_id: Arc::new(AtomicU32::new(1)),
+            backup_host_id: Arc::new(RwLock::new(None)),
+
             peers: Arc::new(RwLock::new(HashMap::new())),
+            peer_addrs: Arc::new(RwLock::new(HashMap::new())),
+            client_endpoints: Arc::new(RwLock::new(HashMap::new())),
+
             active_socket: Arc::new(RwLock::new(None)),
-            active_peer_addr: Arc::new(RwLock::new(None)),
+            host_socket_addr: Arc::new(RwLock::new(None)),
             relay_sender: Arc::new(RwLock::new(None)),
+
             chat_messages: Arc::new(RwLock::new(Vec::new())),
             seen_msg_ids: Arc::new(RwLock::new(HashSet::new())),
             pending_acks: Arc::new(RwLock::new(HashMap::new())),
             session_abort: Arc::new(RwLock::new(None)),
             shutdown_signal: Arc::new(AtomicBool::new(false)),
-            next_peer_id: Arc::new(AtomicU32::new(1)),
+            next_peer_id: Arc::new(AtomicU32::new(2)),
             audio_engine: crate::audio::AudioEngine::new(),
             latest_remote_video: Arc::new(RwLock::new(None)),
             remote_media_state: Arc::new(RwLock::new(RemoteMediaState::default())),
             video_frame_seq: Arc::new(AtomicU32::new(1)),
+            current_room_code: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -220,7 +284,15 @@ impl P2pNode {
     }
 
     pub fn get_peers(&self) -> Vec<PeerInfo> {
-        self.peers.read().values().cloned().collect()
+        let speaking_ids = self.audio_engine.get_speaking_peers();
+        let peers_guard = self.peers.read();
+        let mut list = Vec::with_capacity(peers_guard.len());
+        for peer in peers_guard.values() {
+            let mut p = peer.clone();
+            p.is_speaking = speaking_ids.contains(&p.id);
+            list.push(p);
+        }
+        list
     }
 
     pub fn get_chat_messages(&self) -> Vec<ChatMessage> {
@@ -233,13 +305,15 @@ impl P2pNode {
         }
         self.shutdown_signal.store(true, Ordering::SeqCst);
 
-        // Send disconnect packet to connected peers
-        if let Some(sock) = self.active_socket.read().as_ref() {
-            let disc = Packet::Disconnect {
-                reason: "Пользователь вышел из комнаты".into(),
-            };
-            if let Ok(bytes) = disc.encode() {
-                let addrs: Vec<SocketAddr> = self.peers.read().keys().cloned().collect();
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
+        let disc = Packet::Disconnect {
+            sender_id: my_id,
+            reason: "Пользователь вышел из комнаты".into(),
+        };
+
+        if let Ok(bytes) = disc.encode() {
+            if let Some(sock) = self.active_socket.read().as_ref() {
+                let addrs: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
                 for addr in addrs {
                     let s = sock.clone();
                     let b = bytes.clone();
@@ -247,12 +321,16 @@ impl P2pNode {
                         let _ = s.send_to(&b, addr).await;
                     });
                 }
+                if let Some(host_addr) = *self.host_socket_addr.read() {
+                    let s = sock.clone();
+                    let b = bytes.clone();
+                    tokio::spawn(async move {
+                        let _ = s.send_to(&b, host_addr).await;
+                    });
+                }
             }
         }
         if let Some(relay_tx) = self.relay_sender.read().clone() {
-            let disc = Packet::Disconnect {
-                reason: "Пользователь вышел из комнаты".into(),
-            };
             tokio::spawn(async move {
                 let _ = relay_tx.send(disc).await;
             });
@@ -263,11 +341,15 @@ impl P2pNode {
         *self.latest_remote_video.write() = None;
         *self.remote_media_state.write() = RemoteMediaState::default();
         *self.active_socket.write() = None;
-        *self.active_peer_addr.write() = None;
+        *self.host_socket_addr.write() = None;
         *self.relay_sender.write() = None;
+        self.client_endpoints.write().clear();
+        self.peer_addrs.write().clear();
         self.peers.write().clear();
         self.seen_msg_ids.write().clear();
         self.pending_acks.write().clear();
+        self.is_host.store(false, Ordering::SeqCst);
+        *self.current_room_code.write() = None;
         *self.status.write() = ConnectionStatus::Disconnected;
         self.logger.info("Состояние сброшено в Disconnected");
     }
@@ -359,20 +441,14 @@ impl P2pNode {
             return Ok(());
         }
 
-        let sock_opt = self.active_socket.read().clone();
-        let peer_addr_opt = *self.active_peer_addr.read();
-        let relay_tx_opt = self.relay_sender.read().clone();
-
-        if peer_addr_opt.is_none() && relay_tx_opt.is_none() {
-            return Ok(());
-        }
-
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
         let frame_id = self.video_frame_seq.fetch_add(1, Ordering::SeqCst);
         const CHUNK_SIZE: usize = 1200;
         let chunk_total = ((bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u16;
 
         for (idx, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
             let pkt = Packet::VideoChunk {
+                sender_id: my_id,
                 frame_id,
                 chunk_idx: idx as u16,
                 chunk_total,
@@ -380,141 +456,85 @@ impl P2pNode {
                 data: chunk.to_vec(),
             };
 
-            if let (Some(sock), Some(peer_addr)) = (&sock_opt, peer_addr_opt) {
-                if let Ok(b) = pkt.encode() {
-                    let _ = sock.send_to(&b, peer_addr).await;
-                }
-            } else if let Some(relay_tx) = &relay_tx_opt {
-                let _ = relay_tx.send(pkt).await;
-            }
-
-            // Pacing between UDP chunks to avoid buffer bloat and packet drops
-            tokio::time::sleep(Duration::from_micros(200)).await;
+            self.broadcast_packet(&pkt).await;
+            tokio::time::sleep(Duration::from_micros(150)).await;
         }
 
         Ok(())
     }
 
     pub async fn send_media_state(&self, video_active: bool, screen_active: bool) -> Result<(), String> {
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
         let pkt = Packet::MediaState {
+            sender_id: my_id,
             mic_muted: self.audio_engine.is_mic_muted(),
             deafened: self.audio_engine.is_deafened(),
             video_active,
             screen_active,
         };
-
-        let sock_opt = self.active_socket.read().clone();
-        let peer_addr_opt = *self.active_peer_addr.read();
-        let relay_tx_opt = self.relay_sender.read().clone();
-
-        if let (Some(sock), Some(peer_addr)) = (sock_opt, peer_addr_opt) {
-            if let Ok(b) = pkt.encode() {
-                let _ = sock.send_to(&b, peer_addr).await;
-            }
-        } else if let Some(relay_tx) = relay_tx_opt {
-            let _ = relay_tx.send(pkt).await;
-        }
-
+        self.broadcast_packet(&pkt).await;
         Ok(())
     }
 
     fn broadcast_media_state(&self) -> Result<(), String> {
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
         let pkt = Packet::MediaState {
+            sender_id: my_id,
             mic_muted: self.audio_engine.is_mic_muted(),
             deafened: self.audio_engine.is_deafened(),
             video_active: false,
             screen_active: false,
         };
-        let sock_opt = self.active_socket.read().clone();
-        let peer_addr_opt = *self.active_peer_addr.read();
-        let relay_tx_opt = self.relay_sender.read().clone();
-
+        let self_clone = self.clone();
         tokio::spawn(async move {
-            if let (Some(sock), Some(peer_addr)) = (sock_opt, peer_addr_opt) {
-                if let Ok(b) = pkt.encode() {
-                    let _ = sock.send_to(&b, peer_addr).await;
-                }
-            } else if let Some(relay_tx) = relay_tx_opt {
-                let _ = relay_tx.send(pkt).await;
-            }
+            self_clone.broadcast_packet(&pkt).await;
         });
-
         Ok(())
     }
 
-    /// Send a text message to the connected peer over P2P/Relay with guaranteed delivery (ACK retry loop)
+    pub async fn broadcast_packet(&self, packet: &Packet) {
+        if let Ok(bytes) = packet.encode() {
+            let sock_opt = self.active_socket.read().clone();
+            if let Some(sock) = sock_opt {
+                // If Host: send to all connected clients
+                let client_addrs: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
+                for addr in client_addrs {
+                    let _ = sock.send_to(&bytes, addr).await;
+                }
+                // If Client: send to Host
+                let host_addr_opt = *self.host_socket_addr.read();
+                if let Some(host_addr) = host_addr_opt {
+                    let _ = sock.send_to(&bytes, host_addr).await;
+                }
+            }
+            let relay_tx_opt = self.relay_sender.read().clone();
+            if let Some(relay_tx) = relay_tx_opt {
+                let _ = relay_tx.send(packet.clone()).await;
+            }
+        }
+    }
+
     pub async fn send_chat_message(&self, text: String, my_name: String) -> Result<ChatMessage, String> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Err("Сообщение не может быть пустым".into());
         }
 
-        let sock_opt = self.active_socket.read().clone();
-        let peer_addr_opt = *self.active_peer_addr.read();
-        let relay_tx_opt = self.relay_sender.read().clone();
-
-        if peer_addr_opt.is_none() && relay_tx_opt.is_none() {
-            return Err("Нет подключенного собеседника".to_string());
-        }
-
-        // Generate globally unique message ID using random 63-bit integer to prevent any peer collisions
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
         let id = (rand::random::<u64>() & 0x7FFF_FFFF_FFFF_FFFF).max(1);
         let timestamp_ms = now_ms();
-
-        // Mark as seen so sender never treats own message as duplicate if bounced
         self.seen_msg_ids.write().insert(id);
 
         let packet = Packet::TextMessage {
             id,
+            sender_id: my_id,
             text: trimmed.to_string(),
             sender_name: my_name.clone(),
             timestamp_ms,
         };
 
-        if let (Some(sock), Some(peer_addr)) = (sock_opt, peer_addr_opt) {
-            let encoded = packet
-                .encode()
-                .map_err(|e| format!("Ошибка кодирования сообщения: {}", e))?;
-
-            // Register ACK oneshot
-            let (ack_tx, mut ack_rx) = oneshot::channel();
-            self.pending_acks.write().insert(id, ack_tx);
-
-            // Spawn retry loop in background: sends up to 6 times (every 200ms) until ACK is received
-            let sock_clone = sock.clone();
-            let enc_clone = encoded.clone();
-            let pending_clone = self.pending_acks.clone();
-            tokio::spawn(async move {
-                for _ in 0..6 {
-                    let _ = sock_clone.send_to(&enc_clone, peer_addr).await;
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(200)) => {},
-                        _ = &mut ack_rx => {
-                            return;
-                        }
-                    }
-                }
-                pending_clone.write().remove(&id);
-            });
-        } else if let Some(relay_tx) = relay_tx_opt {
-            let (ack_tx, mut ack_rx) = oneshot::channel();
-            self.pending_acks.write().insert(id, ack_tx);
-
-            let pending_clone = self.pending_acks.clone();
-            let pkt_clone = packet.clone();
-            tokio::spawn(async move {
-                for _ in 0..4 {
-                    let _ = relay_tx.send(pkt_clone.clone()).await;
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(400)) => {},
-                        _ = &mut ack_rx => {
-                            return;
-                        }
-                    }
-                }
-                pending_clone.write().remove(&id);
-            });
-        }
+        // Broadcast with retry
+        self.broadcast_packet(&packet).await;
 
         let msg = ChatMessage {
             id,
@@ -529,7 +549,114 @@ impl P2pNode {
         Ok(msg)
     }
 
-    /// Mode: Host starts room with a 6-digit code
+    /// Update local nickname and broadcast to all peers in call
+    pub async fn update_nickname(&self, new_nickname: String) -> Result<(), String> {
+        let trimmed = new_nickname.trim().to_string();
+        if trimmed.is_empty() {
+            return Err("Имя не может быть пустым".into());
+        }
+
+        *self.my_nickname.write() = trimmed.clone();
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
+        let is_host = self.is_host.load(Ordering::Relaxed);
+
+        {
+            let mut st = self.status.write();
+            if let ConnectionStatus::Connected { host_name, is_host: host_flag, .. } = &mut *st {
+                if *host_flag || is_host {
+                    *host_name = trimmed.clone();
+                }
+            }
+        }
+
+        let pkt = Packet::NicknameUpdate {
+            sender_id: my_id,
+            new_nickname: trimmed.clone(),
+        };
+        self.broadcast_packet(&pkt).await;
+        self.logger.info(&format!("Ваше имя обновлено на '{}'", trimmed));
+        Ok(())
+    }
+
+    /// Transfer host responsibility to another connected peer
+    pub async fn transfer_host(&self, new_host_id: u32) -> Result<(), String> {
+        if !self.is_host.load(Ordering::Relaxed) {
+            return Err("Только текущий хост может передать роль хоста".into());
+        }
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
+        if new_host_id == my_id {
+            return Ok(());
+        }
+
+        self.logger.info(&format!(
+            "👑 Передача роли хоста от узла {} к узлу {}",
+            my_id, new_host_id
+        ));
+
+        let handover_pkt = Packet::HostHandover {
+            old_host_id: my_id,
+            new_host_id,
+        };
+
+        self.broadcast_packet(&handover_pkt).await;
+        self.is_host.store(false, Ordering::SeqCst);
+        self.current_host_id.store(new_host_id, Ordering::SeqCst);
+
+        // Point host_socket_addr to the new host so our outgoing audio/video goes directly to them
+        if let Some(target_addr) = self.client_endpoints.read().get(&new_host_id).cloned() {
+            *self.host_socket_addr.write() = Some(target_addr);
+        }
+
+        // Update local peer roster
+        let new_host_name = {
+            let mut peers_guard = self.peers.write();
+            if let Some(target) = peers_guard.get_mut(&new_host_id) {
+                target.is_host = true;
+                target.name.clone()
+            } else {
+                "Организатор".into()
+            }
+        };
+
+        // Update connection status
+        let mut st = self.status.write();
+        if let ConnectionStatus::Connected { is_host, host_name, .. } = &mut *st {
+            *is_host = false;
+            *host_name = new_host_name;
+        }
+
+        Ok(())
+    }
+
+    /// Promote this node to SFU Host (used on failover when host disconnects)
+    pub async fn promote_to_host(&self) {
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
+        self.logger.warn(&format!(
+            "👑 [Failover] Узел {} принимает на себя роль SFU Хоста комнаты!",
+            my_id
+        ));
+
+        self.is_host.store(true, Ordering::SeqCst);
+        self.current_host_id.store(my_id, Ordering::SeqCst);
+        *self.host_socket_addr.write() = None;
+
+        let claim_pkt = Packet::ClaimHost {
+            candidate_id: my_id,
+            reason: "Предыдущий хост отключился".into(),
+        };
+        self.broadcast_packet(&claim_pkt).await;
+
+        let my_name = self.my_nickname.read().clone();
+        let _room_code = self.current_room_code.read().clone().unwrap_or_default();
+
+        let mut st = self.status.write();
+        if let ConnectionStatus::Connected { is_host, host_name, .. } = &mut *st {
+            *is_host = true;
+            *host_name = my_name;
+        }
+    }
+
+    /// Mode: Host starts Star-SFU room with a 6-digit code
     pub async fn start_room(
         &self,
         room_code: String,
@@ -541,7 +668,7 @@ impl P2pNode {
 
         let clean_code = crate::signaling::sanitize_room_code(&room_code);
         self.logger.info(&format!(
-            "Создание комнаты '{}' (Код: {}), никнейм '{}'",
+            "Создание Star-SFU комнаты '{}' (Код: {}), хост '{}'",
             room_code, clean_code, nickname
         ));
 
@@ -558,92 +685,62 @@ impl P2pNode {
         let candidates = gather_candidates(arc_socket.clone(), actual_port, opt_physical_ip, &self.logger).await;
 
         let local_str = candidates.first().map(|a| a.to_string());
-        let pub_str = candidates.iter().find(|a| !a.ip().is_loopback() && a.to_string() != local_str.clone().unwrap_or_default()).map(|a| a.to_string());
+        let pub_str = candidates
+            .iter()
+            .find(|a| !a.ip().is_loopback() && a.to_string() != local_str.clone().unwrap_or_default())
+            .map(|a| a.to_string());
 
-        let offer_link = create_offer_link(&nickname, &room_code, candidates.clone());
+        let offer_link = create_offer_link_with_id(&nickname, &room_code, candidates.clone(), Some(1));
 
-        *self.status.write() = ConnectionStatus::Hosting {
+        // 3. Node identity as Host (id = 1)
+        self.my_peer_id.store(1, Ordering::SeqCst);
+        *self.my_nickname.write() = nickname.clone();
+        self.is_host.store(true, Ordering::SeqCst);
+        self.current_host_id.store(1, Ordering::SeqCst);
+        *self.backup_host_id.write() = None;
+        *self.current_room_code.write() = Some(clean_code.clone());
+
+        *self.status.write() = ConnectionStatus::Connected {
+            my_id: 1,
+            is_host: true,
+            host_name: nickname.clone(),
+            peer_name: "Ожидание гостей".into(),
+            peer_addr: pub_str.clone().or(local_str.clone()).unwrap_or_default(),
             room_name: room_code.clone(),
             room_code: Some(clean_code.clone()),
-            local_addr: local_str,
-            public_addr: pub_str,
+            ping_ms: 0,
             connected_count: 0,
         };
 
-        // 3. Spawn background task to wait for Answer on signaling broker
-        let sock_clone = arc_socket.clone();
-        let logger_clone = self.logger.clone();
-        let status_clone = self.status.clone();
-        let peers_clone = self.peers.clone();
-        let active_peer_clone = self.active_peer_addr.clone();
-        let relay_sender_clone = self.relay_sender.clone();
-        let chat_clone = self.chat_messages.clone();
-        let seen_msg_clone = self.seen_msg_ids.clone();
-        let pending_clone = self.pending_acks.clone();
-        let shutdown_clone = self.shutdown_signal.clone();
-        let host_name = nickname.clone();
-        let room_name = room_code.clone();
-        let next_id = self.next_peer_id.clone();
-        let my_candidates = candidates.clone();
+        // 4. Start local audio engine
+        if let Err(e) = self.audio_engine.start() {
+            self.logger.error(&format!("Не удалось запустить аудио движок хоста: {}", e));
+        } else {
+            self.logger.info("Аудио движок хоста успешно запущен");
+            self.audio_engine.play_connect_chime();
+        }
+
+        // 5. Start continuous Nostr signaling session for multi-guest intake
+        let host_signaling = MqttSignaling::start_host_session(&clean_code, &offer_link, &self.logger).await?;
+
+        // 6. Spawn Star-SFU Host routing and connection loop
+        let node_clone = self.clone();
         let code_for_task = clean_code.clone();
-        let audio_engine_clone = self.audio_engine.clone();
-        let latest_video_clone = self.latest_remote_video.clone();
-        let remote_media_clone = self.remote_media_state.clone();
 
         let task = tokio::spawn(async move {
-            logger_clone.info(&format!("Ожидание подключения гостя в комнате {} через брокер...", code_for_task));
-            
-            let answer_res = MqttSignaling::host_exchange(&code_for_task, &offer_link, Duration::from_secs(90), &logger_clone).await;
-            
-            if shutdown_clone.load(Ordering::Relaxed) {
-                return;
-            }
-
-            match answer_res {
-                Ok(answer_str) => {
-                    logger_clone.info("Получен Answer гостя через брокер. Начинаем пробитие NAT...");
-                    match parse_answer_link(&answer_str) {
-                        Ok(answer) => {
-                            run_simultaneous_punching_flow(
-                                sock_clone,
-                                host_name,
-                                room_name,
-                                code_for_task,
-                                answer.name,
-                                answer.candidates,
-                                my_candidates,
-                                status_clone,
-                                peers_clone,
-                                active_peer_clone,
-                                relay_sender_clone,
-                                chat_clone,
-                                seen_msg_clone,
-                                pending_clone,
-                                shutdown_clone,
-                                logger_clone,
-                                next_id,
-                                audio_engine_clone,
-                                latest_video_clone,
-                                remote_media_clone,
-                            ).await;
-                        }
-                        Err(e) => {
-                            logger_clone.error(&format!("Ошибка разбора Answer гостя: {}", e));
-                            *status_clone.write() = ConnectionStatus::Failed { error: e };
-                        }
-                    }
-                }
-                Err(e) => {
-                    logger_clone.warn(&format!("Сигналинг комнаты завершился: {}", e));
-                }
-            }
+            run_sfu_host_loop(
+                arc_socket,
+                host_signaling,
+                code_for_task,
+                node_clone,
+            ).await;
         });
-        *self.session_abort.write() = Some(task.abort_handle());
 
+        *self.session_abort.write() = Some(task.abort_handle());
         Ok(clean_code)
     }
 
-    /// Mode: Client joins room with a 6-digit code
+    /// Mode: Client joins Star-SFU room with a 6-digit code
     pub async fn join_room(
         &self,
         room_code: String,
@@ -655,7 +752,7 @@ impl P2pNode {
 
         let clean_code = crate::signaling::sanitize_room_code(&room_code);
         self.logger.info(&format!(
-            "Вход в комнату '{}' (Код: {}), никнейм '{}'",
+            "Вход в Star-SFU комнату '{}' (Код: {}), клиент '{}'",
             room_code, clean_code, nickname
         ));
 
@@ -675,135 +772,1076 @@ impl P2pNode {
         let arc_socket = Arc::new(socket);
         *self.active_socket.write() = Some(arc_socket.clone());
 
-        // 2. Gather candidates (LAN + STUN)
+        // 2. Gather candidates
         let candidates = gather_candidates(arc_socket.clone(), actual_port, opt_physical_ip, &self.logger).await;
-        let answer_link = create_answer_link(&nickname, candidates.clone());
 
-        // 3. Exchange via Signaling broker
-        let logger_clone = self.logger.clone();
-        let sock_clone = arc_socket.clone();
-        let status_clone = self.status.clone();
-        let peers_clone = self.peers.clone();
-        let active_peer_clone = self.active_peer_addr.clone();
-        let relay_sender_clone = self.relay_sender.clone();
-        let chat_clone = self.chat_messages.clone();
-        let seen_msg_clone = self.seen_msg_ids.clone();
-        let pending_clone = self.pending_acks.clone();
-        let shutdown_clone = self.shutdown_signal.clone();
-        let client_name = nickname.clone();
-        let next_id = self.next_peer_id.clone();
-        let my_candidates = candidates.clone();
+        let my_nonce = rand::random::<u64>();
+        let client_initial_id = (rand::random::<u32>() % 9000 + 1000).max(2);
+        self.my_peer_id.store(client_initial_id, Ordering::SeqCst);
+        *self.my_nickname.write() = nickname.clone();
+        self.is_host.store(false, Ordering::SeqCst);
+        *self.current_room_code.write() = Some(clean_code.clone());
+
+        let answer_link = create_answer_link_with_id(
+            &nickname,
+            candidates.clone(),
+            Some(client_initial_id),
+            Some(my_nonce),
+        );
+
+        let node_clone = self.clone();
         let code_for_task = clean_code.clone();
-        let audio_engine_clone = self.audio_engine.clone();
-        let latest_video_clone = self.latest_remote_video.clone();
-        let remote_media_clone = self.remote_media_state.clone();
 
         let task = tokio::spawn(async move {
-            let offer_res = MqttSignaling::client_exchange(&code_for_task, &answer_link, Duration::from_secs(45), &logger_clone).await;
-
-            if shutdown_clone.load(Ordering::Relaxed) {
-                return;
-            }
-
-            match offer_res {
-                Ok(offer_str) => {
-                    match parse_offer_link(&offer_str) {
-                        Ok(offer) => {
-                            logger_clone.info(&format!("Offer от хоста '{}' получен! Начинаем встречное пробитие NAT...", offer.name));
-                            run_simultaneous_punching_flow(
-                                sock_clone,
-                                client_name,
-                                offer.room,
-                                code_for_task,
-                                offer.name,
-                                offer.candidates,
-                                my_candidates,
-                                status_clone,
-                                peers_clone,
-                                active_peer_clone,
-                                relay_sender_clone,
-                                chat_clone,
-                                seen_msg_clone,
-                                pending_clone,
-                                shutdown_clone,
-                                logger_clone,
-                                next_id,
-                                audio_engine_clone,
-                                latest_video_clone,
-                                remote_media_clone,
-                            ).await;
-                        }
-                        Err(e) => {
-                            logger_clone.error(&format!("Ошибка разбора Offer: {}", e));
-                            *status_clone.write() = ConnectionStatus::Failed { error: e };
-                        }
-                    }
-                }
-                Err(e) => {
-                    logger_clone.error(&format!("Не удалось подключиться: {}", e));
-                    *status_clone.write() = ConnectionStatus::Failed { error: e };
-                }
-            }
+            run_sfu_client_connection(
+                arc_socket,
+                code_for_task,
+                answer_link,
+                candidates,
+                client_initial_id,
+                my_nonce,
+                node_clone,
+            ).await;
         });
-        *self.session_abort.write() = Some(task.abort_handle());
 
+        *self.session_abort.write() = Some(task.abort_handle());
         Ok(())
     }
 }
 
-/// Gathers LAN and STUN candidates
-async fn gather_candidates(
-    socket: Arc<UdpSocket>,
-    port: u16,
-    opt_physical_ip: Option<Ipv4Addr>,
-    logger: &AppLogger,
-) -> Vec<SocketAddr> {
+/// Builds full list of peers in the room including the host itself
+fn build_host_peer_list(node: &P2pNode) -> Vec<PeerInfo> {
     let mut list = Vec::new();
-
-    // 1. Local LAN IP: prioritize chosen physical interface IP, fallback to auto-detection
-    let lan_ip = opt_physical_ip.map(IpAddr::V4).unwrap_or_else(detect_local_lan_ip);
-    let local_addr = SocketAddr::new(lan_ip, port);
-    list.push(local_addr);
-    logger.info(&format!("Локальный адрес кандидата: {}", local_addr));
-
-    // 2. STUN Public IP
-    if let Some(pub_addr) = discover_public_ip_via_stun(socket, logger).await {
-        logger.info(&format!("STUN публичный адрес кандидата: {}", pub_addr));
-        if !list.contains(&pub_addr) {
-            list.push(pub_addr);
+    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+    let my_name = node.my_nickname.read().clone();
+    list.push(PeerInfo {
+        id: my_id,
+        name: my_name,
+        addr: "".into(),
+        ping_ms: 0,
+        last_seen_ms: now_ms(),
+        is_host: node.is_host.load(Ordering::Relaxed),
+        is_speaking: false,
+        mic_muted: false,
+        deafened: false,
+        video_active: false,
+        screen_active: false,
+    });
+    for p in node.peers.read().values() {
+        if p.id != my_id {
+            list.push(p.clone());
         }
-    } else {
-        logger.warn("STUN: не удалось определить публичный адрес (будет использован LAN/VPN адрес)");
     }
-
     list
 }
 
-/// Expand candidates with delta ports for Symmetric NAT / CGNAT port drift
-fn expand_candidates_with_port_spray(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
-    let mut targets = Vec::new();
-    for &addr in candidates {
-        targets.push(addr);
-        if let SocketAddr::V4(v4) = addr {
-            let port = v4.port();
-            for delta in [-5i32, -4, -3, -2, -1, 1, 2, 3, 4, 5] {
-                let p = port as i32 + delta;
-                if (1024..=65535).contains(&p) {
-                    let sprayed = SocketAddr::new(IpAddr::V4(*v4.ip()), p as u16);
-                    if !targets.contains(&sprayed) {
-                        targets.push(sprayed);
+/// Star-SFU Host Loop: receives packets from all guests and forwards them across the room
+async fn run_sfu_host_loop(
+    socket: Arc<UdpSocket>,
+    mut host_signaling: HostSignalingSession,
+    room_code: String,
+    node: P2pNode,
+) {
+    node.logger.info("============================================================");
+    node.logger.info(&format!("STAR-SFU ХОСТ АКТИВЕН ДЛЯ КОМНАТЫ '{}'", room_code));
+    node.logger.info("============================================================");
+
+    let mut buf = [0u8; 4096];
+    let mut video_reassembler = VideoReassembler::new();
+    let mut last_ping_broadcast = Instant::now();
+    let mut ping_seq = 0u64;
+
+    // Background Audio Transmitter for Host
+    let audio_sock = socket.clone();
+    let node_audio = node.clone();
+    let audio_tx_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut audio_seq = 0u64;
+
+        while !node_audio.shutdown_signal.load(Ordering::Relaxed) {
+            interval.tick().await;
+            let my_id = node_audio.my_peer_id.load(Ordering::Relaxed);
+            for audio_payload in node_audio.audio_engine.pop_outgoing_packets() {
+                audio_seq += 1;
+                let audio_pkt = Packet::AudioData {
+                    sender_id: my_id,
+                    seq: audio_seq,
+                    data: audio_payload,
+                };
+                if let Ok(b) = audio_pkt.encode() {
+                    let opt_haddr = *node_audio.host_socket_addr.read();
+                    if node_audio.is_host.load(Ordering::Relaxed) {
+                        let client_addrs: Vec<SocketAddr> = node_audio.client_endpoints.read().values().cloned().collect();
+                        for caddr in client_addrs {
+                            let _ = audio_sock.send_to(&b, caddr).await;
+                        }
+                    } else if let Some(haddr) = opt_haddr {
+                        let _ = audio_sock.send_to(&b, haddr).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut last_diag_log = Instant::now();
+
+    while !node.shutdown_signal.load(Ordering::Relaxed) {
+        // Periodic audio diagnostics logging every 10s
+        if last_diag_log.elapsed() >= Duration::from_secs(10) {
+            let (rx, tx, starves, jb_samples) = node.audio_engine.get_audio_diagnostics();
+            node.logger.info(&format!(
+                "[AUDIO ДИАГНОСТИКА] Пакетов получено: {}, отправлено: {}, голоданий: {}, сэмплов в буфере: {}",
+                rx, tx, starves, jb_samples
+            ));
+            last_diag_log = Instant::now();
+        }
+
+        // Periodic ping and peer list broadcast every 2.5s
+        if last_ping_broadcast.elapsed() >= Duration::from_millis(2500) {
+            ping_seq += 1;
+            let my_id = node.my_peer_id.load(Ordering::Relaxed);
+            let ping_pkt = Packet::Ping {
+                sender_id: my_id,
+                seq: ping_seq,
+                timestamp_ms: now_ms(),
+            };
+            node.broadcast_packet(&ping_pkt).await;
+
+            // Compute backup host (guest with lowest peer id)
+            let backup_id = {
+                let p_guard = node.peers.read();
+                p_guard.keys().filter(|&&id| id != 1).min().cloned()
+            };
+            *node.backup_host_id.write() = backup_id;
+
+            let peers_list = build_host_peer_list(&node);
+            let update_pkt = Packet::PeerListUpdate {
+                host_id: my_id,
+                backup_host_id: backup_id,
+                peers: peers_list,
+            };
+            node.broadcast_packet(&update_pkt).await;
+
+            // Update connected count in Hosting/Connected status
+            let connected_count = node.peers.read().len();
+            let mut st = node.status.write();
+            if let ConnectionStatus::Connected { connected_count: cc, peer_name, .. } = &mut *st {
+                *cc = connected_count;
+                *peer_name = if connected_count == 0 {
+                    "Ожидание гостей".into()
+                } else {
+                    format!("Участников: {}", connected_count + 1)
+                };
+            }
+
+            last_ping_broadcast = Instant::now();
+        }
+
+        tokio::select! {
+            // 1. Incoming Answers from Nostr Signaling for new guests
+            Some(answer_str) = host_signaling.incoming_answers.recv() => {
+                if let Ok(answer) = parse_answer_link(&answer_str) {
+                    node.logger.info(&format!(
+                        "SFU Хост: получен запрос на подключение от гостя '{}'!",
+                        answer.name
+                    ));
+                    let _assigned_id = answer.guest_id.unwrap_or_else(|| node.next_peer_id.fetch_add(1, Ordering::SeqCst));
+                    let targets = expand_candidates_with_port_spray(&answer.candidates);
+
+                    let sock_clone = socket.clone();
+                    let my_name = node.my_nickname.read().clone();
+                    let node_punch = node.clone();
+                    let guest_id_opt = answer.guest_id;
+                    tokio::spawn(async move {
+                        let punch_pkt = Packet::Punch {
+                            nonce: answer.nonce.unwrap_or_else(rand::random),
+                            sender_name: my_name,
+                            sender_id: 1,
+                        };
+                        if let Ok(b) = punch_pkt.encode() {
+                            let punch_start = Instant::now();
+                            while punch_start.elapsed() < Duration::from_secs(7) {
+                                if let Some(gid) = guest_id_opt {
+                                    if node_punch.client_endpoints.read().contains_key(&gid) {
+                                        break;
+                                    }
+                                }
+                                for &t in &targets {
+                                    let _ = sock_clone.send_to(&b, t).await;
+                                }
+                                tokio::time::sleep(Duration::from_millis(70)).await;
+                            }
+                        }
+                    });
+                }
+            }
+
+            // 2. Incoming UDP packets from connected guests
+            recv_res = socket.recv_from(&mut buf) => {
+                match recv_res {
+                    Ok((len, sender_addr)) => {
+                        if let Ok(pkt) = Packet::decode(&buf[..len]) {
+                            match pkt {
+                                Packet::Punch { nonce, sender_name, sender_id } => {
+                                    node.logger.info(&format!(
+                                        "SFU Хост: подключился гость '{}' (id={}, addr={})!",
+                                        sender_name, sender_id, sender_addr
+                                    ));
+
+                                    // Send PunchAck
+                                    let ack = Packet::PunchAck {
+                                        nonce,
+                                        sender_name: node.my_nickname.read().clone(),
+                                        sender_id: 1,
+                                    };
+                                    if let Ok(ack_b) = ack.encode() {
+                                        for _ in 0..3 {
+                                            let _ = socket.send_to(&ack_b, sender_addr).await;
+                                        }
+                                    }
+
+                                    // Register in client endpoints and peer table
+                                    node.client_endpoints.write().insert(sender_id, sender_addr);
+                                    node.peer_addrs.write().insert(sender_addr, sender_id);
+                                    node.peers.write().insert(
+                                        sender_id,
+                                        PeerInfo {
+                                            id: sender_id,
+                                            name: sender_name.clone(),
+                                            addr: sender_addr.to_string(),
+                                            ping_ms: 1,
+                                            last_seen_ms: now_ms(),
+                                            is_host: false,
+                                            is_speaking: false,
+                                            mic_muted: false,
+                                            deafened: false,
+                                            video_active: false,
+                                            screen_active: false,
+                                        },
+                                    );
+
+                                    // Send ConnectAccept with current peer list
+                                    let accept = Packet::ConnectAccept {
+                                        assigned_id: sender_id,
+                                        host_id: node.my_peer_id.load(Ordering::Relaxed),
+                                        host_name: node.my_nickname.read().clone(),
+                                        room_name: room_code.clone(),
+                                        peers: build_host_peer_list(&node),
+                                    };
+                                    if let Ok(b) = accept.encode() {
+                                        let _ = socket.send_to(&b, sender_addr).await;
+                                    }
+
+                                    node.audio_engine.play_connect_chime();
+                                }
+                                Packet::PunchAck { sender_name, sender_id, .. } => {
+                                    node.client_endpoints.write().insert(sender_id, sender_addr);
+                                    node.peer_addrs.write().insert(sender_addr, sender_id);
+                                    if let Some(p) = node.peers.write().get_mut(&sender_id) {
+                                        p.last_seen_ms = now_ms();
+                                        p.name = sender_name;
+                                    }
+                                }
+                                Packet::AudioData { sender_id, seq, data } => {
+                                    // Host feeds locally into mixer
+                                    node.audio_engine.feed_incoming_packet(sender_id, &data);
+                                    if let Some(p) = node.peers.write().get_mut(&sender_id) {
+                                        p.last_seen_ms = now_ms();
+                                    }
+
+                                    // SFU FORWARDING: Relay audio to all OTHER clients if we are host
+                                    if node.is_host.load(Ordering::Relaxed) {
+                                        let forward_pkt = Packet::AudioData { sender_id, seq, data };
+                                        if let Ok(forward_bytes) = forward_pkt.encode() {
+                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
+                                            for caddr in endpoints {
+                                                if caddr != sender_addr {
+                                                    let _ = socket.send_to(&forward_bytes, caddr).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Packet::VideoChunk {
+                                    sender_id,
+                                    frame_id,
+                                    chunk_idx,
+                                    chunk_total,
+                                    is_screen,
+                                    data,
+                                } => {
+                                    // Host feeds into local video reassembler
+                                    video_reassembler.handle_chunk(
+                                        sender_id,
+                                        frame_id,
+                                        chunk_idx,
+                                        chunk_total,
+                                        is_screen,
+                                        data.clone(),
+                                        &node.latest_remote_video,
+                                    );
+                                    if let Some(p) = node.peers.write().get_mut(&sender_id) {
+                                        p.last_seen_ms = now_ms();
+                                    }
+
+                                    // SFU FORWARDING: Relay video chunk to all other clients if we are host
+                                    if node.is_host.load(Ordering::Relaxed) {
+                                        let forward_pkt = Packet::VideoChunk {
+                                            sender_id,
+                                            frame_id,
+                                            chunk_idx,
+                                            chunk_total,
+                                            is_screen,
+                                            data,
+                                        };
+                                        if let Ok(forward_bytes) = forward_pkt.encode() {
+                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
+                                            for caddr in endpoints {
+                                                if caddr != sender_addr {
+                                                    let _ = socket.send_to(&forward_bytes, caddr).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Packet::TextMessage { id, sender_id, text, sender_name, timestamp_ms } => {
+                                    let ack = Packet::TextAck { id };
+                                    if let Ok(ack_b) = ack.encode() {
+                                        let _ = socket.send_to(&ack_b, sender_addr).await;
+                                    }
+
+                                    let is_new = node.seen_msg_ids.write().insert(id);
+                                    if is_new {
+                                        node.logger.info(&format!("[ЧАТ SFU] {}: {}", sender_name, text));
+                                        node.chat_messages.write().push(ChatMessage {
+                                             id,
+                                             sender: sender_name.clone(),
+                                             text: text.clone(),
+                                             timestamp_ms,
+                                             is_me: false,
+                                        });
+
+                                        // SFU FORWARDING: Relay text message to all other clients
+                                        let forward_pkt = Packet::TextMessage {
+                                            id,
+                                            sender_id,
+                                            text,
+                                            sender_name,
+                                            timestamp_ms,
+                                        };
+                                        if let Ok(fb) = forward_pkt.encode() {
+                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
+                                            for caddr in endpoints {
+                                                if caddr != sender_addr {
+                                                    let _ = socket.send_to(&fb, caddr).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Packet::MediaState { sender_id, mic_muted, deafened, video_active, screen_active } => {
+                                    if let Some(p) = node.peers.write().get_mut(&sender_id) {
+                                        p.mic_muted = mic_muted;
+                                        p.deafened = deafened;
+                                        p.video_active = video_active;
+                                        p.screen_active = screen_active;
+                                        p.last_seen_ms = now_ms();
+                                    }
+
+                                    // SFU FORWARDING: Relay media state to all other clients
+                                    let forward_pkt = Packet::MediaState { sender_id, mic_muted, deafened, video_active, screen_active };
+                                    if let Ok(fb) = forward_pkt.encode() {
+                                        let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
+                                        for caddr in endpoints {
+                                            if caddr != sender_addr {
+                                                let _ = socket.send_to(&fb, caddr).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                Packet::Ping { sender_id, seq, timestamp_ms } => {
+                                    let pong = Packet::Pong { sender_id: 1, seq, timestamp_ms };
+                                    if let Ok(b) = pong.encode() {
+                                        let _ = socket.send_to(&b, sender_addr).await;
+                                    }
+                                    if let Some(p) = node.peers.write().get_mut(&sender_id) {
+                                        p.last_seen_ms = now_ms();
+                                    }
+                                }
+                                Packet::Pong { sender_id, timestamp_ms, .. } => {
+                                    let rtt = (now_ms().saturating_sub(timestamp_ms) as u32).max(1);
+                                    if let Some(p) = node.peers.write().get_mut(&sender_id) {
+                                        p.ping_ms = rtt;
+                                        p.last_seen_ms = now_ms();
+                                    }
+                                }
+                                Packet::Disconnect { sender_id, reason } => {
+                                    node.logger.warn(&format!("Гость (id={}) отключился: {}", sender_id, reason));
+                                    node.client_endpoints.write().remove(&sender_id);
+                                    node.peer_addrs.write().remove(&sender_addr);
+                                    node.peers.write().remove(&sender_id);
+                                    node.audio_engine.play_disconnect_chime();
+
+                                    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                    let update = Packet::PeerListUpdate {
+                                        host_id: my_id,
+                                        backup_host_id: *node.backup_host_id.read(),
+                                        peers: build_host_peer_list(&node),
+                                    };
+                                    node.broadcast_packet(&update).await;
+                                }
+                                Packet::NicknameUpdate { sender_id, new_nickname } => {
+                                    node.logger.info(&format!("[SFU] Участник (id={}) обновил имя на '{}'", sender_id, new_nickname));
+                                    if let Some(p) = node.peers.write().get_mut(&sender_id) {
+                                        p.name = new_nickname.clone();
+                                    }
+                                    if node.is_host.load(Ordering::Relaxed) {
+                                        let fwd = Packet::NicknameUpdate { sender_id, new_nickname };
+                                        if let Ok(fb) = fwd.encode() {
+                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
+                                            for caddr in endpoints {
+                                                if caddr != sender_addr {
+                                                    let _ = socket.send_to(&fb, caddr).await;
+                                                }
+                                            }
+                                        }
+                                        let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                        let update = Packet::PeerListUpdate {
+                                            host_id: my_id,
+                                            backup_host_id: *node.backup_host_id.read(),
+                                            peers: build_host_peer_list(&node),
+                                        };
+                                        node.broadcast_packet(&update).await;
+                                    }
+                                }
+                                Packet::HostHandover { new_host_id, .. } => {
+                                    node.current_host_id.store(new_host_id, Ordering::SeqCst);
+                                    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                    if new_host_id != my_id {
+                                        node.is_host.store(false, Ordering::SeqCst);
+                                        let mut peers_guard = node.peers.write();
+                                        for p in peers_guard.values_mut() {
+                                            p.is_host = p.id == new_host_id;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if e.raw_os_error() != Some(10054) {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
                     }
                 }
             }
         }
     }
-    targets
+
+    audio_tx_task.abort();
+    node.audio_engine.stop();
+}
+
+/// Star-SFU Client Connection & Connected Session
+async fn run_sfu_client_connection(
+    socket: Arc<UdpSocket>,
+    room_code: String,
+    answer_link: String,
+    _my_candidates: Vec<SocketAddr>,
+    client_initial_id: u32,
+    my_nonce: u64,
+    node: P2pNode,
+) {
+    node.logger.info(&format!("Поиск комнаты '{}' на WSS-релеях...", room_code));
+
+    let offer_res = MqttSignaling::client_exchange(&room_code, &answer_link, Duration::from_secs(45), &node.logger).await;
+
+    if node.shutdown_signal.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let offer = match offer_res {
+        Ok(str_offer) => match parse_offer_link(&str_offer) {
+            Ok(off) => off,
+            Err(e) => {
+                node.logger.error(&format!("Ошибка разбора Offer: {}", e));
+                *node.status.write() = ConnectionStatus::Failed { error: e };
+                return;
+            }
+        },
+        Err(e) => {
+            node.logger.error(&format!("Не удалось найти хоста: {}", e));
+            *node.status.write() = ConnectionStatus::Failed { error: e };
+            return;
+        }
+    };
+
+    node.logger.info(&format!("Offer от хоста '{}' получен! Начинаем пробитие NAT...", offer.name));
+    *node.status.write() = ConnectionStatus::Connecting {
+        target_str: offer.name.clone(),
+        attempt: 1,
+        max_attempts: 2,
+        mode: "Пробитие UDP к SFU Хосту...".into(),
+    };
+
+    let targets = expand_candidates_with_port_spray(&offer.candidates);
+    let punch_pkt = Packet::Punch {
+        nonce: my_nonce,
+        sender_name: node.my_nickname.read().clone(),
+        sender_id: client_initial_id,
+    };
+    let punch_bytes = match punch_pkt.encode() {
+        Ok(b) => b,
+        Err(e) => {
+            node.logger.error(&format!("Ошибка кодирования Punch: {}", e));
+            return;
+        }
+    };
+
+    let mut buf = [0u8; 4096];
+    let punch_start = Instant::now();
+    let punch_timeout = Duration::from_secs(8);
+    let mut last_blast = Instant::now() - Duration::from_secs(1);
+    let mut connected_host_addr: Option<SocketAddr> = None;
+
+    while punch_start.elapsed() < punch_timeout && !node.shutdown_signal.load(Ordering::Relaxed) {
+        if last_blast.elapsed() >= Duration::from_millis(70) {
+            for &t in &targets {
+                let _ = socket.send_to(&punch_bytes, t).await;
+            }
+            last_blast = Instant::now();
+        }
+
+        tokio::select! {
+            recv_res = socket.recv_from(&mut buf) => {
+                match recv_res {
+                    Ok((len, sender_addr)) => {
+                        if let Ok(pkt) = Packet::decode(&buf[..len]) {
+                            match pkt {
+                                Packet::PunchAck { .. } | Packet::ConnectAccept { .. } => {
+                                    node.logger.info(&format!("УСПЕХ: канал к SFU Хосту ({}) открыт!", sender_addr));
+                                    connected_host_addr = Some(sender_addr);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if e.raw_os_error() != Some(10054) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(15)) => {}
+        }
+    }
+
+    if node.shutdown_signal.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let host_addr = match connected_host_addr {
+        Some(a) => a,
+        None => {
+            node.logger.warn("Прямое UDP пробитие к хосту не удалось. Переключаемся на резервный WSS релей...");
+            *node.status.write() = ConnectionStatus::Connecting {
+                target_str: offer.name.clone(),
+                attempt: 2,
+                max_attempts: 2,
+                mode: "Подключение через WSS релей...".into(),
+            };
+
+            let my_name = node.my_nickname.read().clone();
+            match MqttSignaling::start_relay_session(&room_code, &my_name, &node.logger).await {
+                Ok(relay_session) => {
+                    node.logger.info("Резервный релейный канал активирован!");
+                    run_relay_connected_loop(relay_session, room_code, node).await;
+                    return;
+                }
+                Err(e) => {
+                    let err = format!("Не удалось подключиться к комнате: {}", e);
+                    node.logger.error(&err);
+                    *node.status.write() = ConnectionStatus::Failed { error: err };
+                    return;
+                }
+            }
+        }
+    };
+
+    // Client connected to Host over UDP
+    *node.host_socket_addr.write() = Some(host_addr);
+    *node.status.write() = ConnectionStatus::Connected {
+        my_id: client_initial_id,
+        is_host: false,
+        host_name: offer.name.clone(),
+        peer_name: offer.name.clone(),
+        peer_addr: host_addr.to_string(),
+        room_name: offer.room.clone(),
+        room_code: Some(room_code.clone()),
+        ping_ms: 1,
+        connected_count: 1,
+    };
+
+    if let Err(e) = node.audio_engine.start() {
+        node.logger.error(&format!("Не удалось запустить аудио движок: {}", e));
+    } else {
+        node.audio_engine.play_connect_chime();
+    }
+
+    // Launch Audio Transmitter
+    let audio_sock = socket.clone();
+    let node_audio = node.clone();
+    let audio_tx_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut audio_seq = 0u64;
+
+        while !node_audio.shutdown_signal.load(Ordering::Relaxed) {
+            interval.tick().await;
+            let my_id = node_audio.my_peer_id.load(Ordering::Relaxed);
+            let is_host = node_audio.is_host.load(Ordering::Relaxed);
+            for audio_payload in node_audio.audio_engine.pop_outgoing_packets() {
+                audio_seq += 1;
+                let audio_pkt = Packet::AudioData {
+                    sender_id: my_id,
+                    seq: audio_seq,
+                    data: audio_payload,
+                };
+                if let Ok(b) = audio_pkt.encode() {
+                    let opt_haddr = *node_audio.host_socket_addr.read();
+                    if is_host {
+                        let endpoints: Vec<SocketAddr> = node_audio.client_endpoints.read().values().cloned().collect();
+                        for caddr in endpoints {
+                            let _ = audio_sock.send_to(&b, caddr).await;
+                        }
+                    } else if let Some(haddr) = opt_haddr {
+                        let _ = audio_sock.send_to(&b, haddr).await;
+                    } else {
+                        let _ = audio_sock.send_to(&b, host_addr).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut last_ping = Instant::now();
+    let mut ping_seq = 0u64;
+    let mut video_reassembler = VideoReassembler::new();
+    let mut last_host_packet = Instant::now();
+    let mut last_diag_log = Instant::now();
+
+    while !node.shutdown_signal.load(Ordering::Relaxed) {
+        // Periodic audio diagnostics logging every 10s
+        if last_diag_log.elapsed() >= Duration::from_secs(10) {
+            let (rx, tx, starves, jb_samples) = node.audio_engine.get_audio_diagnostics();
+            node.logger.info(&format!(
+                "[AUDIO ДИАГНОСТИКА] Пакетов получено: {}, отправлено: {}, голоданий: {}, сэмплов в буфере: {}",
+                rx, tx, starves, jb_samples
+            ));
+            last_diag_log = Instant::now();
+        }
+
+        let is_promoted_host = node.is_host.load(Ordering::Relaxed);
+
+        if last_ping.elapsed() >= Duration::from_millis(1500) {
+            ping_seq += 1;
+            let my_id = node.my_peer_id.load(Ordering::Relaxed);
+            let ping_pkt = Packet::Ping {
+                sender_id: my_id,
+                seq: ping_seq,
+                timestamp_ms: now_ms(),
+            };
+
+            if is_promoted_host {
+                // If we became host, broadcast ping and peer list to all connected clients
+                node.broadcast_packet(&ping_pkt).await;
+
+                let update_pkt = Packet::PeerListUpdate {
+                    host_id: my_id,
+                    backup_host_id: *node.backup_host_id.read(),
+                    peers: build_host_peer_list(&node),
+                };
+                node.broadcast_packet(&update_pkt).await;
+            } else {
+                if let Ok(b) = ping_pkt.encode() {
+                    let target = node.host_socket_addr.read().unwrap_or(host_addr);
+                    let _ = socket.send_to(&b, target).await;
+                }
+            }
+            last_ping = Instant::now();
+
+            // Failover check: if no packet from host for > 3.5s and we are not host yet
+            if !is_promoted_host && last_host_packet.elapsed() > Duration::from_millis(3500) {
+                let backup_id = *node.backup_host_id.read();
+                let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                let should_promote = match backup_id {
+                    Some(b_id) => b_id == my_id,
+                    None => true,
+                };
+
+                if should_promote {
+                    node.logger.warn("Хост перестал отвечать! Принимаем роль SFU Хоста без разрыва связи...");
+                    node.is_host.store(true, Ordering::SeqCst);
+                    node.current_host_id.store(my_id, Ordering::SeqCst);
+                    *node.host_socket_addr.write() = None;
+                    let my_name = node.my_nickname.read().clone();
+                    {
+                        let mut st = node.status.write();
+                        if let ConnectionStatus::Connected { is_host, host_name, .. } = &mut *st {
+                            *is_host = true;
+                            *host_name = my_name;
+                        }
+                    }
+                    let claim_pkt = Packet::ClaimHost {
+                        candidate_id: my_id,
+                        reason: "Предыдущий хост отключился".into(),
+                    };
+                    node.broadcast_packet(&claim_pkt).await;
+                }
+            }
+        }
+
+        tokio::select! {
+            recv_res = socket.recv_from(&mut buf) => {
+                match recv_res {
+                    Ok((len, sender_addr)) => {
+                        last_host_packet = Instant::now();
+                        if let Ok(pkt) = Packet::decode(&buf[..len]) {
+                            match pkt {
+                                Packet::ConnectAccept { assigned_id, host_id, peers, .. } => {
+                                    node.my_peer_id.store(assigned_id, Ordering::SeqCst);
+                                    node.current_host_id.store(host_id, Ordering::SeqCst);
+                                    let mut p_guard = node.peers.write();
+                                    p_guard.clear();
+                                    for p in peers {
+                                        if p.id != assigned_id {
+                                            p_guard.insert(p.id, p);
+                                        }
+                                    }
+                                }
+                                Packet::PeerListUpdate { host_id, backup_host_id, peers } => {
+                                    node.current_host_id.store(host_id, Ordering::SeqCst);
+                                    *node.backup_host_id.write() = backup_host_id;
+                                    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                    let mut p_guard = node.peers.write();
+                                    p_guard.clear();
+                                    for p in peers {
+                                        if p.id != my_id {
+                                            p_guard.insert(p.id, p);
+                                        }
+                                    }
+                                }
+                                Packet::AudioData { sender_id, seq, data } => {
+                                    node.audio_engine.feed_incoming_packet(sender_id, &data);
+                                    if let Some(p) = node.peers.write().get_mut(&sender_id) {
+                                        p.last_seen_ms = now_ms();
+                                    }
+
+                                    // If this client was promoted to SFU Host, relay audio to all other clients
+                                    if node.is_host.load(Ordering::Relaxed) {
+                                        let forward_pkt = Packet::AudioData { sender_id, seq, data };
+                                        if let Ok(forward_bytes) = forward_pkt.encode() {
+                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
+                                            for caddr in endpoints {
+                                                if caddr != sender_addr {
+                                                    let _ = socket.send_to(&forward_bytes, caddr).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Packet::VideoChunk { sender_id, frame_id, chunk_idx, chunk_total, is_screen, data } => {
+                                    video_reassembler.handle_chunk(
+                                        sender_id,
+                                        frame_id,
+                                        chunk_idx,
+                                        chunk_total,
+                                        is_screen,
+                                        data.clone(),
+                                        &node.latest_remote_video,
+                                    );
+                                    if let Some(p) = node.peers.write().get_mut(&sender_id) {
+                                        p.last_seen_ms = now_ms();
+                                    }
+
+                                    // If promoted to host, forward video chunk to other clients
+                                    if node.is_host.load(Ordering::Relaxed) {
+                                        let forward_pkt = Packet::VideoChunk {
+                                            sender_id,
+                                            frame_id,
+                                            chunk_idx,
+                                            chunk_total,
+                                            is_screen,
+                                            data,
+                                        };
+                                        if let Ok(forward_bytes) = forward_pkt.encode() {
+                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
+                                            for caddr in endpoints {
+                                                if caddr != sender_addr {
+                                                    let _ = socket.send_to(&forward_bytes, caddr).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Packet::TextMessage { id, sender_id, text, sender_name, timestamp_ms } => {
+                                    let is_new = node.seen_msg_ids.write().insert(id);
+                                    if is_new {
+                                        node.logger.info(&format!("[ЧАТ] {}: {}", sender_name, text));
+                                        node.chat_messages.write().push(ChatMessage {
+                                            id,
+                                            sender: sender_name.clone(),
+                                            text: text.clone(),
+                                            timestamp_ms,
+                                            is_me: false,
+                                        });
+
+                                        // If promoted to host, forward text message to other clients
+                                        if node.is_host.load(Ordering::Relaxed) {
+                                            let forward_pkt = Packet::TextMessage {
+                                                id,
+                                                sender_id,
+                                                text,
+                                                sender_name,
+                                                timestamp_ms,
+                                            };
+                                            if let Ok(fb) = forward_pkt.encode() {
+                                                let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
+                                                for caddr in endpoints {
+                                                    if caddr != sender_addr {
+                                                        let _ = socket.send_to(&fb, caddr).await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Packet::MediaState { sender_id, mic_muted, deafened, video_active, screen_active } => {
+                                    if let Some(p) = node.peers.write().get_mut(&sender_id) {
+                                        p.mic_muted = mic_muted;
+                                        p.deafened = deafened;
+                                        p.video_active = video_active;
+                                        p.screen_active = screen_active;
+                                    }
+
+                                    // If promoted to host, forward media state to other clients
+                                    if node.is_host.load(Ordering::Relaxed) {
+                                        let forward_pkt = Packet::MediaState { sender_id, mic_muted, deafened, video_active, screen_active };
+                                        if let Ok(fb) = forward_pkt.encode() {
+                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
+                                            for caddr in endpoints {
+                                                if caddr != sender_addr {
+                                                    let _ = socket.send_to(&fb, caddr).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Packet::HostHandover { old_host_id, new_host_id } => {
+                                    node.current_host_id.store(new_host_id, Ordering::SeqCst);
+                                    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                    if new_host_id == my_id {
+                                        node.logger.warn("👑 Вам передана роль SFU Хоста! Переключение режима без разрыва соединения...");
+                                        node.is_host.store(true, Ordering::SeqCst);
+                                        *node.host_socket_addr.write() = None;
+                                        node.client_endpoints.write().insert(old_host_id, sender_addr);
+                                        node.peer_addrs.write().insert(sender_addr, old_host_id);
+                                        if let Some(p) = node.peers.write().get_mut(&old_host_id) {
+                                            p.is_host = false;
+                                        }
+                                        let my_name = node.my_nickname.read().clone();
+                                        {
+                                            let mut st = node.status.write();
+                                            if let ConnectionStatus::Connected { is_host, host_name, .. } = &mut *st {
+                                                *is_host = true;
+                                                *host_name = my_name;
+                                            }
+                                        }
+                                        let update = Packet::PeerListUpdate {
+                                            host_id: my_id,
+                                            backup_host_id: *node.backup_host_id.read(),
+                                            peers: build_host_peer_list(&node),
+                                        };
+                                        node.broadcast_packet(&update).await;
+                                    } else {
+                                        if let Some(p) = node.peers.write().get_mut(&new_host_id) {
+                                            p.is_host = true;
+                                            if let Ok(parsed) = p.addr.parse::<SocketAddr>() {
+                                                *node.host_socket_addr.write() = Some(parsed);
+                                            }
+                                        }
+                                        if let Some(p) = node.peers.write().get_mut(&old_host_id) {
+                                            p.is_host = false;
+                                        }
+                                    }
+                                }
+                                Packet::NicknameUpdate { sender_id, new_nickname } => {
+                                    node.logger.info(&format!("Участник (id={}) обновил имя на '{}'", sender_id, new_nickname));
+                                    if sender_id == node.current_host_id.load(Ordering::Relaxed) {
+                                        let mut st = node.status.write();
+                                        if let ConnectionStatus::Connected { host_name, .. } = &mut *st {
+                                            *host_name = new_nickname.clone();
+                                        }
+                                    }
+                                    if let Some(p) = node.peers.write().get_mut(&sender_id) {
+                                        p.name = new_nickname.clone();
+                                    }
+                                    if node.is_host.load(Ordering::Relaxed) {
+                                        let fwd = Packet::NicknameUpdate { sender_id, new_nickname };
+                                        if let Ok(fb) = fwd.encode() {
+                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
+                                            for caddr in endpoints {
+                                                if caddr != sender_addr {
+                                                    let _ = socket.send_to(&fb, caddr).await;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Packet::Ping { sender_id, seq, timestamp_ms } => {
+                                    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                    let pong = Packet::Pong { sender_id: my_id, seq, timestamp_ms };
+                                    if let Ok(b) = pong.encode() {
+                                        let _ = socket.send_to(&b, sender_addr).await;
+                                    }
+                                    if let Some(p) = node.peers.write().get_mut(&sender_id) {
+                                        p.last_seen_ms = now_ms();
+                                    }
+                                }
+                                Packet::Pong { timestamp_ms, .. } => {
+                                    let rtt = (now_ms().saturating_sub(timestamp_ms) as u32).max(1);
+                                    let mut st = node.status.write();
+                                    if let ConnectionStatus::Connected { ping_ms, .. } = &mut *st {
+                                        *ping_ms = rtt;
+                                    }
+                                }
+                                Packet::Disconnect { sender_id, reason } => {
+                                    if sender_id == node.current_host_id.load(Ordering::Relaxed) {
+                                        node.logger.warn(&format!("Хост вышел: {}. Проверка смены хоста...", reason));
+                                        let backup_id = *node.backup_host_id.read();
+                                        let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                        if backup_id == Some(my_id) {
+                                            node.logger.warn("👑 Принимаем роль SFU Хоста вместо отключившегося хоста!");
+                                            node.is_host.store(true, Ordering::SeqCst);
+                                            node.current_host_id.store(my_id, Ordering::SeqCst);
+                                            *node.host_socket_addr.write() = None;
+                                            let my_name = node.my_nickname.read().clone();
+                                            let mut st = node.status.write();
+                                            if let ConnectionStatus::Connected { is_host, host_name, .. } = &mut *st {
+                                                *is_host = true;
+                                                *host_name = my_name;
+                                            }
+                                        }
+                                    } else {
+                                        node.peers.write().remove(&sender_id);
+                                        node.client_endpoints.write().remove(&sender_id);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if e.raw_os_error() != Some(10054) {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    audio_tx_task.abort();
+    node.audio_engine.stop();
+}
+
+/// Fallback WSS Relay loop for rooms behind strict CGNAT
+async fn run_relay_connected_loop(
+    mut relay_session: crate::signaling::RelaySession,
+    room_code: String,
+    node: P2pNode,
+) {
+    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+    let _my_name = node.my_nickname.read().clone();
+    *node.relay_sender.write() = Some(relay_session.outgoing_tx.clone());
+
+    *node.status.write() = ConnectionStatus::Connected {
+        my_id,
+        is_host: false,
+        host_name: "WSS Релей".into(),
+        peer_name: "WSS Релей".into(),
+        peer_addr: "Релей TLS/443".into(),
+        room_name: room_code.clone(),
+        room_code: Some(room_code),
+        ping_ms: 35,
+        connected_count: 1,
+    };
+
+    if let Err(e) = node.audio_engine.start() {
+        node.logger.error(&format!("(Релей) Не удалось запустить аудио: {}", e));
+    } else {
+        node.audio_engine.play_connect_chime();
+    }
+
+    let relay_tx = relay_session.outgoing_tx.clone();
+    let node_audio = node.clone();
+    let audio_tx_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        let mut audio_seq = 0u64;
+        while !node_audio.shutdown_signal.load(Ordering::Relaxed) {
+            interval.tick().await;
+            let mid = node_audio.my_peer_id.load(Ordering::Relaxed);
+            for p in node_audio.audio_engine.pop_outgoing_packets() {
+                audio_seq += 1;
+                let _ = relay_tx.send(Packet::AudioData { sender_id: mid, seq: audio_seq, data: p }).await;
+            }
+        }
+    });
+
+    let mut video_reassembler = VideoReassembler::new();
+
+    while !node.shutdown_signal.load(Ordering::Relaxed) {
+        tokio::select! {
+            Some(pkt) = relay_session.incoming_rx.recv() => {
+                match pkt {
+                    Packet::AudioData { sender_id, data, .. } => {
+                        node.audio_engine.feed_incoming_packet(sender_id, &data);
+                    }
+                    Packet::VideoChunk { sender_id, frame_id, chunk_idx, chunk_total, is_screen, data } => {
+                        video_reassembler.handle_chunk(sender_id, frame_id, chunk_idx, chunk_total, is_screen, data, &node.latest_remote_video);
+                    }
+                    Packet::TextMessage { id, text, sender_name, timestamp_ms, .. } => {
+                        let is_new = node.seen_msg_ids.write().insert(id);
+                        if is_new {
+                            node.chat_messages.write().push(ChatMessage {
+                                id,
+                                sender: sender_name,
+                                text,
+                                timestamp_ms,
+                                is_me: false,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(15)) => {}
+        }
+    }
+
+    audio_tx_task.abort();
+    node.audio_engine.stop();
 }
 
 struct VideoReassembler {
     current_frame_id: u32,
     chunk_total: u16,
     is_screen: bool,
+    sender_id: u32,
     chunks: Vec<Option<Vec<u8>>>,
     created_at: Instant,
 }
@@ -814,6 +1852,7 @@ impl VideoReassembler {
             current_frame_id: 0,
             chunk_total: 0,
             is_screen: false,
+            sender_id: 0,
             chunks: Vec::new(),
             created_at: Instant::now(),
         }
@@ -821,6 +1860,7 @@ impl VideoReassembler {
 
     fn handle_chunk(
         &mut self,
+        sender_id: u32,
         frame_id: u32,
         chunk_idx: u16,
         chunk_total: u16,
@@ -829,8 +1869,9 @@ impl VideoReassembler {
         target: &Arc<RwLock<Option<RemoteVideoFrame>>>,
     ) {
         use base64::Engine;
-        if frame_id > self.current_frame_id || self.created_at.elapsed() > Duration::from_millis(800) {
+        if frame_id > self.current_frame_id || sender_id != self.sender_id || self.created_at.elapsed() > Duration::from_millis(800) {
             self.current_frame_id = frame_id;
+            self.sender_id = sender_id;
             self.chunk_total = chunk_total;
             self.is_screen = is_screen;
             self.chunks = vec![None; chunk_total as usize];
@@ -849,6 +1890,7 @@ impl VideoReassembler {
                 }
                 let base64_str = base64::engine::general_purpose::STANDARD.encode(&full_bytes);
                 *target.write() = Some(RemoteVideoFrame {
+                    sender_id,
                     frame_id,
                     is_screen: self.is_screen,
                     jpeg_base64: base64_str,
@@ -860,664 +1902,49 @@ impl VideoReassembler {
     }
 }
 
-/// Core simultaneous hole punching and connected session loop
-async fn run_simultaneous_punching_flow(
+async fn gather_candidates(
     socket: Arc<UdpSocket>,
-    my_name: String,
-    room_name: String,
-    room_code: String,
-    peer_name_expected: String,
-    remote_candidates: Vec<SocketAddr>,
-    _my_candidates: Vec<SocketAddr>,
-    status: Arc<RwLock<ConnectionStatus>>,
-    peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
-    active_peer: Arc<RwLock<Option<SocketAddr>>>,
-    relay_sender: Arc<RwLock<Option<tokio::sync::mpsc::Sender<Packet>>>>,
-    chat_messages: Arc<RwLock<Vec<ChatMessage>>>,
-    seen_msg_ids: Arc<RwLock<HashSet<u64>>>,
-    pending_acks: Arc<RwLock<HashMap<u64, oneshot::Sender<()>>>>,
-    shutdown: Arc<AtomicBool>,
-    logger: AppLogger,
-    next_peer_id: Arc<AtomicU32>,
-    audio_engine: Arc<crate::audio::AudioEngine>,
-    latest_remote_video: Arc<RwLock<Option<RemoteVideoFrame>>>,
-    remote_media_state: Arc<RwLock<RemoteMediaState>>,
-) {
-    let targets = expand_candidates_with_port_spray(&remote_candidates);
-    logger.info(&format!(
-        "Встречное пробитие NAT: рассылка Punch пакетов на {} адресов собеседника '{}'...",
-        targets.len(),
-        peer_name_expected
-    ));
+    port: u16,
+    opt_physical_ip: Option<Ipv4Addr>,
+    logger: &AppLogger,
+) -> Vec<SocketAddr> {
+    let mut list = Vec::new();
 
-    *status.write() = ConnectionStatus::Connecting {
-        target_str: peer_name_expected.clone(),
-        attempt: 1,
-        max_attempts: 2,
-        mode: "Пробитие прямого NAT / Рукопожатие...".into(),
-    };
+    let lan_ip = opt_physical_ip.map(IpAddr::V4).unwrap_or_else(detect_local_lan_ip);
+    let local_addr = SocketAddr::new(lan_ip, port);
+    list.push(local_addr);
+    logger.info(&format!("Локальный адрес кандидата: {}", local_addr));
 
-    let punch_pkt = Packet::Punch {
-        nonce: rand::random(),
-        sender_name: my_name.clone(),
-    };
-    let punch_bytes = match punch_pkt.encode() {
-        Ok(b) => b,
-        Err(e) => {
-            logger.error(&format!("Ошибка кодирования Punch: {}", e));
-            return;
+    if let Some(pub_addr) = discover_public_ip_via_stun(socket, logger).await {
+        logger.info(&format!("STUN публичный адрес кандидата: {}", pub_addr));
+        if !list.contains(&pub_addr) {
+            list.push(pub_addr);
         }
-    };
-
-    let mut buf = [0u8; 4096];
-    let punch_start = Instant::now();
-    let punch_timeout = Duration::from_secs(7);
-    let mut last_blast = Instant::now() - Duration::from_secs(1);
-    let mut connected_endpoint: Option<SocketAddr> = None;
-    let mut resolved_peer_name = peer_name_expected.clone();
-
-    // PHASE 1: SIMULTANEOUS HOLE PUNCHING (up to 7 seconds)
-    while punch_start.elapsed() < punch_timeout && !shutdown.load(Ordering::Relaxed) {
-        // Send punch packets to all targets every 80ms
-        if last_blast.elapsed() >= Duration::from_millis(80) {
-            for &t in &targets {
-                let _ = socket.send_to(&punch_bytes, t).await;
-            }
-            last_blast = Instant::now();
-        }
-
-        tokio::select! {
-            recv_res = socket.recv_from(&mut buf) => {
-                match recv_res {
-                    Ok((len, sender_addr)) => {
-                        if let Ok(pkt) = Packet::decode(&buf[..len]) {
-                            match pkt {
-                                Packet::Punch { sender_name, nonce } => {
-                                    logger.info(&format!(
-                                        "УСПЕХ: получен встречный Punch от '{}' ({})! Отправляем PunchAck...",
-                                        sender_name, sender_addr
-                                    ));
-                                    resolved_peer_name = sender_name.clone();
-                                    let ack = Packet::PunchAck { nonce, sender_name: my_name.clone() };
-                                    if let Ok(ack_b) = ack.encode() {
-                                        for _ in 0..4 {
-                                            let _ = socket.send_to(&ack_b, sender_addr).await;
-                                        }
-                                    }
-                                    connected_endpoint = Some(sender_addr);
-                                    break;
-                                }
-                                Packet::PunchAck { sender_name, .. } => {
-                                    logger.info(&format!(
-                                        "УСПЕХ: получен PunchAck от '{}' ({})! Канал P2P открыт!",
-                                        sender_name, sender_addr
-                                    ));
-                                    resolved_peer_name = sender_name;
-                                    connected_endpoint = Some(sender_addr);
-                                    break;
-                                }
-                                Packet::TextMessage { .. } | Packet::Ping { .. } => {
-                                    logger.info(&format!("Получен P2P пакет от {}! Соединение установлено.", sender_addr));
-                                    connected_endpoint = Some(sender_addr);
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if e.raw_os_error() == Some(10054) {
-                            continue; // Ignore ICMP reset on Windows
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-        }
-    }
-
-    if shutdown.load(Ordering::Relaxed) {
-        return;
-    }
-
-    let active_addr = match connected_endpoint {
-        Some(addr) => addr,
-        None => {
-            logger.warn(&format!(
-                "Прямое UDP пробитие NAT не удалось после {}с (возможно, блокировка UDP провайдером или Symmetric NAT). Включаем резервный WSS релей...",
-                punch_timeout.as_secs()
-            ));
-
-            *status.write() = ConnectionStatus::Connecting {
-                target_str: peer_name_expected.clone(),
-                attempt: 2,
-                max_attempts: 2,
-                mode: "Подключение через WSS релей...".into(),
-            };
-
-            match crate::signaling::MqttSignaling::start_relay_session(&room_code, &my_name, &logger).await {
-                Ok(relay_session) => {
-                    logger.info("Резервный релейный канал успешно активирован!");
-                    *active_peer.write() = None;
-                    *relay_sender.write() = Some(relay_session.outgoing_tx.clone());
-
-                    let peer_id = next_peer_id.fetch_add(1, Ordering::SeqCst);
-                    let relay_virtual_addr = "127.0.0.1:443".parse::<SocketAddr>().unwrap();
-
-                    peers.write().insert(
-                        relay_virtual_addr,
-                        PeerInfo {
-                            id: peer_id,
-                            name: peer_name_expected.clone(),
-                            addr: "Релей (WSS TLS/443)".into(),
-                            ping_ms: 35,
-                            last_seen_ms: now_ms(),
-                        },
-                    );
-
-                    *status.write() = ConnectionStatus::Connected {
-                        peer_name: peer_name_expected.clone(),
-                        peer_addr: "Релей (WSS TLS/443)".into(),
-                        room_name: room_name.clone(),
-                        ping_ms: 35,
-                    };
-
-                    logger.info("============================================================");
-                    logger.info(&format!(
-                        "P2P СОЕДИНЕНИЕ УСТАНОВЛЕНО ЧЕРЕЗ WSS-РЕЛЕЙ! Собеседник: '{}'",
-                        peer_name_expected
-                    ));
-                    logger.info("============================================================");
-                    audio_engine.play_connect_chime();
-
-                    run_relay_connected_loop(
-                        relay_session,
-                        my_name,
-                        peer_name_expected,
-                        status,
-                        peers,
-                        chat_messages,
-                        seen_msg_ids,
-                        pending_acks,
-                        shutdown,
-                        logger,
-                        audio_engine.clone(),
-                        latest_remote_video.clone(),
-                        remote_media_state.clone(),
-                    ).await;
-                    return;
-                }
-                Err(e) => {
-                    let err = format!(
-                        "Не удалось установить ни прямое P2P соединение, ни подключение через релей: {}",
-                        e
-                    );
-                    logger.error(&err);
-                    *status.write() = ConnectionStatus::Failed { error: err };
-                    return;
-                }
-            }
-        }
-    };
-
-    // PHASE 2: DIRECT UDP CONNECTED STATE
-    *active_peer.write() = Some(active_addr);
-    *relay_sender.write() = None;
-    let peer_id = next_peer_id.fetch_add(1, Ordering::SeqCst);
-
-    peers.write().insert(
-        active_addr,
-        PeerInfo {
-            id: peer_id,
-            name: resolved_peer_name.clone(),
-            addr: active_addr.to_string(),
-            ping_ms: 1,
-            last_seen_ms: now_ms(),
-        },
-    );
-
-    *status.write() = ConnectionStatus::Connected {
-        peer_name: resolved_peer_name.clone(),
-        peer_addr: active_addr.to_string(),
-        room_name: room_name.clone(),
-        ping_ms: 1,
-    };
-
-    logger.info(&format!(
-        "============================================================"
-    ));
-    logger.info(&format!(
-        "P2P СОЕДИНЕНИЕ УСТАНОВЛЕНО НАПРЯМУЮ! Собеседник: '{}' ({})",
-        resolved_peer_name, active_addr
-    ));
-    logger.info(&format!(
-        "============================================================"
-    ));
-
-    // Start native audio engine for voice call
-    if let Err(e) = audio_engine.start() {
-        logger.error(&format!("Не удалось запустить аудио движок: {}", e));
     } else {
-        logger.info("Аудио движок запущен для прямого P2P голосового звонка");
-        audio_engine.play_connect_chime();
+        logger.warn("STUN: не удалось определить публичный адрес (будет использован LAN адрес)");
     }
 
-    // PHASE 3: ACTIVE SESSION (Audio/Video + Ping/Pong + Text Chat + Disconnect + Auto Re-Punching)
-    let mut last_ping_sent = Instant::now();
-    let mut last_repunch = Instant::now() - Duration::from_secs(10);
-    let mut ping_seq = 0u64;
-    // Dedicated low-latency background audio transmitter (sends smoothly on 10ms ticks)
-    let audio_sock = socket.clone();
-    let audio_engine_tx = audio_engine.clone();
-    let shutdown_tx = shutdown.clone();
-
-    let audio_tx_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(10));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut audio_seq = 0u64;
-
-        while !shutdown_tx.load(Ordering::Relaxed) {
-            interval.tick().await;
-            for audio_payload in audio_engine_tx.pop_outgoing_packets() {
-                audio_seq += 1;
-                let audio_pkt = Packet::AudioData {
-                    seq: audio_seq,
-                    data: audio_payload,
-                };
-                if let Ok(b) = audio_pkt.encode() {
-                    let _ = audio_sock.send_to(&b, active_addr).await;
-                }
-            }
-        }
-    });
-
-    let mut video_reassembler = VideoReassembler::new();
-
-    while !shutdown.load(Ordering::Relaxed) {
-        // Send Ping every 1.5 seconds to keep mobile CGNAT mappings alive
-        if last_ping_sent.elapsed() >= Duration::from_millis(1500) {
-            ping_seq += 1;
-            let ping_pkt = Packet::Ping {
-                seq: ping_seq,
-                timestamp_ms: now_ms(),
-            };
-            if let Ok(b) = ping_pkt.encode() {
-                let _ = socket.send_to(&b, active_addr).await;
-            }
-            last_ping_sent = Instant::now();
-
-            let silence = {
-                let p_table = peers.read();
-                if let Some(p) = p_table.get(&active_addr) {
-                    now_ms().saturating_sub(p.last_seen_ms)
-                } else {
-                    0
-                }
-            };
-
-            // If no packets received for >3.5s, mobile carrier may have dropped NAT mapping
-            // Immediately spray Punch packets to remote endpoints to re-open NAT
-            if silence > 3500 && last_repunch.elapsed() >= Duration::from_millis(1500) {
-                logger.warn(&format!(
-                    "Пауза связи ({}мс), повторный залп Punch для восстановления мобильного CGNAT...",
-                    silence
-                ));
-                for &t in &targets {
-                    let _ = socket.send_to(&punch_bytes, t).await;
-                }
-                last_repunch = Instant::now();
-            }
-
-            if silence > 10000 {
-                logger.warn("Таймаут P2P связи (собеседник не отвечает более 10с)");
-            }
-        }
-
-        tokio::select! {
-            recv_res = socket.recv_from(&mut buf) => {
-                match recv_res {
-                    Ok((len, sender_addr)) => {
-                        if sender_addr == active_addr || targets.contains(&sender_addr) {
-                            if let Ok(pkt) = Packet::decode(&buf[..len]) {
-                                match pkt {
-                                    Packet::AudioData { data, .. } => {
-                                        audio_engine.feed_incoming_packet(&data);
-                                        if let Some(p) = peers.write().get_mut(&active_addr) {
-                                            p.last_seen_ms = now_ms();
-                                        }
-                                    }
-                                    Packet::VideoChunk {
-                                        frame_id,
-                                        chunk_idx,
-                                        chunk_total,
-                                        is_screen,
-                                        data,
-                                    } => {
-                                        video_reassembler.handle_chunk(
-                                            frame_id,
-                                            chunk_idx,
-                                            chunk_total,
-                                            is_screen,
-                                            data,
-                                            &latest_remote_video,
-                                        );
-                                        if let Some(p) = peers.write().get_mut(&active_addr) {
-                                            p.last_seen_ms = now_ms();
-                                        }
-                                    }
-                                    Packet::MediaState {
-                                        mic_muted,
-                                        deafened,
-                                        video_active,
-                                        screen_active,
-                                    } => {
-                                        *remote_media_state.write() = RemoteMediaState {
-                                            mic_muted,
-                                            deafened,
-                                            video_active,
-                                            screen_active,
-                                        };
-                                        if let Some(p) = peers.write().get_mut(&active_addr) {
-                                            p.last_seen_ms = now_ms();
-                                        }
-                                    }
-                                    Packet::Ping { seq, timestamp_ms } => {
-                                        let pong = Packet::Pong { seq, timestamp_ms };
-                                        if let Ok(b) = pong.encode() {
-                                            let _ = socket.send_to(&b, active_addr).await;
-                                        }
-                                        if let Some(p) = peers.write().get_mut(&active_addr) {
-                                            p.last_seen_ms = now_ms();
-                                        }
-                                    }
-                                    Packet::Pong { timestamp_ms, .. } => {
-                                        let rtt = (now_ms().saturating_sub(timestamp_ms) as u32).max(1);
-                                        if let Some(p) = peers.write().get_mut(&active_addr) {
-                                            p.ping_ms = rtt;
-                                            p.last_seen_ms = now_ms();
-                                        }
-                                        let mut st = status.write();
-                                        if let ConnectionStatus::Connected { ping_ms, .. } = &mut *st {
-                                            *ping_ms = rtt;
-                                        }
-                                    }
-                                    Packet::TextMessage { id, text, sender_name, timestamp_ms } => {
-                                        // Immediately send TextAck (3 times to guarantee delivery over mobile cellular loss)
-                                        let ack = Packet::TextAck { id };
-                                        if let Ok(ack_b) = ack.encode() {
-                                            let _ = socket.send_to(&ack_b, active_addr).await;
-                                            let _ = socket.send_to(&ack_b, active_addr).await;
-                                            let _ = socket.send_to(&ack_b, active_addr).await;
-                                        }
-
-                                        // Deduplicate incoming messages strictly by id
-                                        let is_new = seen_msg_ids.write().insert(id);
-                                        if is_new {
-                                            logger.info(&format!("[ЧАТ] {}: {}", sender_name, text));
-                                            chat_messages.write().push(ChatMessage {
-                                                id,
-                                                sender: sender_name,
-                                                text,
-                                                timestamp_ms,
-                                                is_me: false,
-                                            });
-                                        }
-                                        if let Some(p) = peers.write().get_mut(&active_addr) {
-                                            p.last_seen_ms = now_ms();
-                                        }
-                                    }
-                                    Packet::TextAck { id } => {
-                                        if let Some(tx) = pending_acks.write().remove(&id) {
-                                            let _ = tx.send(());
-                                        }
-                                        if let Some(p) = peers.write().get_mut(&active_addr) {
-                                            p.last_seen_ms = now_ms();
-                                        }
-                                    }
-                                    Packet::Punch { nonce, .. } => {
-                                        // Peer is re-punching to recover NAT hole
-                                        let ack = Packet::PunchAck { nonce, sender_name: my_name.clone() };
-                                        if let Ok(ack_b) = ack.encode() {
-                                            let _ = socket.send_to(&ack_b, active_addr).await;
-                                        }
-                                        if let Some(p) = peers.write().get_mut(&active_addr) {
-                                            p.last_seen_ms = now_ms();
-                                        }
-                                    }
-                                    Packet::PunchAck { .. } => {
-                                        if let Some(p) = peers.write().get_mut(&active_addr) {
-                                            p.last_seen_ms = now_ms();
-                                        }
-                                    }
-                                    Packet::Disconnect { reason } => {
-                                        logger.warn(&format!("Собеседник отключил связь: {}", reason));
-                                        audio_engine.play_disconnect_chime();
-                                        *status.write() = ConnectionStatus::Failed {
-                                            error: format!("Собеседник отключился: {}", reason),
-                                        };
-                                        audio_tx_task.abort();
-                                        audio_engine.stop();
-                                        return;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if e.raw_os_error() == Some(10054) {
-                            continue;
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
-        }
-    }
-    audio_tx_task.abort();
-    audio_engine.stop();
+    list
 }
 
-/// Active session loop for Relay (Nostr WSS TLS/443) fallback
-async fn run_relay_connected_loop(
-    mut relay_session: crate::signaling::RelaySession,
-    my_name: String,
-    _peer_name_expected: String,
-    status: Arc<RwLock<ConnectionStatus>>,
-    peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
-    chat_messages: Arc<RwLock<Vec<ChatMessage>>>,
-    seen_msg_ids: Arc<RwLock<HashSet<u64>>>,
-    pending_acks: Arc<RwLock<HashMap<u64, oneshot::Sender<()>>>>,
-    shutdown: Arc<AtomicBool>,
-    logger: AppLogger,
-    audio_engine: Arc<crate::audio::AudioEngine>,
-    latest_remote_video: Arc<RwLock<Option<RemoteVideoFrame>>>,
-    remote_media_state: Arc<RwLock<RemoteMediaState>>,
-) {
-    let mut last_ping_sent = Instant::now();
-    let mut ping_seq = 0u64;
-    let mut video_reassembler = VideoReassembler::new();
-    let relay_virtual_addr = "127.0.0.1:443".parse::<SocketAddr>().unwrap();
-
-    // Start audio engine for relay voice call
-    if let Err(e) = audio_engine.start() {
-        logger.error(&format!("(Релей) Не удалось запустить аудио движок: {}", e));
-    } else {
-        logger.info("(Релей) Аудио движок запущен для WSS P2P голосового звонка");
-    }
-
-    // Send initial Punch packet through relay to guarantee mutual session activation
-    let init_punch = Packet::Punch {
-        nonce: rand::random(),
-        sender_name: my_name.clone(),
-    };
-    let _ = relay_session.outgoing_tx.send(init_punch).await;
-
-    // Dedicated low-latency background audio transmitter for relay (10ms cadence)
-    let relay_tx = relay_session.outgoing_tx.clone();
-    let audio_engine_tx = audio_engine.clone();
-    let shutdown_tx = shutdown.clone();
-
-    let audio_tx_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(10));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut audio_seq = 0u64;
-
-        while !shutdown_tx.load(Ordering::Relaxed) {
-            interval.tick().await;
-            for audio_payload in audio_engine_tx.pop_outgoing_packets() {
-                audio_seq += 1;
-                let audio_pkt = Packet::AudioData {
-                    seq: audio_seq,
-                    data: audio_payload,
-                };
-                let _ = relay_tx.send(audio_pkt).await;
-            }
-        }
-    });
-
-    while !shutdown.load(Ordering::Relaxed) {
-        // Send Ping every 2 seconds over relay to measure latency and keep alive
-        if last_ping_sent.elapsed() >= Duration::from_millis(2000) {
-            ping_seq += 1;
-            let ping_pkt = Packet::Ping {
-                seq: ping_seq,
-                timestamp_ms: now_ms(),
-            };
-            let _ = relay_session.outgoing_tx.send(ping_pkt).await;
-            last_ping_sent = Instant::now();
-        }
-
-        tokio::select! {
-            recv_opt = relay_session.incoming_rx.recv() => {
-                match recv_opt {
-                    Some(pkt) => {
-                        match pkt {
-                            Packet::AudioData { data, .. } => {
-                                audio_engine.feed_incoming_packet(&data);
-                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
-                                    p.last_seen_ms = now_ms();
-                                }
-                            }
-                            Packet::VideoChunk {
-                                frame_id,
-                                chunk_idx,
-                                chunk_total,
-                                is_screen,
-                                data,
-                            } => {
-                                video_reassembler.handle_chunk(
-                                    frame_id,
-                                    chunk_idx,
-                                    chunk_total,
-                                    is_screen,
-                                    data,
-                                    &latest_remote_video,
-                                );
-                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
-                                    p.last_seen_ms = now_ms();
-                                }
-                            }
-                            Packet::MediaState {
-                                mic_muted,
-                                deafened,
-                                video_active,
-                                screen_active,
-                            } => {
-                                *remote_media_state.write() = RemoteMediaState {
-                                    mic_muted,
-                                    deafened,
-                                    video_active,
-                                    screen_active,
-                                };
-                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
-                                    p.last_seen_ms = now_ms();
-                                }
-                            }
-                            Packet::Ping { seq, timestamp_ms } => {
-                                let pong = Packet::Pong { seq, timestamp_ms };
-                                let _ = relay_session.outgoing_tx.send(pong).await;
-                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
-                                    p.last_seen_ms = now_ms();
-                                }
-                            }
-                            Packet::Pong { timestamp_ms, .. } => {
-                                let rtt = (now_ms().saturating_sub(timestamp_ms) as u32).max(1);
-                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
-                                    p.ping_ms = rtt;
-                                    p.last_seen_ms = now_ms();
-                                }
-                                let mut st = status.write();
-                                if let ConnectionStatus::Connected { ping_ms, .. } = &mut *st {
-                                    *ping_ms = rtt;
-                                }
-                            }
-                            Packet::TextMessage { id, text, sender_name, timestamp_ms } => {
-                                // Send TextAck back through relay
-                                let ack = Packet::TextAck { id };
-                                let _ = relay_session.outgoing_tx.send(ack).await;
-
-                                let is_new = seen_msg_ids.write().insert(id);
-                                if is_new {
-                                    logger.info(&format!("[ЧАТ Релей] {}: {}", sender_name, text));
-                                    chat_messages.write().push(ChatMessage {
-                                        id,
-                                        sender: sender_name,
-                                        text,
-                                        timestamp_ms,
-                                        is_me: false,
-                                    });
-                                }
-                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
-                                    p.last_seen_ms = now_ms();
-                                }
-                            }
-                            Packet::TextAck { id } => {
-                                if let Some(tx) = pending_acks.write().remove(&id) {
-                                    let _ = tx.send(());
-                                }
-                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
-                                    p.last_seen_ms = now_ms();
-                                }
-                            }
-                            Packet::Punch { nonce, .. } => {
-                                let ack = Packet::PunchAck { nonce, sender_name: my_name.clone() };
-                                let _ = relay_session.outgoing_tx.send(ack).await;
-                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
-                                    p.last_seen_ms = now_ms();
-                                }
-                            }
-                            Packet::PunchAck { .. } => {
-                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
-                                    p.last_seen_ms = now_ms();
-                                }
-                            }
-                            Packet::Disconnect { reason } => {
-                                logger.warn(&format!("Собеседник отключил связь (релей): {}", reason));
-                                audio_engine.play_disconnect_chime();
-                                *status.write() = ConnectionStatus::Failed {
-                                    error: format!("Собеседник отключился: {}", reason),
-                                };
-                                audio_tx_task.abort();
-                                audio_engine.stop();
-                                return;
-                            }
-                            _ => {}
-                        }
-                    }
-                    None => {
-                        logger.warn("Канал релея закрыт");
-                        break;
+fn expand_candidates_with_port_spray(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut targets = Vec::new();
+    for &addr in candidates {
+        targets.push(addr);
+        if let SocketAddr::V4(v4) = addr {
+            let port = v4.port();
+            for delta in [-10i32, -8, -6, -5, -4, -3, -2, -1, 1, 2, 3, 4, 5, 6, 8, 10] {
+                let p = port as i32 + delta;
+                if (1024..=65535).contains(&p) {
+                    let sprayed = SocketAddr::new(IpAddr::V4(*v4.ip()), p as u16);
+                    if !targets.contains(&sprayed) {
+                        targets.push(sprayed);
                     }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(15)) => {}
         }
     }
-    audio_tx_task.abort();
-    audio_engine.stop();
+    targets
 }
 
 pub fn detect_local_lan_ip() -> IpAddr {
@@ -1552,14 +1979,12 @@ async fn discover_public_ip_via_stun(socket: Arc<UdpSocket>, logger: &AppLogger)
         *b = rand::random();
     }
 
-    // Build RFC 5389 Binding Request
     let mut req = [0u8; 20];
-    req[0..2].copy_from_slice(&0x0001u16.to_be_bytes()); // Type: Binding Request
-    req[2..4].copy_from_slice(&0x0000u16.to_be_bytes()); // Length: 0
-    req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes()); // Magic Cookie
+    req[0..2].copy_from_slice(&0x0001u16.to_be_bytes());
+    req[2..4].copy_from_slice(&0x0000u16.to_be_bytes());
+    req[4..8].copy_from_slice(&0x2112A442u32.to_be_bytes());
     req[8..20].copy_from_slice(&tx_id);
 
-    // 1. Resolve hostnames in parallel with short timeout
     let mut resolve_tasks = Vec::new();
     for &server in STUN_SERVERS {
         resolve_tasks.push(async move {
@@ -1572,7 +1997,6 @@ async fn discover_public_ip_via_stun(socket: Arc<UdpSocket>, logger: &AppLogger)
     for res in results {
         if let Ok(Ok(addrs)) = res {
             for addr in addrs {
-                // IMPORTANT: Filter out IPv6 to prevent WSAEAFNOSUPPORT error on IPv4 socket
                 if let SocketAddr::V4(_) = addr {
                     if !targets.contains(&addr) {
                         targets.push(addr);
@@ -1583,13 +2007,12 @@ async fn discover_public_ip_via_stun(socket: Arc<UdpSocket>, logger: &AppLogger)
     }
 
     if targets.is_empty() {
-        logger.warn("STUN: Не удалось разрешить STUN-серверы (проверьте интернет)");
+        logger.warn("STUN: Не удалось разрешить STUN-серверы");
         return None;
     }
 
     targets.truncate(8);
 
-    // 2. Parallel blast to all targets
     for &t in &targets {
         let _ = socket.send_to(&req, t).await;
     }
@@ -1599,7 +2022,6 @@ async fn discover_public_ip_via_stun(socket: Arc<UdpSocket>, logger: &AppLogger)
     let mut last_reblast = Instant::now();
     let overall_timeout = Duration::from_millis(2500);
 
-    // 3. Fast response collection with 400ms retry
     while start_time.elapsed() < overall_timeout {
         if last_reblast.elapsed() >= Duration::from_millis(400) {
             for &t in &targets {
@@ -1616,7 +2038,7 @@ async fn discover_public_ip_via_stun(socket: Arc<UdpSocket>, logger: &AppLogger)
                 if let Ok((len, from)) = res {
                     if len >= 20 {
                         if let Some(pub_addr) = parse_stun_response(&buf[..len], &tx_id) {
-                            logger.info(&format!("STUN: получен ответ от {} -> публичный адрес: {}", from, pub_addr));
+                            logger.info(&format!("STUN: получен ответ от {} -> {}", from, pub_addr));
                             return Some(pub_addr);
                         }
                     }
@@ -1654,14 +2076,12 @@ fn parse_stun_response(buf: &[u8], tx_id: &[u8; 12]) -> Option<SocketAddr> {
             break;
         }
 
-        // XOR-MAPPED-ADDRESS (0x0020)
         if attr_type == 0x0020 && attr_len >= 8 {
             let family = buf[offset + 1];
             let x_port = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
             let port = x_port ^ 0x2112;
 
             if family == 0x01 {
-                // IPv4
                 let mut ip_bytes = [0u8; 4];
                 ip_bytes.copy_from_slice(&buf[offset + 4..offset + 8]);
                 let magic_bytes = 0x2112A442u32.to_be_bytes();
@@ -1674,7 +2094,6 @@ fn parse_stun_response(buf: &[u8], tx_id: &[u8; 12]) -> Option<SocketAddr> {
                 ));
             }
         } else if attr_type == 0x0001 && attr_len >= 8 {
-            // Standard MAPPED-ADDRESS (0x0001)
             let family = buf[offset + 1];
             let port = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
             if family == 0x01 {
@@ -1699,30 +2118,24 @@ pub fn configure_socket_physical_if(socket: &UdpSocket, logger: &AppLogger) -> O
             fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
         }
 
-        // Expand socket buffers to 1 MB so burst video chunks never drop packets
         let buf_size: i32 = 1024 * 1024;
-        let _ = setsockopt(raw_sock, 0xFFFF /* SOL_SOCKET */, 0x1002 /* SO_RCVBUF */, &buf_size as *const _ as *const u8, 4);
-        let _ = setsockopt(raw_sock, 0xFFFF /* SOL_SOCKET */, 0x1001 /* SO_SNDBUF */, &buf_size as *const _ as *const u8, 4);
+        let _ = setsockopt(raw_sock, 0xFFFF, 0x1002, &buf_size as *const _ as *const u8, 4);
+        let _ = setsockopt(raw_sock, 0xFFFF, 0x1001, &buf_size as *const _ as *const u8, 4);
 
         if let Some((if_idx, opt_ip)) = find_best_physical_interface() {
-            let if_index_be: u32 = if_idx.to_be(); // network byte order for Winsock IP_UNICAST_IF
+            let if_index_be: u32 = if_idx.to_be();
             let res = setsockopt(
                 raw_sock,
-                0,  /* IPPROTO_IP */
-                31, /* IP_UNICAST_IF */
+                0,
+                31,
                 &if_index_be as *const _ as *const u8,
                 4,
             );
             if res == 0 {
                 logger.info(&format!(
-                    "UDP сокет привязан к физическому интерфейсу #{} (обход VPN, LAN IP: {:?})",
+                    "UDP сокет привязан к физическому интерфейсу #{} (LAN IP: {:?})",
                     if_idx,
                     opt_ip.unwrap_or(Ipv4Addr::UNSPECIFIED)
-                ));
-            } else {
-                logger.warn(&format!(
-                    "Не удалось установить IP_UNICAST_IF для интерфейса #{}",
-                    if_idx
                 ));
             }
             return opt_ip;
@@ -1790,13 +2203,11 @@ pub fn find_best_physical_interface() -> Option<(u32, Option<Ipv4Addr>)> {
             let adapter = &*curr;
             let desc = pwstr_to_string(adapter.Description as _).to_lowercase();
             let friendly = pwstr_to_string(adapter.FriendlyName as _).to_lowercase();
-            let is_up = adapter.OperStatus == 1; // IfOperStatusUp
+            let is_up = adapter.OperStatus == 1;
             let if_index = adapter.Anonymous1.Anonymous.IfIndex;
 
             if is_up && if_index > 0 {
                 let mut score = 0i32;
-
-                // Physical interface type: 6 = Ethernet, 71 = Wi-Fi, 243/244 = WWAN
                 let is_physical = adapter.IfType == 6
                     || adapter.IfType == 71
                     || adapter.IfType == 243
@@ -1805,19 +2216,14 @@ pub fn find_best_physical_interface() -> Option<(u32, Option<Ipv4Addr>)> {
                 if is_physical {
                     score += 200;
                 }
-
-                // Check default gateway (real physical internet interface has gateway)
                 if !adapter.FirstGatewayAddress.is_null() {
                     score += 1000;
                 }
-
-                // Check blacklist
                 let is_blacklisted = blacklist.iter().any(|&w| desc.contains(w) || friendly.contains(w));
                 if is_blacklisted {
                     score -= 5000;
                 }
 
-                // Extract IPv4 address if available
                 let mut ipv4_addr = None;
                 let mut unicast = adapter.FirstUnicastAddress;
                 while !unicast.is_null() {
@@ -1868,7 +2274,6 @@ mod tests {
         let node_a = P2pNode::new(logger_a);
         let node_b = P2pNode::new(logger_b);
 
-        // Simulate simultaneous punching directly between two local ports
         let sock_a = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let sock_b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
 
@@ -1878,29 +2283,27 @@ mod tests {
         *node_a.active_socket.write() = Some(sock_a.clone());
         *node_b.active_socket.write() = Some(sock_b.clone());
 
-        *node_a.active_peer_addr.write() = Some(addr_b);
-        *node_b.active_peer_addr.write() = Some(addr_a);
+        node_a.client_endpoints.write().insert(2, addr_b);
+        *node_b.host_socket_addr.write() = Some(addr_a);
 
-        // Send a message with id 999
         let pkt = Packet::TextMessage {
             id: 999,
+            sender_id: 1,
             text: "Тестовое сообщение".into(),
             sender_name: "Alice".into(),
             timestamp_ms: now_ms(),
         };
         let b = pkt.encode().unwrap();
 
-        // Send it 3 times to simulate duplicate UDP arrivals
         sock_a.send_to(&b, addr_b).await.unwrap();
         sock_a.send_to(&b, addr_b).await.unwrap();
         sock_a.send_to(&b, addr_b).await.unwrap();
 
-        // Simulate receiver loop on B for 3 packets
         let mut buf = [0u8; 1024];
         for _ in 0..3 {
             let (len, _) = sock_b.recv_from(&mut buf).await.unwrap();
             let decoded = Packet::decode(&buf[..len]).unwrap();
-            if let Packet::TextMessage { id, text, sender_name, timestamp_ms } = decoded {
+            if let Packet::TextMessage { id, text, sender_name, timestamp_ms, .. } = decoded {
                 let is_new = node_b.seen_msg_ids.write().insert(id);
                 if is_new {
                     node_b.chat_messages.write().push(ChatMessage {
@@ -1935,14 +2338,45 @@ mod tests {
         assert_eq!(dec, Packet::TextAck { id: 12345 });
     }
 
-    #[tokio::test]
-    async fn test_fast_parallel_stun() {
-        let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
-        let logger = AppLogger::init();
-        let start = Instant::now();
-        let pub_addr = discover_public_ip_via_stun(sock, &logger).await;
-        let elapsed = start.elapsed();
-        println!("STUN discovered: {:?} in {:?}", pub_addr, elapsed);
-        assert!(pub_addr.is_some(), "STUN must discover public IP");
+    #[test]
+    fn test_sfu_packets_roundtrip() {
+        // Test HostHandover
+        let handover = Packet::HostHandover {
+            old_host_id: 1,
+            new_host_id: 2,
+        };
+        let b = handover.encode().unwrap();
+        assert_eq!(Packet::decode(&b).unwrap(), handover);
+
+        // Test ClaimHost
+        let claim = Packet::ClaimHost {
+            candidate_id: 2,
+            reason: "Host disconnect".into(),
+        };
+        let b = claim.encode().unwrap();
+        assert_eq!(Packet::decode(&b).unwrap(), claim);
+
+        // Test PeerListUpdate
+        let peer_update = Packet::PeerListUpdate {
+            host_id: 1,
+            backup_host_id: Some(2),
+            peers: vec![
+                PeerInfo {
+                    id: 2,
+                    name: "Bob".into(),
+                    addr: "127.0.0.1:8888".into(),
+                    ping_ms: 12,
+                    last_seen_ms: 1000,
+                    is_host: false,
+                    is_speaking: true,
+                    mic_muted: false,
+                    deafened: false,
+                    video_active: true,
+                    screen_active: false,
+                }
+            ],
+        };
+        let b = peer_update.encode().unwrap();
+        assert_eq!(Packet::decode(&b).unwrap(), peer_update);
     }
 }

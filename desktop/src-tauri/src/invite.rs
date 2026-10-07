@@ -8,19 +8,35 @@ pub struct OfferData {
     pub name: String,
     pub room: String,
     pub candidates: Vec<SocketAddr>,
+    #[serde(default)]
+    pub host_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerData {
     pub name: String,
     pub candidates: Vec<SocketAddr>,
+    #[serde(default)]
+    pub guest_id: Option<u32>,
+    #[serde(default)]
+    pub nonce: Option<u64>,
 }
 
 pub fn create_offer_link(name: &str, room: &str, candidates: Vec<SocketAddr>) -> String {
+    create_offer_link_with_id(name, room, candidates, Some(1))
+}
+
+pub fn create_offer_link_with_id(
+    name: &str,
+    room: &str,
+    candidates: Vec<SocketAddr>,
+    host_id: Option<u32>,
+) -> String {
     let data = OfferData {
         name: name.to_string(),
         room: room.to_string(),
         candidates,
+        host_id,
     };
     let json = serde_json::to_string(&data).unwrap_or_default();
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
@@ -28,9 +44,20 @@ pub fn create_offer_link(name: &str, room: &str, candidates: Vec<SocketAddr>) ->
 }
 
 pub fn create_answer_link(name: &str, candidates: Vec<SocketAddr>) -> String {
+    create_answer_link_with_id(name, candidates, None, None)
+}
+
+pub fn create_answer_link_with_id(
+    name: &str,
+    candidates: Vec<SocketAddr>,
+    guest_id: Option<u32>,
+    nonce: Option<u64>,
+) -> String {
     let data = AnswerData {
         name: name.to_string(),
         candidates,
+        guest_id,
+        nonce,
     };
     let json = serde_json::to_string(&data).unwrap_or_default();
     let encoded = URL_SAFE_NO_PAD.encode(json.as_bytes());
@@ -74,6 +101,7 @@ pub fn parse_offer_link(raw_input: &str) -> Result<OfferData, String> {
                     name: legacy.name,
                     room: legacy.room,
                     candidates: c,
+                    host_id: None,
                 });
             }
         }
@@ -84,6 +112,7 @@ pub fn parse_offer_link(raw_input: &str) -> Result<OfferData, String> {
             name: "Прямой узел".into(),
             room: "Комната".into(),
             candidates: vec![addr],
+            host_id: None,
         });
     }
 
@@ -112,6 +141,8 @@ pub fn parse_answer_link(raw_input: &str) -> Result<AnswerData, String> {
         return Ok(AnswerData {
             name: "Узел-клиент".into(),
             candidates: vec![addr],
+            guest_id: None,
+            nonce: None,
         });
     }
 

@@ -1,7 +1,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 use parking_lot::Mutex;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -204,6 +204,8 @@ pub struct InputResampler {
     step: f64,
     phase: f64,
     last_sample: f32,
+    has_leftover: bool,
+    leftover_sample: f32,
 }
 
 impl InputResampler {
@@ -214,10 +216,17 @@ impl InputResampler {
             step: in_rate / out_rate,
             phase: 0.0,
             last_sample: 0.0,
+            has_leftover: false,
+            leftover_sample: 0.0,
         }
     }
 
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
+        let n = input.len();
+        if n == 0 {
+            return;
+        }
+
         if (self.step - 1.0).abs() < 1e-4 {
             output.extend_from_slice(input);
             if let Some(&last) = input.last() {
@@ -226,22 +235,29 @@ impl InputResampler {
             return;
         }
 
-        let n = input.len();
-        if n == 0 {
-            return;
-        }
-
         // Optimized 48 kHz -> 24 kHz (exact 2:1 downsampling with anti-aliasing FIR averaging)
         if (self.in_rate - 48000.0).abs() < 10.0 && (self.out_rate - 24000.0).abs() < 10.0 {
             let mut i = 0;
+            if self.has_leftover {
+                // Pair leftover sample from previous callback chunk with the first sample of this chunk
+                let avg = (self.leftover_sample + input[0]) * 0.5;
+                output.push(avg);
+                i = 1;
+                self.has_leftover = false;
+            }
+
             while i + 1 < n {
                 let avg = (input[i] + input[i + 1]) * 0.5;
                 output.push(avg);
                 i += 2;
             }
+
             if i < n {
-                self.last_sample = input[n - 1];
+                // Odd leftover sample at the end of the chunk; preserve for next callback chunk
+                self.leftover_sample = input[i];
+                self.has_leftover = true;
             }
+            self.last_sample = *input.last().unwrap_or(&self.last_sample);
             return;
         }
 
@@ -273,9 +289,9 @@ pub struct AudioEngine {
     input_stream: Mutex<Option<Stream>>,
     output_stream: Mutex<Option<Stream>>,
 
-    // Queues & Jitter Buffer
+    // Queues & Multi-Peer Jitter Buffers
     outgoing_audio_packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    jitter_buffer: Arc<Mutex<JitterBuffer>>,
+    peer_jitter_buffers: Arc<Mutex<HashMap<u32, JitterBuffer>>>,
     chime_queue: Arc<Mutex<VecDeque<f32>>>,
 
     // Controls
@@ -292,6 +308,13 @@ pub struct AudioEngine {
     last_local_speech: Arc<Mutex<Instant>>,
     remote_speaking: Arc<AtomicBool>,
     last_remote_speech: Arc<Mutex<Instant>>,
+    peer_last_speech: Arc<Mutex<HashMap<u32, Instant>>>,
+    peer_speaking: Arc<Mutex<HashMap<u32, bool>>>,
+
+    // Diagnostics & Quality Metrics
+    rx_packet_count: Arc<AtomicU32>,
+    tx_packet_count: Arc<AtomicU32>,
+    buffer_starve_count: Arc<AtomicU32>,
 
     // Device health & Auto-recovery
     is_running: Arc<AtomicBool>,
@@ -309,14 +332,18 @@ unsafe impl Sync for AudioEngine {}
 
 impl AudioEngine {
     pub fn new() -> Arc<Self> {
+        let mut initial_buffers = HashMap::new();
+        // Peer 0 is dedicated to local loopback test
+        initial_buffers.insert(
+            0,
+            JitterBuffer::new(JITTER_TARGET_SAMPLES, JITTER_MAX_SAMPLES),
+        );
+
         let engine = Arc::new(Self {
             input_stream: Mutex::new(None),
             output_stream: Mutex::new(None),
             outgoing_audio_packets: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
-            jitter_buffer: Arc::new(Mutex::new(JitterBuffer::new(
-                JITTER_TARGET_SAMPLES,
-                JITTER_MAX_SAMPLES,
-            ))),
+            peer_jitter_buffers: Arc::new(Mutex::new(initial_buffers)),
             chime_queue: Arc::new(Mutex::new(VecDeque::with_capacity(16384))),
             mic_muted: Arc::new(AtomicBool::new(false)),
             deafened: Arc::new(AtomicBool::new(false)),
@@ -329,6 +356,11 @@ impl AudioEngine {
             last_local_speech: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10))),
             remote_speaking: Arc::new(AtomicBool::new(false)),
             last_remote_speech: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(10))),
+            peer_last_speech: Arc::new(Mutex::new(HashMap::new())),
+            peer_speaking: Arc::new(Mutex::new(HashMap::new())),
+            rx_packet_count: Arc::new(AtomicU32::new(0)),
+            tx_packet_count: Arc::new(AtomicU32::new(0)),
+            buffer_starve_count: Arc::new(AtomicU32::new(0)),
             is_running: Arc::new(AtomicBool::new(false)),
             output_stream_errored: Arc::new(AtomicBool::new(false)),
             input_stream_errored: Arc::new(AtomicBool::new(false)),
@@ -380,7 +412,9 @@ impl AudioEngine {
     pub fn set_deafened(&self, deafened: bool) {
         self.deafened.store(deafened, Ordering::SeqCst);
         if deafened {
-            self.jitter_buffer.lock().clear();
+            for jb in self.peer_jitter_buffers.lock().values_mut() {
+                jb.clear();
+            }
         }
     }
 
@@ -517,14 +551,19 @@ impl AudioEngine {
     /// Pop ready HD voice packets to send over P2P
     pub fn pop_outgoing_packets(&self) -> Vec<Vec<u8>> {
         let mut q = self.outgoing_audio_packets.lock();
-        q.drain(..).collect()
+        let packets: Vec<Vec<u8>> = q.drain(..).collect();
+        if !packets.is_empty() {
+            self.tx_packet_count.fetch_add(packets.len() as u32, Ordering::Relaxed);
+        }
+        packets
     }
 
-    /// Feed incoming HD audio packet from remote peer to JitterBuffer
-    pub fn feed_incoming_packet(&self, data: &[u8]) {
+    /// Feed incoming HD audio packet from remote peer to that peer's JitterBuffer
+    pub fn feed_incoming_packet(&self, sender_id: u32, data: &[u8]) {
         if self.deafened.load(Ordering::Relaxed) || data.is_empty() {
             return;
         }
+        self.rx_packet_count.fetch_add(1, Ordering::Relaxed);
 
         let pcm: Vec<i16> = match data[0] {
             CODEC_PCM24K => {
@@ -555,10 +594,51 @@ impl AudioEngine {
         };
 
         if !pcm.is_empty() {
-            self.jitter_buffer.lock().push_pcm_samples(&pcm);
-            *self.last_remote_speech.lock() = Instant::now();
+            let mut bufs = self.peer_jitter_buffers.lock();
+            let jb = bufs.entry(sender_id).or_insert_with(|| {
+                JitterBuffer::new(JITTER_TARGET_SAMPLES, JITTER_MAX_SAMPLES)
+            });
+            jb.push_pcm_samples(&pcm);
+
+            let now = Instant::now();
+            self.peer_last_speech.lock().insert(sender_id, now);
+            self.peer_speaking.lock().insert(sender_id, true);
+            *self.last_remote_speech.lock() = now;
             self.remote_speaking.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Retrieve audio quality diagnostics: (packets_received, packets_sent, buffer_starvations, total_jitter_samples)
+    pub fn get_audio_diagnostics(&self) -> (u32, u32, u32, usize) {
+        let rx = self.rx_packet_count.load(Ordering::Relaxed);
+        let tx = self.tx_packet_count.load(Ordering::Relaxed);
+        let starves = self.buffer_starve_count.load(Ordering::Relaxed);
+        let jb_len = {
+            let bufs = self.peer_jitter_buffers.lock();
+            bufs.values().map(|b| b.len()).sum()
+        };
+        (rx, tx, starves, jb_len)
+    }
+
+    pub fn is_peer_speaking(&self, peer_id: u32) -> bool {
+        let speech = self.peer_last_speech.lock();
+        if let Some(&last_seen) = speech.get(&peer_id) {
+            last_seen.elapsed() < Duration::from_millis(350)
+        } else {
+            false
+        }
+    }
+
+    pub fn get_speaking_peers(&self) -> Vec<u32> {
+        let mut list = Vec::new();
+        let speech = self.peer_last_speech.lock();
+        let now = Instant::now();
+        for (&id, &last_seen) in speech.iter() {
+            if id != 0 && now.duration_since(last_seen) < Duration::from_millis(350) {
+                list.push(id);
+            }
+        }
+        list
     }
 
     /// Checks if device errors occurred or default devices changed (e.g. headphones plugged/unplugged)
@@ -640,7 +720,7 @@ impl AudioEngine {
 
         let channels = config.channels() as usize;
         let dev_sample_rate = config.sample_rate().0 as f64;
-        let jitter_buf = self.jitter_buffer.clone();
+        let peer_buffers = self.peer_jitter_buffers.clone();
         let chimes = self.chime_queue.clone();
         let deafened_flag = self.deafened.clone();
         let volume_bits = self.peer_volume.clone();
@@ -662,7 +742,7 @@ impl AudioEngine {
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let is_deaf = deafened_flag.load(Ordering::Relaxed);
                     let vol = f32::from_bits(volume_bits.load(Ordering::Relaxed));
-                    let mut jb = jitter_buf.lock();
+                    let mut buffers = peer_buffers.lock();
                     let mut chime_q = chimes.lock();
 
                     let frames = data.len() / channels;
@@ -670,7 +750,16 @@ impl AudioEngine {
                         while phase >= 1.0 {
                             phase -= 1.0;
                             current_sample = next_sample;
-                            next_sample = jb.pop_sample();
+                            let mut mixed = 0.0f32;
+                            let mut any_sound = false;
+                            for jb in buffers.values_mut() {
+                                let s = jb.pop_sample();
+                                if s.abs() > 0.00001 {
+                                    mixed += s;
+                                    any_sound = true;
+                                }
+                            }
+                            next_sample = if any_sound { soft_limiter(mixed) } else { 0.0 };
                         }
 
                         let voice_sample = if !is_deaf {
@@ -698,7 +787,7 @@ impl AudioEngine {
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     let is_deaf = deafened_flag.load(Ordering::Relaxed);
                     let vol = f32::from_bits(volume_bits.load(Ordering::Relaxed));
-                    let mut jb = jitter_buf.lock();
+                    let mut buffers = peer_buffers.lock();
                     let mut chime_q = chimes.lock();
 
                     let frames = data.len() / channels;
@@ -706,7 +795,16 @@ impl AudioEngine {
                         while phase >= 1.0 {
                             phase -= 1.0;
                             current_sample = next_sample;
-                            next_sample = jb.pop_sample();
+                            let mut mixed = 0.0f32;
+                            let mut any_sound = false;
+                            for jb in buffers.values_mut() {
+                                let s = jb.pop_sample();
+                                if s.abs() > 0.00001 {
+                                    mixed += s;
+                                    any_sound = true;
+                                }
+                            }
+                            next_sample = if any_sound { soft_limiter(mixed) } else { 0.0 };
                         }
 
                         let voice_sample = if !is_deaf {
@@ -752,7 +850,7 @@ impl AudioEngine {
         let mic_gain_bits = self.mic_gain.clone();
         let mic_level_bits = self.mic_level.clone();
         let loopback_flag = self.loopback_test.clone();
-        let jb_loopback = self.jitter_buffer.clone();
+        let peer_buffers_in = self.peer_jitter_buffers.clone();
 
         // Accumulator buffer for downsampled 24kHz mono audio
         let accumulator = Arc::new(Mutex::new(Vec::<f32>::with_capacity(2048)));
@@ -821,9 +919,13 @@ impl AudioEngine {
                         })
                         .collect();
 
-                    // If user is running loopback test, feed into local jitter buffer
+                    // If user is running loopback test, feed into local jitter buffer (id = 0)
                     if loopback_flag.load(Ordering::Relaxed) {
-                        jb_loopback.lock().push_pcm_samples(&pcm);
+                        let mut bufs = peer_buffers_in.lock();
+                        let jb = bufs.entry(0).or_insert_with(|| {
+                            JitterBuffer::new(JITTER_TARGET_SAMPLES, JITTER_MAX_SAMPLES)
+                        });
+                        jb.push_pcm_samples(&pcm);
                     }
 
                     // Encode as HD 24 kHz 16-bit Linear PCM:
@@ -913,7 +1015,9 @@ impl AudioEngine {
         *self.input_stream.lock() = None;
         *self.output_stream.lock() = None;
         self.outgoing_audio_packets.lock().clear();
-        self.jitter_buffer.lock().clear();
+        self.peer_jitter_buffers.lock().clear();
+        self.peer_last_speech.lock().clear();
+        self.peer_speaking.lock().clear();
         self.chime_queue.lock().clear();
         self.local_speaking.store(false, Ordering::SeqCst);
         self.remote_speaking.store(false, Ordering::SeqCst);
