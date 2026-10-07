@@ -1,10 +1,11 @@
+pub mod audio;
 mod invite;
 mod logger;
-mod p2p;
+pub mod p2p;
 mod signaling;
 
 use logger::AppLogger;
-use p2p::{ChatMessage, ConnectionStatus, P2pNode, PeerInfo};
+use p2p::{ChatMessage, ConnectionStatus, P2pNode, PeerInfo, RemoteVideoFrame, VoiceStatus};
 use std::sync::Arc;
 use tauri::State;
 
@@ -71,6 +72,84 @@ fn get_log_file_path(state: State<'_, AppState>) -> String {
     state.logger.log_file_path()
 }
 
+#[tauri::command]
+fn set_mic_muted(muted: bool, state: State<'_, AppState>) {
+    state.node.set_mic_muted(muted);
+}
+
+#[tauri::command]
+fn set_deafened(deafened: bool, state: State<'_, AppState>) {
+    state.node.set_deafened(deafened);
+}
+
+#[tauri::command]
+fn set_peer_volume(volume: f32, state: State<'_, AppState>) {
+    state.node.set_peer_volume(volume);
+}
+
+#[tauri::command]
+fn set_mic_sensitivity(sensitivity: f32, state: State<'_, AppState>) {
+    state.node.set_mic_sensitivity(sensitivity);
+}
+
+#[tauri::command]
+fn set_mic_gain(gain: f32, state: State<'_, AppState>) {
+    state.node.set_mic_gain(gain);
+}
+
+#[tauri::command]
+fn set_loopback_test(enabled: bool, state: State<'_, AppState>) {
+    state.node.set_loopback_test(enabled);
+}
+
+#[tauri::command]
+fn restart_audio(state: State<'_, AppState>) -> Result<(), String> {
+    state.node.restart_audio()
+}
+
+#[tauri::command]
+fn start_mic_test(state: State<'_, AppState>) -> Result<(), String> {
+    state.node.start_mic_test()
+}
+
+#[tauri::command]
+fn stop_mic_test(state: State<'_, AppState>) {
+    state.node.stop_mic_test();
+}
+
+#[tauri::command]
+fn get_voice_status(state: State<'_, AppState>) -> VoiceStatus {
+    state.node.get_voice_status()
+}
+
+#[tauri::command]
+fn get_remote_video_frame(last_frame_id: u32, state: State<'_, AppState>) -> Option<RemoteVideoFrame> {
+    state.node.get_remote_video_frame(last_frame_id)
+}
+
+#[tauri::command]
+async fn send_video_frame(
+    jpeg_base64: String,
+    is_screen: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.node.send_video_frame(jpeg_base64, is_screen).await
+}
+
+#[tauri::command]
+async fn send_media_state(
+    video_active: bool,
+    screen_active: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state.node.send_media_state(video_active, screen_active).await
+}
+
+#[tauri::command]
+fn play_notification_sound(sound_type: String, state: State<'_, AppState>) {
+    state.node.play_notification_sound(&sound_type);
+}
+
 pub fn run() {
     let logger = AppLogger::init();
     logger.info("Запуск приложения Balabol P2P...");
@@ -91,6 +170,20 @@ pub fn run() {
             get_peers,
             get_logs,
             get_log_file_path,
+            set_mic_muted,
+            set_deafened,
+            set_peer_volume,
+            set_mic_sensitivity,
+            set_mic_gain,
+            set_loopback_test,
+            restart_audio,
+            start_mic_test,
+            stop_mic_test,
+            play_notification_sound,
+            get_voice_status,
+            get_remote_video_frame,
+            send_video_frame,
+            send_media_state,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

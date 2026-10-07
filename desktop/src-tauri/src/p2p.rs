@@ -59,6 +59,23 @@ pub enum Packet {
     Disconnect {
         reason: String,
     },
+    AudioData {
+        seq: u64,
+        data: Vec<u8>,
+    },
+    VideoChunk {
+        frame_id: u32,
+        chunk_idx: u16,
+        chunk_total: u16,
+        is_screen: bool,
+        data: Vec<u8>,
+    },
+    MediaState {
+        mic_muted: bool,
+        deafened: bool,
+        video_active: bool,
+        screen_active: bool,
+    },
 }
 
 impl Packet {
@@ -94,6 +111,39 @@ pub struct PeerInfo {
     pub addr: String,
     pub ping_ms: u32,
     pub last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteVideoFrame {
+    pub frame_id: u32,
+    pub is_screen: bool,
+    pub jpeg_base64: String,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RemoteMediaState {
+    pub mic_muted: bool,
+    pub deafened: bool,
+    pub video_active: bool,
+    pub screen_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceStatus {
+    pub mic_muted: bool,
+    pub deafened: bool,
+    pub peer_volume: f32,
+    pub local_speaking: bool,
+    pub remote_speaking: bool,
+    pub remote_media: RemoteMediaState,
+    pub mic_level: f32,
+    pub mic_sensitivity: f32,
+    pub mic_gain: f32,
+    pub output_device_ok: bool,
+    pub input_device_ok: bool,
+    pub output_device_name: Option<String>,
+    pub input_device_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +187,10 @@ pub struct P2pNode {
     session_abort: Arc<RwLock<Option<tokio::task::AbortHandle>>>,
     shutdown_signal: Arc<AtomicBool>,
     next_peer_id: Arc<AtomicU32>,
+    audio_engine: Arc<crate::audio::AudioEngine>,
+    latest_remote_video: Arc<RwLock<Option<RemoteVideoFrame>>>,
+    remote_media_state: Arc<RwLock<RemoteMediaState>>,
+    video_frame_seq: Arc<AtomicU32>,
 }
 
 impl P2pNode {
@@ -154,6 +208,10 @@ impl P2pNode {
             session_abort: Arc::new(RwLock::new(None)),
             shutdown_signal: Arc::new(AtomicBool::new(false)),
             next_peer_id: Arc::new(AtomicU32::new(1)),
+            audio_engine: crate::audio::AudioEngine::new(),
+            latest_remote_video: Arc::new(RwLock::new(None)),
+            remote_media_state: Arc::new(RwLock::new(RemoteMediaState::default())),
+            video_frame_seq: Arc::new(AtomicU32::new(1)),
         }
     }
 
@@ -201,6 +259,9 @@ impl P2pNode {
         }
 
         self.logger.info("Отключение P2P соединения...");
+        self.audio_engine.stop();
+        *self.latest_remote_video.write() = None;
+        *self.remote_media_state.write() = RemoteMediaState::default();
         *self.active_socket.write() = None;
         *self.active_peer_addr.write() = None;
         *self.relay_sender.write() = None;
@@ -209,6 +270,176 @@ impl P2pNode {
         self.pending_acks.write().clear();
         *self.status.write() = ConnectionStatus::Disconnected;
         self.logger.info("Состояние сброшено в Disconnected");
+    }
+
+    pub fn set_mic_muted(&self, muted: bool) {
+        self.audio_engine.set_mic_muted(muted);
+        let _ = self.broadcast_media_state();
+    }
+
+    pub fn set_deafened(&self, deafened: bool) {
+        self.audio_engine.set_deafened(deafened);
+        let _ = self.broadcast_media_state();
+    }
+
+    pub fn set_peer_volume(&self, volume: f32) {
+        self.audio_engine.set_peer_volume(volume);
+    }
+
+    pub fn get_voice_status(&self) -> VoiceStatus {
+        let remote_media = self.remote_media_state.read().clone();
+        let (out_name, in_name) = self.audio_engine.get_device_names();
+        VoiceStatus {
+            mic_muted: self.audio_engine.is_mic_muted(),
+            deafened: self.audio_engine.is_deafened(),
+            peer_volume: self.audio_engine.get_peer_volume(),
+            local_speaking: self.audio_engine.is_local_speaking(),
+            remote_speaking: self.audio_engine.is_remote_speaking(),
+            remote_media,
+            mic_level: self.audio_engine.get_mic_level(),
+            mic_sensitivity: self.audio_engine.get_mic_sensitivity(),
+            mic_gain: self.audio_engine.get_mic_gain(),
+            output_device_ok: self.audio_engine.is_output_ok(),
+            input_device_ok: self.audio_engine.is_input_ok(),
+            output_device_name: out_name,
+            input_device_name: in_name,
+        }
+    }
+
+    pub fn set_mic_sensitivity(&self, sensitivity: f32) {
+        self.audio_engine.set_mic_sensitivity(sensitivity);
+    }
+
+    pub fn set_mic_gain(&self, gain: f32) {
+        self.audio_engine.set_mic_gain(gain);
+    }
+
+    pub fn set_loopback_test(&self, enabled: bool) {
+        self.audio_engine.set_loopback_test(enabled);
+    }
+
+    pub fn restart_audio(&self) -> Result<(), String> {
+        self.audio_engine.restart()
+    }
+
+    pub fn start_mic_test(&self) -> Result<(), String> {
+        self.audio_engine.set_loopback_test(true);
+        self.audio_engine.start()
+    }
+
+    pub fn stop_mic_test(&self) {
+        self.audio_engine.set_loopback_test(false);
+    }
+
+    pub fn play_notification_sound(&self, sound_type: &str) {
+        if sound_type == "connect" {
+            self.audio_engine.play_connect_chime();
+        } else {
+            self.audio_engine.play_disconnect_chime();
+        }
+    }
+
+    pub fn get_remote_video_frame(&self, last_frame_id: u32) -> Option<RemoteVideoFrame> {
+        let guard = self.latest_remote_video.read();
+        if let Some(frame) = guard.as_ref() {
+            if frame.frame_id != last_frame_id {
+                return Some(frame.clone());
+            }
+        }
+        None
+    }
+
+    pub async fn send_video_frame(&self, jpeg_base64: String, is_screen: bool) -> Result<(), String> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&jpeg_base64)
+            .map_err(|e| format!("Base64 decode error: {}", e))?;
+
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
+        let sock_opt = self.active_socket.read().clone();
+        let peer_addr_opt = *self.active_peer_addr.read();
+        let relay_tx_opt = self.relay_sender.read().clone();
+
+        if peer_addr_opt.is_none() && relay_tx_opt.is_none() {
+            return Ok(());
+        }
+
+        let frame_id = self.video_frame_seq.fetch_add(1, Ordering::SeqCst);
+        const CHUNK_SIZE: usize = 1200;
+        let chunk_total = ((bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u16;
+
+        for (idx, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
+            let pkt = Packet::VideoChunk {
+                frame_id,
+                chunk_idx: idx as u16,
+                chunk_total,
+                is_screen,
+                data: chunk.to_vec(),
+            };
+
+            if let (Some(sock), Some(peer_addr)) = (&sock_opt, peer_addr_opt) {
+                if let Ok(b) = pkt.encode() {
+                    let _ = sock.send_to(&b, peer_addr).await;
+                }
+            } else if let Some(relay_tx) = &relay_tx_opt {
+                let _ = relay_tx.send(pkt).await;
+            }
+
+            // Pacing between UDP chunks to avoid buffer bloat and packet drops
+            tokio::time::sleep(Duration::from_micros(200)).await;
+        }
+
+        Ok(())
+    }
+
+    pub async fn send_media_state(&self, video_active: bool, screen_active: bool) -> Result<(), String> {
+        let pkt = Packet::MediaState {
+            mic_muted: self.audio_engine.is_mic_muted(),
+            deafened: self.audio_engine.is_deafened(),
+            video_active,
+            screen_active,
+        };
+
+        let sock_opt = self.active_socket.read().clone();
+        let peer_addr_opt = *self.active_peer_addr.read();
+        let relay_tx_opt = self.relay_sender.read().clone();
+
+        if let (Some(sock), Some(peer_addr)) = (sock_opt, peer_addr_opt) {
+            if let Ok(b) = pkt.encode() {
+                let _ = sock.send_to(&b, peer_addr).await;
+            }
+        } else if let Some(relay_tx) = relay_tx_opt {
+            let _ = relay_tx.send(pkt).await;
+        }
+
+        Ok(())
+    }
+
+    fn broadcast_media_state(&self) -> Result<(), String> {
+        let pkt = Packet::MediaState {
+            mic_muted: self.audio_engine.is_mic_muted(),
+            deafened: self.audio_engine.is_deafened(),
+            video_active: false,
+            screen_active: false,
+        };
+        let sock_opt = self.active_socket.read().clone();
+        let peer_addr_opt = *self.active_peer_addr.read();
+        let relay_tx_opt = self.relay_sender.read().clone();
+
+        tokio::spawn(async move {
+            if let (Some(sock), Some(peer_addr)) = (sock_opt, peer_addr_opt) {
+                if let Ok(b) = pkt.encode() {
+                    let _ = sock.send_to(&b, peer_addr).await;
+                }
+            } else if let Some(relay_tx) = relay_tx_opt {
+                let _ = relay_tx.send(pkt).await;
+            }
+        });
+
+        Ok(())
     }
 
     /// Send a text message to the connected peer over P2P/Relay with guaranteed delivery (ACK retry loop)
@@ -355,6 +586,9 @@ impl P2pNode {
         let next_id = self.next_peer_id.clone();
         let my_candidates = candidates.clone();
         let code_for_task = clean_code.clone();
+        let audio_engine_clone = self.audio_engine.clone();
+        let latest_video_clone = self.latest_remote_video.clone();
+        let remote_media_clone = self.remote_media_state.clone();
 
         let task = tokio::spawn(async move {
             logger_clone.info(&format!("Ожидание подключения гостя в комнате {} через брокер...", code_for_task));
@@ -388,6 +622,9 @@ impl P2pNode {
                                 shutdown_clone,
                                 logger_clone,
                                 next_id,
+                                audio_engine_clone,
+                                latest_video_clone,
+                                remote_media_clone,
                             ).await;
                         }
                         Err(e) => {
@@ -457,6 +694,9 @@ impl P2pNode {
         let next_id = self.next_peer_id.clone();
         let my_candidates = candidates.clone();
         let code_for_task = clean_code.clone();
+        let audio_engine_clone = self.audio_engine.clone();
+        let latest_video_clone = self.latest_remote_video.clone();
+        let remote_media_clone = self.remote_media_state.clone();
 
         let task = tokio::spawn(async move {
             let offer_res = MqttSignaling::client_exchange(&code_for_task, &answer_link, Duration::from_secs(45), &logger_clone).await;
@@ -488,6 +728,9 @@ impl P2pNode {
                                 shutdown_clone,
                                 logger_clone,
                                 next_id,
+                                audio_engine_clone,
+                                latest_video_clone,
+                                remote_media_clone,
                             ).await;
                         }
                         Err(e) => {
@@ -557,6 +800,66 @@ fn expand_candidates_with_port_spray(candidates: &[SocketAddr]) -> Vec<SocketAdd
     targets
 }
 
+struct VideoReassembler {
+    current_frame_id: u32,
+    chunk_total: u16,
+    is_screen: bool,
+    chunks: Vec<Option<Vec<u8>>>,
+    created_at: Instant,
+}
+
+impl VideoReassembler {
+    fn new() -> Self {
+        Self {
+            current_frame_id: 0,
+            chunk_total: 0,
+            is_screen: false,
+            chunks: Vec::new(),
+            created_at: Instant::now(),
+        }
+    }
+
+    fn handle_chunk(
+        &mut self,
+        frame_id: u32,
+        chunk_idx: u16,
+        chunk_total: u16,
+        is_screen: bool,
+        data: Vec<u8>,
+        target: &Arc<RwLock<Option<RemoteVideoFrame>>>,
+    ) {
+        use base64::Engine;
+        if frame_id > self.current_frame_id || self.created_at.elapsed() > Duration::from_millis(800) {
+            self.current_frame_id = frame_id;
+            self.chunk_total = chunk_total;
+            self.is_screen = is_screen;
+            self.chunks = vec![None; chunk_total as usize];
+            self.created_at = Instant::now();
+        }
+
+        if frame_id == self.current_frame_id && (chunk_idx as usize) < self.chunks.len() {
+            self.chunks[chunk_idx as usize] = Some(data);
+
+            if self.chunks.iter().all(|c| c.is_some()) {
+                let mut full_bytes = Vec::new();
+                for c in &self.chunks {
+                    if let Some(bytes) = c {
+                        full_bytes.extend_from_slice(bytes);
+                    }
+                }
+                let base64_str = base64::engine::general_purpose::STANDARD.encode(&full_bytes);
+                *target.write() = Some(RemoteVideoFrame {
+                    frame_id,
+                    is_screen: self.is_screen,
+                    jpeg_base64: base64_str,
+                    timestamp_ms: now_ms(),
+                });
+                self.chunks.clear();
+            }
+        }
+    }
+}
+
 /// Core simultaneous hole punching and connected session loop
 async fn run_simultaneous_punching_flow(
     socket: Arc<UdpSocket>,
@@ -576,6 +879,9 @@ async fn run_simultaneous_punching_flow(
     shutdown: Arc<AtomicBool>,
     logger: AppLogger,
     next_peer_id: Arc<AtomicU32>,
+    audio_engine: Arc<crate::audio::AudioEngine>,
+    latest_remote_video: Arc<RwLock<Option<RemoteVideoFrame>>>,
+    remote_media_state: Arc<RwLock<RemoteMediaState>>,
 ) {
     let targets = expand_candidates_with_port_spray(&remote_candidates);
     logger.info(&format!(
@@ -723,6 +1029,7 @@ async fn run_simultaneous_punching_flow(
                         peer_name_expected
                     ));
                     logger.info("============================================================");
+                    audio_engine.play_connect_chime();
 
                     run_relay_connected_loop(
                         relay_session,
@@ -735,6 +1042,9 @@ async fn run_simultaneous_punching_flow(
                         pending_acks,
                         shutdown,
                         logger,
+                        audio_engine.clone(),
+                        latest_remote_video.clone(),
+                        remote_media_state.clone(),
                     ).await;
                     return;
                 }
@@ -785,10 +1095,44 @@ async fn run_simultaneous_punching_flow(
         "============================================================"
     ));
 
-    // PHASE 3: ACTIVE SESSION (Ping/Pong + Text Chat + Disconnect + Auto Re-Punching)
+    // Start native audio engine for voice call
+    if let Err(e) = audio_engine.start() {
+        logger.error(&format!("Не удалось запустить аудио движок: {}", e));
+    } else {
+        logger.info("Аудио движок запущен для прямого P2P голосового звонка");
+        audio_engine.play_connect_chime();
+    }
+
+    // PHASE 3: ACTIVE SESSION (Audio/Video + Ping/Pong + Text Chat + Disconnect + Auto Re-Punching)
     let mut last_ping_sent = Instant::now();
     let mut last_repunch = Instant::now() - Duration::from_secs(10);
     let mut ping_seq = 0u64;
+    // Dedicated low-latency background audio transmitter (sends smoothly on 10ms ticks)
+    let audio_sock = socket.clone();
+    let audio_engine_tx = audio_engine.clone();
+    let shutdown_tx = shutdown.clone();
+
+    let audio_tx_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut audio_seq = 0u64;
+
+        while !shutdown_tx.load(Ordering::Relaxed) {
+            interval.tick().await;
+            for audio_payload in audio_engine_tx.pop_outgoing_packets() {
+                audio_seq += 1;
+                let audio_pkt = Packet::AudioData {
+                    seq: audio_seq,
+                    data: audio_payload,
+                };
+                if let Ok(b) = audio_pkt.encode() {
+                    let _ = audio_sock.send_to(&b, active_addr).await;
+                }
+            }
+        }
+    });
+
+    let mut video_reassembler = VideoReassembler::new();
 
     while !shutdown.load(Ordering::Relaxed) {
         // Send Ping every 1.5 seconds to keep mobile CGNAT mappings alive
@@ -837,6 +1181,47 @@ async fn run_simultaneous_punching_flow(
                         if sender_addr == active_addr || targets.contains(&sender_addr) {
                             if let Ok(pkt) = Packet::decode(&buf[..len]) {
                                 match pkt {
+                                    Packet::AudioData { data, .. } => {
+                                        audio_engine.feed_incoming_packet(&data);
+                                        if let Some(p) = peers.write().get_mut(&active_addr) {
+                                            p.last_seen_ms = now_ms();
+                                        }
+                                    }
+                                    Packet::VideoChunk {
+                                        frame_id,
+                                        chunk_idx,
+                                        chunk_total,
+                                        is_screen,
+                                        data,
+                                    } => {
+                                        video_reassembler.handle_chunk(
+                                            frame_id,
+                                            chunk_idx,
+                                            chunk_total,
+                                            is_screen,
+                                            data,
+                                            &latest_remote_video,
+                                        );
+                                        if let Some(p) = peers.write().get_mut(&active_addr) {
+                                            p.last_seen_ms = now_ms();
+                                        }
+                                    }
+                                    Packet::MediaState {
+                                        mic_muted,
+                                        deafened,
+                                        video_active,
+                                        screen_active,
+                                    } => {
+                                        *remote_media_state.write() = RemoteMediaState {
+                                            mic_muted,
+                                            deafened,
+                                            video_active,
+                                            screen_active,
+                                        };
+                                        if let Some(p) = peers.write().get_mut(&active_addr) {
+                                            p.last_seen_ms = now_ms();
+                                        }
+                                    }
                                     Packet::Ping { seq, timestamp_ms } => {
                                         let pong = Packet::Pong { seq, timestamp_ms };
                                         if let Ok(b) = pong.encode() {
@@ -907,9 +1292,12 @@ async fn run_simultaneous_punching_flow(
                                     }
                                     Packet::Disconnect { reason } => {
                                         logger.warn(&format!("Собеседник отключил связь: {}", reason));
+                                        audio_engine.play_disconnect_chime();
                                         *status.write() = ConnectionStatus::Failed {
                                             error: format!("Собеседник отключился: {}", reason),
                                         };
+                                        audio_tx_task.abort();
+                                        audio_engine.stop();
                                         return;
                                     }
                                     _ => {}
@@ -925,9 +1313,11 @@ async fn run_simultaneous_punching_flow(
                     }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
         }
     }
+    audio_tx_task.abort();
+    audio_engine.stop();
 }
 
 /// Active session loop for Relay (Nostr WSS TLS/443) fallback
@@ -942,10 +1332,21 @@ async fn run_relay_connected_loop(
     pending_acks: Arc<RwLock<HashMap<u64, oneshot::Sender<()>>>>,
     shutdown: Arc<AtomicBool>,
     logger: AppLogger,
+    audio_engine: Arc<crate::audio::AudioEngine>,
+    latest_remote_video: Arc<RwLock<Option<RemoteVideoFrame>>>,
+    remote_media_state: Arc<RwLock<RemoteMediaState>>,
 ) {
     let mut last_ping_sent = Instant::now();
     let mut ping_seq = 0u64;
+    let mut video_reassembler = VideoReassembler::new();
     let relay_virtual_addr = "127.0.0.1:443".parse::<SocketAddr>().unwrap();
+
+    // Start audio engine for relay voice call
+    if let Err(e) = audio_engine.start() {
+        logger.error(&format!("(Релей) Не удалось запустить аудио движок: {}", e));
+    } else {
+        logger.info("(Релей) Аудио движок запущен для WSS P2P голосового звонка");
+    }
 
     // Send initial Punch packet through relay to guarantee mutual session activation
     let init_punch = Packet::Punch {
@@ -953,6 +1354,29 @@ async fn run_relay_connected_loop(
         sender_name: my_name.clone(),
     };
     let _ = relay_session.outgoing_tx.send(init_punch).await;
+
+    // Dedicated low-latency background audio transmitter for relay (10ms cadence)
+    let relay_tx = relay_session.outgoing_tx.clone();
+    let audio_engine_tx = audio_engine.clone();
+    let shutdown_tx = shutdown.clone();
+
+    let audio_tx_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut audio_seq = 0u64;
+
+        while !shutdown_tx.load(Ordering::Relaxed) {
+            interval.tick().await;
+            for audio_payload in audio_engine_tx.pop_outgoing_packets() {
+                audio_seq += 1;
+                let audio_pkt = Packet::AudioData {
+                    seq: audio_seq,
+                    data: audio_payload,
+                };
+                let _ = relay_tx.send(audio_pkt).await;
+            }
+        }
+    });
 
     while !shutdown.load(Ordering::Relaxed) {
         // Send Ping every 2 seconds over relay to measure latency and keep alive
@@ -971,6 +1395,47 @@ async fn run_relay_connected_loop(
                 match recv_opt {
                     Some(pkt) => {
                         match pkt {
+                            Packet::AudioData { data, .. } => {
+                                audio_engine.feed_incoming_packet(&data);
+                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
+                                    p.last_seen_ms = now_ms();
+                                }
+                            }
+                            Packet::VideoChunk {
+                                frame_id,
+                                chunk_idx,
+                                chunk_total,
+                                is_screen,
+                                data,
+                            } => {
+                                video_reassembler.handle_chunk(
+                                    frame_id,
+                                    chunk_idx,
+                                    chunk_total,
+                                    is_screen,
+                                    data,
+                                    &latest_remote_video,
+                                );
+                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
+                                    p.last_seen_ms = now_ms();
+                                }
+                            }
+                            Packet::MediaState {
+                                mic_muted,
+                                deafened,
+                                video_active,
+                                screen_active,
+                            } => {
+                                *remote_media_state.write() = RemoteMediaState {
+                                    mic_muted,
+                                    deafened,
+                                    video_active,
+                                    screen_active,
+                                };
+                                if let Some(p) = peers.write().get_mut(&relay_virtual_addr) {
+                                    p.last_seen_ms = now_ms();
+                                }
+                            }
                             Packet::Ping { seq, timestamp_ms } => {
                                 let pong = Packet::Pong { seq, timestamp_ms };
                                 let _ = relay_session.outgoing_tx.send(pong).await;
@@ -1031,9 +1496,12 @@ async fn run_relay_connected_loop(
                             }
                             Packet::Disconnect { reason } => {
                                 logger.warn(&format!("Собеседник отключил связь (релей): {}", reason));
+                                audio_engine.play_disconnect_chime();
                                 *status.write() = ConnectionStatus::Failed {
                                     error: format!("Собеседник отключился: {}", reason),
                                 };
+                                audio_tx_task.abort();
+                                audio_engine.stop();
                                 return;
                             }
                             _ => {}
@@ -1045,9 +1513,11 @@ async fn run_relay_connected_loop(
                     }
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(15)) => {}
         }
     }
+    audio_tx_task.abort();
+    audio_engine.stop();
 }
 
 pub fn detect_local_lan_ip() -> IpAddr {
@@ -1222,13 +1692,20 @@ fn parse_stun_response(buf: &[u8], tx_id: &[u8; 12]) -> Option<SocketAddr> {
 #[cfg(windows)]
 pub fn configure_socket_physical_if(socket: &UdpSocket, logger: &AppLogger) -> Option<Ipv4Addr> {
     use std::os::windows::io::AsRawSocket;
-    if let Some((if_idx, opt_ip)) = find_best_physical_interface() {
-        let raw_sock = socket.as_raw_socket() as usize;
-        let if_index_be: u32 = if_idx.to_be(); // network byte order for Winsock IP_UNICAST_IF
-        unsafe {
-            extern "system" {
-                fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
-            }
+    let raw_sock = socket.as_raw_socket() as usize;
+
+    unsafe {
+        extern "system" {
+            fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+        }
+
+        // Expand socket buffers to 1 MB so burst video chunks never drop packets
+        let buf_size: i32 = 1024 * 1024;
+        let _ = setsockopt(raw_sock, 0xFFFF /* SOL_SOCKET */, 0x1002 /* SO_RCVBUF */, &buf_size as *const _ as *const u8, 4);
+        let _ = setsockopt(raw_sock, 0xFFFF /* SOL_SOCKET */, 0x1001 /* SO_SNDBUF */, &buf_size as *const _ as *const u8, 4);
+
+        if let Some((if_idx, opt_ip)) = find_best_physical_interface() {
+            let if_index_be: u32 = if_idx.to_be(); // network byte order for Winsock IP_UNICAST_IF
             let res = setsockopt(
                 raw_sock,
                 0,  /* IPPROTO_IP */
@@ -1248,8 +1725,8 @@ pub fn configure_socket_physical_if(socket: &UdpSocket, logger: &AppLogger) -> O
                     if_idx
                 ));
             }
+            return opt_ip;
         }
-        return opt_ip;
     }
     None
 }
