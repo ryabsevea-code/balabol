@@ -150,6 +150,16 @@ fn play_notification_sound(sound_type: String, state: State<'_, AppState>) {
     state.node.play_notification_sound(&sound_type);
 }
 
+#[tauri::command]
+async fn transfer_host(new_host_id: u32, state: State<'_, AppState>) -> Result<(), String> {
+    state.node.transfer_host(new_host_id).await
+}
+
+#[tauri::command]
+async fn set_nickname(nickname: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.node.update_nickname(nickname).await
+}
+
 pub fn run() {
     let logger = AppLogger::init();
     logger.info("Запуск приложения Balabol P2P...");
@@ -184,6 +194,8 @@ pub fn run() {
             get_remote_video_frame,
             send_video_frame,
             send_media_state,
+            transfer_host,
+            set_nickname,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
