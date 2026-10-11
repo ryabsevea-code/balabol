@@ -83,8 +83,18 @@ fn set_deafened(deafened: bool, state: State<'_, AppState>) {
 }
 
 #[tauri::command]
-fn set_peer_volume(volume: f32, state: State<'_, AppState>) {
-    state.node.set_peer_volume(volume);
+fn set_master_volume(volume: f32, state: State<'_, AppState>) {
+    state.node.set_master_volume(volume);
+}
+
+#[tauri::command]
+fn get_master_volume(state: State<'_, AppState>) -> f32 {
+    state.node.get_master_volume()
+}
+
+#[tauri::command]
+fn set_peer_volume(peer_id: u32, volume: f32, state: State<'_, AppState>) {
+    state.node.set_peer_volume(peer_id, volume);
 }
 
 #[tauri::command]
@@ -182,6 +192,8 @@ pub fn run() {
             get_log_file_path,
             set_mic_muted,
             set_deafened,
+            set_master_volume,
+            get_master_volume,
             set_peer_volume,
             set_mic_sensitivity,
             set_mic_gain,

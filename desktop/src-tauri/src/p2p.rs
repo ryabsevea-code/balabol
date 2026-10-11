@@ -96,6 +96,7 @@ pub enum Packet {
     HostHandover {
         old_host_id: u32,
         new_host_id: u32,
+        new_host_addr: Option<SocketAddr>,
     },
     ClaimHost {
         candidate_id: u32,
@@ -169,7 +170,6 @@ pub struct RemoteMediaState {
 pub struct VoiceStatus {
     pub mic_muted: bool,
     pub deafened: bool,
-    pub peer_volume: f32,
     pub local_speaking: bool,
     pub remote_speaking: bool,
     pub remote_media: RemoteMediaState,
@@ -252,7 +252,7 @@ impl P2pNode {
             logger,
             status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
             my_peer_id: Arc::new(AtomicU32::new(1)),
-            my_nickname: Arc::new(RwLock::new("Узел".into())),
+            my_nickname: Arc::new(RwLock::new("РЈР·РµР»".into())),
             is_host: Arc::new(AtomicBool::new(false)),
             current_host_id: Arc::new(AtomicU32::new(1)),
             backup_host_id: Arc::new(RwLock::new(None)),
@@ -308,7 +308,7 @@ impl P2pNode {
         let my_id = self.my_peer_id.load(Ordering::Relaxed);
         let disc = Packet::Disconnect {
             sender_id: my_id,
-            reason: "Пользователь вышел из комнаты".into(),
+            reason: "РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РІС‹С€РµР» РёР· РєРѕРјРЅР°С‚С‹".into(),
         };
 
         if let Ok(bytes) = disc.encode() {
@@ -336,7 +336,7 @@ impl P2pNode {
             });
         }
 
-        self.logger.info("Отключение P2P соединения...");
+        self.logger.info("РћС‚РєР»СЋС‡РµРЅРёРµ P2P СЃРѕРµРґРёРЅРµРЅРёСЏ...");
         self.audio_engine.stop();
         *self.latest_remote_video.write() = None;
         *self.remote_media_state.write() = RemoteMediaState::default();
@@ -351,7 +351,7 @@ impl P2pNode {
         self.is_host.store(false, Ordering::SeqCst);
         *self.current_room_code.write() = None;
         *self.status.write() = ConnectionStatus::Disconnected;
-        self.logger.info("Состояние сброшено в Disconnected");
+        self.logger.info("РЎРѕСЃС‚РѕСЏРЅРёРµ СЃР±СЂРѕС€РµРЅРѕ РІ Disconnected");
     }
 
     pub fn set_mic_muted(&self, muted: bool) {
@@ -364,8 +364,16 @@ impl P2pNode {
         let _ = self.broadcast_media_state();
     }
 
-    pub fn set_peer_volume(&self, volume: f32) {
-        self.audio_engine.set_peer_volume(volume);
+    pub fn set_master_volume(&self, volume: f32) {
+        self.audio_engine.set_master_volume(volume);
+    }
+
+    pub fn get_master_volume(&self) -> f32 {
+        self.audio_engine.get_master_volume()
+    }
+
+    pub fn set_peer_volume(&self, peer_id: u32, volume: f32) {
+        self.audio_engine.set_peer_volume(peer_id, volume);
     }
 
     pub fn get_voice_status(&self) -> VoiceStatus {
@@ -374,7 +382,6 @@ impl P2pNode {
         VoiceStatus {
             mic_muted: self.audio_engine.is_mic_muted(),
             deafened: self.audio_engine.is_deafened(),
-            peer_volume: self.audio_engine.get_peer_volume(),
             local_speaking: self.audio_engine.is_local_speaking(),
             remote_speaking: self.audio_engine.is_remote_speaking(),
             remote_media,
@@ -517,7 +524,7 @@ impl P2pNode {
     pub async fn send_chat_message(&self, text: String, my_name: String) -> Result<ChatMessage, String> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
-            return Err("Сообщение не может быть пустым".into());
+            return Err("РЎРѕРѕР±С‰РµРЅРёРµ РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РїСѓСЃС‚С‹Рј".into());
         }
 
         let my_id = self.my_peer_id.load(Ordering::Relaxed);
@@ -545,7 +552,7 @@ impl P2pNode {
         };
 
         self.chat_messages.write().push(msg.clone());
-        self.logger.info(&format!("[ЧАТ] Я: {}", trimmed));
+        self.logger.info(&format!("[Р§РђРў] РЇ: {}", trimmed));
         Ok(msg)
     }
 
@@ -553,7 +560,7 @@ impl P2pNode {
     pub async fn update_nickname(&self, new_nickname: String) -> Result<(), String> {
         let trimmed = new_nickname.trim().to_string();
         if trimmed.is_empty() {
-            return Err("Имя не может быть пустым".into());
+            return Err("РРјСЏ РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РїСѓСЃС‚С‹Рј".into());
         }
 
         *self.my_nickname.write() = trimmed.clone();
@@ -574,14 +581,14 @@ impl P2pNode {
             new_nickname: trimmed.clone(),
         };
         self.broadcast_packet(&pkt).await;
-        self.logger.info(&format!("Ваше имя обновлено на '{}'", trimmed));
+        self.logger.info(&format!("Р’Р°С€Рµ РёРјСЏ РѕР±РЅРѕРІР»РµРЅРѕ РЅР° '{}'", trimmed));
         Ok(())
     }
 
     /// Transfer host responsibility to another connected peer
     pub async fn transfer_host(&self, new_host_id: u32) -> Result<(), String> {
         if !self.is_host.load(Ordering::Relaxed) {
-            return Err("Только текущий хост может передать роль хоста".into());
+            return Err("РўРѕР»СЊРєРѕ С‚РµРєСѓС‰РёР№ С…РѕСЃС‚ РјРѕР¶РµС‚ РїРµСЂРµРґР°С‚СЊ СЂРѕР»СЊ С…РѕСЃС‚Р°".into());
         }
         let my_id = self.my_peer_id.load(Ordering::Relaxed);
         if new_host_id == my_id {
@@ -589,22 +596,42 @@ impl P2pNode {
         }
 
         self.logger.info(&format!(
-            "👑 Передача роли хоста от узла {} к узлу {}",
+            "рџ‘‘ РџРµСЂРµРґР°С‡Р° СЂРѕР»Рё С…РѕСЃС‚Р° РѕС‚ СѓР·Р»Р° {} Рє СѓР·Р»Сѓ {}",
             my_id, new_host_id
         ));
+
+        let opt_target = self.client_endpoints.read().get(&new_host_id).cloned();
 
         let handover_pkt = Packet::HostHandover {
             old_host_id: my_id,
             new_host_id,
+            new_host_addr: opt_target,
         };
 
-        self.broadcast_packet(&handover_pkt).await;
+        // Broadcast handover packet to all clients with retry so no client misses it
+        for _ in 0..3 {
+            self.broadcast_packet(&handover_pkt).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         self.is_host.store(false, Ordering::SeqCst);
         self.current_host_id.store(new_host_id, Ordering::SeqCst);
 
         // Point host_socket_addr to the new host so our outgoing audio/video goes directly to them
-        if let Some(target_addr) = self.client_endpoints.read().get(&new_host_id).cloned() {
+        if let Some(target_addr) = opt_target {
             *self.host_socket_addr.write() = Some(target_addr);
+            let sock_opt = self.active_socket.read().clone();
+            if let Some(sock) = sock_opt {
+                let punch = Packet::Punch {
+                    nonce: rand::random(),
+                    sender_name: self.my_nickname.read().clone(),
+                    sender_id: my_id,
+                };
+                if let Ok(b) = punch.encode() {
+                    for _ in 0..5 {
+                        let _ = sock.send_to(&b, target_addr).await;
+                    }
+                }
+            }
         }
 
         // Update local peer roster
@@ -614,7 +641,7 @@ impl P2pNode {
                 target.is_host = true;
                 target.name.clone()
             } else {
-                "Организатор".into()
+                "РћСЂРіР°РЅРёР·Р°С‚РѕСЂ".into()
             }
         };
 
@@ -632,7 +659,7 @@ impl P2pNode {
     pub async fn promote_to_host(&self) {
         let my_id = self.my_peer_id.load(Ordering::Relaxed);
         self.logger.warn(&format!(
-            "👑 [Failover] Узел {} принимает на себя роль SFU Хоста комнаты!",
+            "рџ‘‘ [Failover] РЈР·РµР» {} РїСЂРёРЅРёРјР°РµС‚ РЅР° СЃРµР±СЏ СЂРѕР»СЊ SFU РҐРѕСЃС‚Р° РєРѕРјРЅР°С‚С‹!",
             my_id
         ));
 
@@ -642,7 +669,7 @@ impl P2pNode {
 
         let claim_pkt = Packet::ClaimHost {
             candidate_id: my_id,
-            reason: "Предыдущий хост отключился".into(),
+            reason: "РџСЂРµРґС‹РґСѓС‰РёР№ С…РѕСЃС‚ РѕС‚РєР»СЋС‡РёР»СЃСЏ".into(),
         };
         self.broadcast_packet(&claim_pkt).await;
 
@@ -668,14 +695,14 @@ impl P2pNode {
 
         let clean_code = crate::signaling::sanitize_room_code(&room_code);
         self.logger.info(&format!(
-            "Создание Star-SFU комнаты '{}' (Код: {}), хост '{}'",
+            "РЎРѕР·РґР°РЅРёРµ Star-SFU РєРѕРјРЅР°С‚С‹ '{}' (РљРѕРґ: {}), С…РѕСЃС‚ '{}'",
             room_code, clean_code, nickname
         ));
 
         // 1. Bind UDP socket
         let socket = UdpSocket::bind("0.0.0.0:0")
             .await
-            .map_err(|e| format!("Не удалось создать UDP сокет: {}", e))?;
+            .map_err(|e| format!("РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕР·РґР°С‚СЊ UDP СЃРѕРєРµС‚: {}", e))?;
         let opt_physical_ip = configure_socket_physical_if(&socket, &self.logger);
         let actual_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
         let arc_socket = Arc::new(socket);
@@ -704,7 +731,7 @@ impl P2pNode {
             my_id: 1,
             is_host: true,
             host_name: nickname.clone(),
-            peer_name: "Ожидание гостей".into(),
+            peer_name: "РћР¶РёРґР°РЅРёРµ РіРѕСЃС‚РµР№".into(),
             peer_addr: pub_str.clone().or(local_str.clone()).unwrap_or_default(),
             room_name: room_code.clone(),
             room_code: Some(clean_code.clone()),
@@ -714,9 +741,9 @@ impl P2pNode {
 
         // 4. Start local audio engine
         if let Err(e) = self.audio_engine.start() {
-            self.logger.error(&format!("Не удалось запустить аудио движок хоста: {}", e));
+            self.logger.error(&format!("РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ Р°СѓРґРёРѕ РґРІРёР¶РѕРє С…РѕСЃС‚Р°: {}", e));
         } else {
-            self.logger.info("Аудио движок хоста успешно запущен");
+            self.logger.info("РђСѓРґРёРѕ РґРІРёР¶РѕРє С…РѕСЃС‚Р° СѓСЃРїРµС€РЅРѕ Р·Р°РїСѓС‰РµРЅ");
             self.audio_engine.play_connect_chime();
         }
 
@@ -752,21 +779,21 @@ impl P2pNode {
 
         let clean_code = crate::signaling::sanitize_room_code(&room_code);
         self.logger.info(&format!(
-            "Вход в Star-SFU комнату '{}' (Код: {}), клиент '{}'",
+            "Р’С…РѕРґ РІ Star-SFU РєРѕРјРЅР°С‚Сѓ '{}' (РљРѕРґ: {}), РєР»РёРµРЅС‚ '{}'",
             room_code, clean_code, nickname
         ));
 
         *self.status.write() = ConnectionStatus::Connecting {
-            target_str: format!("Комната {}", clean_code),
+            target_str: format!("РљРѕРјРЅР°С‚Р° {}", clean_code),
             attempt: 1,
             max_attempts: 1,
-            mode: "Поиск хоста через брокер...".into(),
+            mode: "РџРѕРёСЃРє С…РѕСЃС‚Р° С‡РµСЂРµР· Р±СЂРѕРєРµСЂ...".into(),
         };
 
         // 1. Bind UDP socket
         let socket = UdpSocket::bind("0.0.0.0:0")
             .await
-            .map_err(|e| format!("Не удалось создать UDP сокет: {}", e))?;
+            .map_err(|e| format!("РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕР·РґР°С‚СЊ UDP СЃРѕРєРµС‚: {}", e))?;
         let opt_physical_ip = configure_socket_physical_if(&socket, &self.logger);
         let actual_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
         let arc_socket = Arc::new(socket);
@@ -871,13 +898,24 @@ async fn run_sfu_host_loop(
                 };
                 if let Ok(b) = audio_pkt.encode() {
                     let opt_haddr = *node_audio.host_socket_addr.read();
+                    let my_local_port = audio_sock.local_addr().map(|a| a.port()).unwrap_or(0);
                     if node_audio.is_host.load(Ordering::Relaxed) {
-                        let client_addrs: Vec<SocketAddr> = node_audio.client_endpoints.read().values().cloned().collect();
-                        for caddr in client_addrs {
-                            let _ = audio_sock.send_to(&b, caddr).await;
+                        let endpoints: Vec<(u32, SocketAddr)> = node_audio
+                            .client_endpoints
+                            .read()
+                            .iter()
+                            .map(|(&id, &addr)| (id, addr))
+                            .collect();
+                        let mut sent_addrs = std::collections::HashSet::new();
+                        for (cid, caddr) in endpoints {
+                            if cid != my_id && caddr.port() != my_local_port && sent_addrs.insert(caddr) {
+                                let _ = audio_sock.send_to(&b, caddr).await;
+                            }
                         }
                     } else if let Some(haddr) = opt_haddr {
-                        let _ = audio_sock.send_to(&b, haddr).await;
+                        if haddr.port() != my_local_port {
+                            let _ = audio_sock.send_to(&b, haddr).await;
+                        }
                     }
                 }
             }
@@ -897,67 +935,110 @@ async fn run_sfu_host_loop(
             last_diag_log = Instant::now();
         }
 
-        // Periodic ping and peer list broadcast every 2.5s
-        if last_ping_broadcast.elapsed() >= Duration::from_millis(2500) {
-            ping_seq += 1;
-            let my_id = node.my_peer_id.load(Ordering::Relaxed);
-            let ping_pkt = Packet::Ping {
-                sender_id: my_id,
-                seq: ping_seq,
-                timestamp_ms: now_ms(),
-            };
-            node.broadcast_packet(&ping_pkt).await;
+        // Periodic ping and peer list broadcast every 1.5s (only active SFU host sends these)
+        if last_ping_broadcast.elapsed() >= Duration::from_millis(1500) {
+            if node.is_host.load(Ordering::Relaxed) {
+                let now = now_ms();
+                let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                let mut to_remove = Vec::new();
+                {
+                    let peers = node.peers.read();
+                    for p in peers.values() {
+                        // 30 seconds inactivity timeout (generous margin for silence / high network jitter)
+                        if p.id != my_id && now.saturating_sub(p.last_seen_ms) > 30000 {
+                            to_remove.push(p.id);
+                        }
+                    }
+                }
+                if !to_remove.is_empty() {
+                    let mut peers = node.peers.write();
+                    let mut endpoints = node.client_endpoints.write();
+                    for id in to_remove {
+                        node.logger.warn(&format!("Гость (id={}) отключился по таймауту!", id));
+                        peers.remove(&id);
+                        endpoints.remove(&id);
+                    }
+                }
 
-            // Compute backup host (guest with lowest peer id)
-            let backup_id = {
-                let p_guard = node.peers.read();
-                p_guard.keys().filter(|&&id| id != 1).min().cloned()
-            };
-            *node.backup_host_id.write() = backup_id;
-
-            let peers_list = build_host_peer_list(&node);
-            let update_pkt = Packet::PeerListUpdate {
-                host_id: my_id,
-                backup_host_id: backup_id,
-                peers: peers_list,
-            };
-            node.broadcast_packet(&update_pkt).await;
-
-            // Update connected count in Hosting/Connected status
-            let connected_count = node.peers.read().len();
-            let mut st = node.status.write();
-            if let ConnectionStatus::Connected { connected_count: cc, peer_name, .. } = &mut *st {
-                *cc = connected_count;
-                *peer_name = if connected_count == 0 {
-                    "Ожидание гостей".into()
-                } else {
-                    format!("Участников: {}", connected_count + 1)
+                ping_seq += 1;
+                let ping_pkt = Packet::Ping {
+                    sender_id: my_id,
+                    seq: ping_seq,
+                    timestamp_ms: now_ms(),
                 };
+                node.broadcast_packet(&ping_pkt).await;
+
+                // Compute backup host (guest with lowest peer id other than host)
+                let backup_id = {
+                    let p_guard = node.peers.read();
+                    p_guard.keys().filter(|&&id| id != my_id).min().cloned()
+                };
+                *node.backup_host_id.write() = backup_id;
+
+                let peers_list = build_host_peer_list(&node);
+                let update_pkt = Packet::PeerListUpdate {
+                    host_id: my_id,
+                    backup_host_id: backup_id,
+                    peers: peers_list,
+                };
+                node.broadcast_packet(&update_pkt).await;
+
+                // Update connected count in Hosting/Connected status
+                let connected_count = node.peers.read().len();
+                let mut st = node.status.write();
+                if let ConnectionStatus::Connected { connected_count: cc, peer_name, .. } = &mut *st {
+                    *cc = connected_count;
+                    *peer_name = if connected_count == 0 {
+                        "Ожидание гостей".into()
+                    } else {
+                        format!("Участников: {}", connected_count + 1)
+                    };
+                }
             }
 
             last_ping_broadcast = Instant::now();
         }
 
         tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             // 1. Incoming Answers from Nostr Signaling for new guests
             Some(answer_str) = host_signaling.incoming_answers.recv() => {
+                if !node.is_host.load(Ordering::Relaxed) {
+                    continue;
+                }
                 if let Ok(answer) = parse_answer_link(&answer_str) {
+                    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                    let my_name = node.my_nickname.read().clone();
+                    if answer.name == my_name {
+                        continue;
+                    }
+                    if let Some(gid) = answer.guest_id {
+                        if gid == my_id {
+                            continue;
+                        }
+                    }
+                    let my_local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+                    let targets: Vec<SocketAddr> = expand_candidates_with_port_spray(&answer.candidates)
+                        .into_iter()
+                        .filter(|addr| addr.port() != my_local_port)
+                        .collect();
+                    if targets.is_empty() {
+                        continue;
+                    }
                     node.logger.info(&format!(
                         "SFU Хост: получен запрос на подключение от гостя '{}'!",
                         answer.name
                     ));
                     let _assigned_id = answer.guest_id.unwrap_or_else(|| node.next_peer_id.fetch_add(1, Ordering::SeqCst));
-                    let targets = expand_candidates_with_port_spray(&answer.candidates);
 
                     let sock_clone = socket.clone();
-                    let my_name = node.my_nickname.read().clone();
                     let node_punch = node.clone();
                     let guest_id_opt = answer.guest_id;
                     tokio::spawn(async move {
                         let punch_pkt = Packet::Punch {
                             nonce: answer.nonce.unwrap_or_else(rand::random),
                             sender_name: my_name,
-                            sender_id: 1,
+                            sender_id: my_id,
                         };
                         if let Ok(b) = punch_pkt.encode() {
                             let punch_start = Instant::now();
@@ -982,8 +1063,47 @@ async fn run_sfu_host_loop(
                 match recv_res {
                     Ok((len, sender_addr)) => {
                         if let Ok(pkt) = Packet::decode(&buf[..len]) {
+                            // Auto-heal client endpoints for dynamic IP/port changes
+                            let pkt_sender_id = match &pkt {
+                                Packet::Punch { sender_id, .. } => Some(*sender_id),
+                                Packet::PunchAck { sender_id, .. } => Some(*sender_id),
+                                Packet::AudioData { sender_id, .. } => Some(*sender_id),
+                                Packet::VideoChunk { sender_id, .. } => Some(*sender_id),
+                                Packet::TextMessage { sender_id, .. } => Some(*sender_id),
+                                Packet::MediaState { sender_id, .. } => Some(*sender_id),
+                                Packet::Ping { sender_id, .. } => Some(*sender_id),
+                                Packet::Pong { sender_id, .. } => Some(*sender_id),
+                                Packet::NicknameUpdate { sender_id, .. } => Some(*sender_id),
+                                Packet::Disconnect { sender_id, .. } => Some(*sender_id),
+                                _ => None,
+                            };
+                            let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                            let my_local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+                            if let Some(sid) = pkt_sender_id {
+                                if sid != my_id && sender_addr.port() != my_local_port {
+                                    let mut endpoints = node.client_endpoints.write();
+                                    if endpoints.get(&sid) != Some(&sender_addr) {
+                                        endpoints.insert(sid, sender_addr);
+                                        node.peer_addrs.write().insert(sender_addr, sid);
+                                        if let Some(p) = node.peers.write().get_mut(&sid) {
+                                            p.addr = sender_addr.to_string();
+                                        }
+                                    }
+                                    if let Some(p) = node.peers.write().get_mut(&sid) {
+                                        p.last_seen_ms = now_ms();
+                                    }
+                                }
+                            }
+
                             match pkt {
                                 Packet::Punch { nonce, sender_name, sender_id } => {
+                                    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                    let my_name = node.my_nickname.read().clone();
+                                    let my_local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+                                    if sender_id == my_id || sender_name == my_name || sender_addr.port() == my_local_port {
+                                        continue;
+                                    }
+
                                     node.logger.info(&format!(
                                         "SFU Хост: подключился гость '{}' (id={}, addr={})!",
                                         sender_name, sender_id, sender_addr
@@ -992,8 +1112,8 @@ async fn run_sfu_host_loop(
                                     // Send PunchAck
                                     let ack = Packet::PunchAck {
                                         nonce,
-                                        sender_name: node.my_nickname.read().clone(),
-                                        sender_id: 1,
+                                        sender_name: my_name.clone(),
+                                        sender_id: my_id,
                                     };
                                     if let Ok(ack_b) = ack.encode() {
                                         for _ in 0..3 {
@@ -1024,8 +1144,8 @@ async fn run_sfu_host_loop(
                                     // Send ConnectAccept with current peer list
                                     let accept = Packet::ConnectAccept {
                                         assigned_id: sender_id,
-                                        host_id: node.my_peer_id.load(Ordering::Relaxed),
-                                        host_name: node.my_nickname.read().clone(),
+                                        host_id: my_id,
+                                        host_name: my_name,
                                         room_name: room_code.clone(),
                                         peers: build_host_peer_list(&node),
                                     };
@@ -1036,6 +1156,13 @@ async fn run_sfu_host_loop(
                                     node.audio_engine.play_connect_chime();
                                 }
                                 Packet::PunchAck { sender_name, sender_id, .. } => {
+                                    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                    let my_name = node.my_nickname.read().clone();
+                                    let my_local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+                                    if sender_id == my_id || sender_name == my_name || sender_addr.port() == my_local_port {
+                                        continue;
+                                    }
+
                                     node.client_endpoints.write().insert(sender_id, sender_addr);
                                     node.peer_addrs.write().insert(sender_addr, sender_id);
                                     if let Some(p) = node.peers.write().get_mut(&sender_id) {
@@ -1044,8 +1171,13 @@ async fn run_sfu_host_loop(
                                     }
                                 }
                                 Packet::AudioData { sender_id, seq, data } => {
-                                    // Host feeds locally into mixer
-                                    node.audio_engine.feed_incoming_packet(sender_id, &data);
+                                    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                    if sender_id == my_id {
+                                        continue;
+                                    }
+
+                                    // Host feeds locally into mixer (deduplicated by AudioEngine)
+                                    node.audio_engine.feed_incoming_packet(sender_id, seq, &data);
                                     if let Some(p) = node.peers.write().get_mut(&sender_id) {
                                         p.last_seen_ms = now_ms();
                                     }
@@ -1054,9 +1186,21 @@ async fn run_sfu_host_loop(
                                     if node.is_host.load(Ordering::Relaxed) {
                                         let forward_pkt = Packet::AudioData { sender_id, seq, data };
                                         if let Ok(forward_bytes) = forward_pkt.encode() {
-                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
-                                            for caddr in endpoints {
-                                                if caddr != sender_addr {
+                                            let endpoints: Vec<(u32, SocketAddr)> = node
+                                                .client_endpoints
+                                                .read()
+                                                .iter()
+                                                .map(|(&id, &addr)| (id, addr))
+                                                .collect();
+                                            let my_local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+                                            let mut sent_addrs = std::collections::HashSet::new();
+                                            for (cid, caddr) in endpoints {
+                                                if cid != sender_id
+                                                    && cid != my_id
+                                                    && caddr != sender_addr
+                                                    && caddr.port() != my_local_port
+                                                    && sent_addrs.insert(caddr)
+                                                {
                                                     let _ = socket.send_to(&forward_bytes, caddr).await;
                                                 }
                                             }
@@ -1113,7 +1257,7 @@ async fn run_sfu_host_loop(
 
                                     let is_new = node.seen_msg_ids.write().insert(id);
                                     if is_new {
-                                        node.logger.info(&format!("[ЧАТ SFU] {}: {}", sender_name, text));
+                                        node.logger.info(&format!("[Р§РђРў SFU] {}: {}", sender_name, text));
                                         node.chat_messages.write().push(ChatMessage {
                                              id,
                                              sender: sender_name.clone(),
@@ -1161,7 +1305,8 @@ async fn run_sfu_host_loop(
                                     }
                                 }
                                 Packet::Ping { sender_id, seq, timestamp_ms } => {
-                                    let pong = Packet::Pong { sender_id: 1, seq, timestamp_ms };
+                                    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                    let pong = Packet::Pong { sender_id: my_id, seq, timestamp_ms };
                                     if let Ok(b) = pong.encode() {
                                         let _ = socket.send_to(&b, sender_addr).await;
                                     }
@@ -1177,7 +1322,7 @@ async fn run_sfu_host_loop(
                                     }
                                 }
                                 Packet::Disconnect { sender_id, reason } => {
-                                    node.logger.warn(&format!("Гость (id={}) отключился: {}", sender_id, reason));
+                                    node.logger.warn(&format!("Р“РѕСЃС‚СЊ (id={}) РѕС‚РєР»СЋС‡РёР»СЃСЏ: {}", sender_id, reason));
                                     node.client_endpoints.write().remove(&sender_id);
                                     node.peer_addrs.write().remove(&sender_addr);
                                     node.peers.write().remove(&sender_id);
@@ -1192,7 +1337,7 @@ async fn run_sfu_host_loop(
                                     node.broadcast_packet(&update).await;
                                 }
                                 Packet::NicknameUpdate { sender_id, new_nickname } => {
-                                    node.logger.info(&format!("[SFU] Участник (id={}) обновил имя на '{}'", sender_id, new_nickname));
+                                    node.logger.info(&format!("[SFU] РЈС‡Р°СЃС‚РЅРёРє (id={}) РѕР±РЅРѕРІРёР» РёРјСЏ РЅР° '{}'", sender_id, new_nickname));
                                     if let Some(p) = node.peers.write().get_mut(&sender_id) {
                                         p.name = new_nickname.clone();
                                     }
@@ -1215,11 +1360,29 @@ async fn run_sfu_host_loop(
                                         node.broadcast_packet(&update).await;
                                     }
                                 }
-                                Packet::HostHandover { new_host_id, .. } => {
+                                Packet::PeerListUpdate { host_id, backup_host_id, peers } => {
+                                    if !node.is_host.load(Ordering::Relaxed) {
+                                        node.current_host_id.store(host_id, Ordering::SeqCst);
+                                        *node.backup_host_id.write() = backup_host_id;
+                                        *node.host_socket_addr.write() = Some(sender_addr);
+                                        let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                        let mut p_guard = node.peers.write();
+                                        p_guard.clear();
+                                        for p in peers {
+                                            if p.id != my_id {
+                                                p_guard.insert(p.id, p);
+                                            }
+                                        }
+                                    }
+                                }
+                                Packet::HostHandover { new_host_id, new_host_addr, .. } => {
                                     node.current_host_id.store(new_host_id, Ordering::SeqCst);
                                     let my_id = node.my_peer_id.load(Ordering::Relaxed);
                                     if new_host_id != my_id {
                                         node.is_host.store(false, Ordering::SeqCst);
+                                        if let Some(n_addr) = new_host_addr {
+                                            *node.host_socket_addr.write() = Some(n_addr);
+                                        }
                                         let mut peers_guard = node.peers.write();
                                         for p in peers_guard.values_mut() {
                                             p.is_host = p.id == new_host_id;
@@ -1254,7 +1417,7 @@ async fn run_sfu_client_connection(
     my_nonce: u64,
     node: P2pNode,
 ) {
-    node.logger.info(&format!("Поиск комнаты '{}' на WSS-релеях...", room_code));
+    node.logger.info(&format!("РџРѕРёСЃРє РєРѕРјРЅР°С‚С‹ '{}' РЅР° WSS-СЂРµР»РµСЏС…...", room_code));
 
     let offer_res = MqttSignaling::client_exchange(&room_code, &answer_link, Duration::from_secs(45), &node.logger).await;
 
@@ -1266,24 +1429,24 @@ async fn run_sfu_client_connection(
         Ok(str_offer) => match parse_offer_link(&str_offer) {
             Ok(off) => off,
             Err(e) => {
-                node.logger.error(&format!("Ошибка разбора Offer: {}", e));
+                node.logger.error(&format!("РћС€РёР±РєР° СЂР°Р·Р±РѕСЂР° Offer: {}", e));
                 *node.status.write() = ConnectionStatus::Failed { error: e };
                 return;
             }
         },
         Err(e) => {
-            node.logger.error(&format!("Не удалось найти хоста: {}", e));
+            node.logger.error(&format!("РќРµ СѓРґР°Р»РѕСЃСЊ РЅР°Р№С‚Рё С…РѕСЃС‚Р°: {}", e));
             *node.status.write() = ConnectionStatus::Failed { error: e };
             return;
         }
     };
 
-    node.logger.info(&format!("Offer от хоста '{}' получен! Начинаем пробитие NAT...", offer.name));
+    node.logger.info(&format!("Offer РѕС‚ С…РѕСЃС‚Р° '{}' РїРѕР»СѓС‡РµРЅ! РќР°С‡РёРЅР°РµРј РїСЂРѕР±РёС‚РёРµ NAT...", offer.name));
     *node.status.write() = ConnectionStatus::Connecting {
         target_str: offer.name.clone(),
         attempt: 1,
         max_attempts: 2,
-        mode: "Пробитие UDP к SFU Хосту...".into(),
+        mode: "РџСЂРѕР±РёС‚РёРµ UDP Рє SFU РҐРѕСЃС‚Сѓ...".into(),
     };
 
     let targets = expand_candidates_with_port_spray(&offer.candidates);
@@ -1295,7 +1458,7 @@ async fn run_sfu_client_connection(
     let punch_bytes = match punch_pkt.encode() {
         Ok(b) => b,
         Err(e) => {
-            node.logger.error(&format!("Ошибка кодирования Punch: {}", e));
+            node.logger.error(&format!("РћС€РёР±РєР° РєРѕРґРёСЂРѕРІР°РЅРёСЏ Punch: {}", e));
             return;
         }
     };
@@ -1321,7 +1484,7 @@ async fn run_sfu_client_connection(
                         if let Ok(pkt) = Packet::decode(&buf[..len]) {
                             match pkt {
                                 Packet::PunchAck { .. } | Packet::ConnectAccept { .. } => {
-                                    node.logger.info(&format!("УСПЕХ: канал к SFU Хосту ({}) открыт!", sender_addr));
+                                    node.logger.info(&format!("РЈРЎРџР•РҐ: РєР°РЅР°Р» Рє SFU РҐРѕСЃС‚Сѓ ({}) РѕС‚РєСЂС‹С‚!", sender_addr));
                                     connected_host_addr = Some(sender_addr);
                                     break;
                                 }
@@ -1347,18 +1510,18 @@ async fn run_sfu_client_connection(
     let host_addr = match connected_host_addr {
         Some(a) => a,
         None => {
-            node.logger.warn("Прямое UDP пробитие к хосту не удалось. Переключаемся на резервный WSS релей...");
+            node.logger.warn("РџСЂСЏРјРѕРµ UDP РїСЂРѕР±РёС‚РёРµ Рє С…РѕСЃС‚Сѓ РЅРµ СѓРґР°Р»РѕСЃСЊ. РџРµСЂРµРєР»СЋС‡Р°РµРјСЃСЏ РЅР° СЂРµР·РµСЂРІРЅС‹Р№ WSS СЂРµР»РµР№...");
             *node.status.write() = ConnectionStatus::Connecting {
                 target_str: offer.name.clone(),
                 attempt: 2,
                 max_attempts: 2,
-                mode: "Подключение через WSS релей...".into(),
+                mode: "РџРѕРґРєР»СЋС‡РµРЅРёРµ С‡РµСЂРµР· WSS СЂРµР»РµР№...".into(),
             };
 
             let my_name = node.my_nickname.read().clone();
             match MqttSignaling::start_relay_session(&room_code, &my_name, &node.logger).await {
                 Ok(relay_session) => {
-                    node.logger.info("Резервный релейный канал активирован!");
+                    node.logger.info("Р РµР·РµСЂРІРЅС‹Р№ СЂРµР»РµР№РЅС‹Р№ РєР°РЅР°Р» Р°РєС‚РёРІРёСЂРѕРІР°РЅ!");
                     run_relay_connected_loop(relay_session, room_code, node).await;
                     return;
                 }
@@ -1372,17 +1535,18 @@ async fn run_sfu_client_connection(
         }
     };
 
-    // Client connected to Host over UDP
     *node.host_socket_addr.write() = Some(host_addr);
+
+    let my_id = node.my_peer_id.load(Ordering::Relaxed);
     *node.status.write() = ConnectionStatus::Connected {
-        my_id: client_initial_id,
+        my_id,
         is_host: false,
         host_name: offer.name.clone(),
         peer_name: offer.name.clone(),
         peer_addr: host_addr.to_string(),
-        room_name: offer.room.clone(),
+        room_name: room_code.clone(),
         room_code: Some(room_code.clone()),
-        ping_ms: 1,
+        ping_ms: 10,
         connected_count: 1,
     };
 
@@ -1413,15 +1577,28 @@ async fn run_sfu_client_connection(
                 };
                 if let Ok(b) = audio_pkt.encode() {
                     let opt_haddr = *node_audio.host_socket_addr.read();
+                    let my_local_port = audio_sock.local_addr().map(|a| a.port()).unwrap_or(0);
                     if is_host {
-                        let endpoints: Vec<SocketAddr> = node_audio.client_endpoints.read().values().cloned().collect();
-                        for caddr in endpoints {
-                            let _ = audio_sock.send_to(&b, caddr).await;
+                        let endpoints: Vec<(u32, SocketAddr)> = node_audio
+                            .client_endpoints
+                            .read()
+                            .iter()
+                            .map(|(&id, &addr)| (id, addr))
+                            .collect();
+                        let mut sent_addrs = std::collections::HashSet::new();
+                        for (cid, caddr) in endpoints {
+                            if cid != my_id && caddr.port() != my_local_port && sent_addrs.insert(caddr) {
+                                let _ = audio_sock.send_to(&b, caddr).await;
+                            }
                         }
                     } else if let Some(haddr) = opt_haddr {
-                        let _ = audio_sock.send_to(&b, haddr).await;
+                        if haddr.port() != my_local_port {
+                            let _ = audio_sock.send_to(&b, haddr).await;
+                        }
                     } else {
-                        let _ = audio_sock.send_to(&b, host_addr).await;
+                        if host_addr.port() != my_local_port {
+                            let _ = audio_sock.send_to(&b, host_addr).await;
+                        }
                     }
                 }
             }
@@ -1435,6 +1612,11 @@ async fn run_sfu_client_connection(
     let mut last_diag_log = Instant::now();
 
     while !node.shutdown_signal.load(Ordering::Relaxed) {
+        if node.is_host.load(Ordering::Relaxed) {
+            node.logger.warn("Переход в полноценный режим SFU Хоста...");
+            break;
+        }
+
         // Periodic audio diagnostics logging every 10s
         if last_diag_log.elapsed() >= Duration::from_secs(10) {
             let (rx, tx, starves, jb_samples) = node.audio_engine.get_audio_diagnostics();
@@ -1445,9 +1627,8 @@ async fn run_sfu_client_connection(
             last_diag_log = Instant::now();
         }
 
-        let is_promoted_host = node.is_host.load(Ordering::Relaxed);
-
-        if last_ping.elapsed() >= Duration::from_millis(1500) {
+        // Ping SFU host every 1.0s unconditionally
+        if last_ping.elapsed() >= Duration::from_millis(1000) {
             ping_seq += 1;
             let my_id = node.my_peer_id.load(Ordering::Relaxed);
             let ping_pkt = Packet::Ping {
@@ -1456,26 +1637,14 @@ async fn run_sfu_client_connection(
                 timestamp_ms: now_ms(),
             };
 
-            if is_promoted_host {
-                // If we became host, broadcast ping and peer list to all connected clients
-                node.broadcast_packet(&ping_pkt).await;
-
-                let update_pkt = Packet::PeerListUpdate {
-                    host_id: my_id,
-                    backup_host_id: *node.backup_host_id.read(),
-                    peers: build_host_peer_list(&node),
-                };
-                node.broadcast_packet(&update_pkt).await;
-            } else {
-                if let Ok(b) = ping_pkt.encode() {
-                    let target = node.host_socket_addr.read().unwrap_or(host_addr);
-                    let _ = socket.send_to(&b, target).await;
-                }
+            if let Ok(b) = ping_pkt.encode() {
+                let target = node.host_socket_addr.read().unwrap_or(host_addr);
+                let _ = socket.send_to(&b, target).await;
             }
             last_ping = Instant::now();
 
-            // Failover check: if no packet from host for > 3.5s and we are not host yet
-            if !is_promoted_host && last_host_packet.elapsed() > Duration::from_millis(3500) {
+            // Failover check: if no packet from host for > 6.0s and we are not host yet
+            if last_host_packet.elapsed() > Duration::from_millis(6000) {
                 let backup_id = *node.backup_host_id.read();
                 let my_id = node.my_peer_id.load(Ordering::Relaxed);
                 let should_promote = match backup_id {
@@ -1501,11 +1670,13 @@ async fn run_sfu_client_connection(
                         reason: "Предыдущий хост отключился".into(),
                     };
                     node.broadcast_packet(&claim_pkt).await;
+                    break;
                 }
             }
         }
 
         tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
             recv_res = socket.recv_from(&mut buf) => {
                 match recv_res {
                     Ok((len, sender_addr)) => {
@@ -1524,34 +1695,28 @@ async fn run_sfu_client_connection(
                                     }
                                 }
                                 Packet::PeerListUpdate { host_id, backup_host_id, peers } => {
-                                    node.current_host_id.store(host_id, Ordering::SeqCst);
-                                    *node.backup_host_id.write() = backup_host_id;
                                     let my_id = node.my_peer_id.load(Ordering::Relaxed);
-                                    let mut p_guard = node.peers.write();
-                                    p_guard.clear();
-                                    for p in peers {
-                                        if p.id != my_id {
-                                            p_guard.insert(p.id, p);
+                                    if host_id != my_id {
+                                        node.current_host_id.store(host_id, Ordering::SeqCst);
+                                        *node.backup_host_id.write() = backup_host_id;
+                                        *node.host_socket_addr.write() = Some(sender_addr);
+                                        let mut p_guard = node.peers.write();
+                                        p_guard.clear();
+                                        for p in peers {
+                                            if p.id != my_id {
+                                                p_guard.insert(p.id, p);
+                                            }
                                         }
                                     }
                                 }
                                 Packet::AudioData { sender_id, seq, data } => {
-                                    node.audio_engine.feed_incoming_packet(sender_id, &data);
+                                    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                                    if sender_id == my_id {
+                                        continue;
+                                    }
+                                    node.audio_engine.feed_incoming_packet(sender_id, seq, &data);
                                     if let Some(p) = node.peers.write().get_mut(&sender_id) {
                                         p.last_seen_ms = now_ms();
-                                    }
-
-                                    // If this client was promoted to SFU Host, relay audio to all other clients
-                                    if node.is_host.load(Ordering::Relaxed) {
-                                        let forward_pkt = Packet::AudioData { sender_id, seq, data };
-                                        if let Ok(forward_bytes) = forward_pkt.encode() {
-                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
-                                            for caddr in endpoints {
-                                                if caddr != sender_addr {
-                                                    let _ = socket.send_to(&forward_bytes, caddr).await;
-                                                }
-                                            }
-                                        }
                                     }
                                 }
                                 Packet::VideoChunk { sender_id, frame_id, chunk_idx, chunk_total, is_screen, data } => {
@@ -1567,28 +1732,8 @@ async fn run_sfu_client_connection(
                                     if let Some(p) = node.peers.write().get_mut(&sender_id) {
                                         p.last_seen_ms = now_ms();
                                     }
-
-                                    // If promoted to host, forward video chunk to other clients
-                                    if node.is_host.load(Ordering::Relaxed) {
-                                        let forward_pkt = Packet::VideoChunk {
-                                            sender_id,
-                                            frame_id,
-                                            chunk_idx,
-                                            chunk_total,
-                                            is_screen,
-                                            data,
-                                        };
-                                        if let Ok(forward_bytes) = forward_pkt.encode() {
-                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
-                                            for caddr in endpoints {
-                                                if caddr != sender_addr {
-                                                    let _ = socket.send_to(&forward_bytes, caddr).await;
-                                                }
-                                            }
-                                        }
-                                    }
                                 }
-                                Packet::TextMessage { id, sender_id, text, sender_name, timestamp_ms } => {
+                                Packet::TextMessage { id, sender_id: _, text, sender_name, timestamp_ms } => {
                                     let is_new = node.seen_msg_ids.write().insert(id);
                                     if is_new {
                                         node.logger.info(&format!("[ЧАТ] {}: {}", sender_name, text));
@@ -1599,25 +1744,6 @@ async fn run_sfu_client_connection(
                                             timestamp_ms,
                                             is_me: false,
                                         });
-
-                                        // If promoted to host, forward text message to other clients
-                                        if node.is_host.load(Ordering::Relaxed) {
-                                            let forward_pkt = Packet::TextMessage {
-                                                id,
-                                                sender_id,
-                                                text,
-                                                sender_name,
-                                                timestamp_ms,
-                                            };
-                                            if let Ok(fb) = forward_pkt.encode() {
-                                                let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
-                                                for caddr in endpoints {
-                                                    if caddr != sender_addr {
-                                                        let _ = socket.send_to(&fb, caddr).await;
-                                                    }
-                                                }
-                                            }
-                                        }
                                     }
                                 }
                                 Packet::MediaState { sender_id, mic_muted, deafened, video_active, screen_active } => {
@@ -1627,21 +1753,8 @@ async fn run_sfu_client_connection(
                                         p.video_active = video_active;
                                         p.screen_active = screen_active;
                                     }
-
-                                    // If promoted to host, forward media state to other clients
-                                    if node.is_host.load(Ordering::Relaxed) {
-                                        let forward_pkt = Packet::MediaState { sender_id, mic_muted, deafened, video_active, screen_active };
-                                        if let Ok(fb) = forward_pkt.encode() {
-                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
-                                            for caddr in endpoints {
-                                                if caddr != sender_addr {
-                                                    let _ = socket.send_to(&fb, caddr).await;
-                                                }
-                                            }
-                                        }
-                                    }
                                 }
-                                Packet::HostHandover { old_host_id, new_host_id } => {
+                                Packet::HostHandover { old_host_id, new_host_id, new_host_addr } => {
                                     node.current_host_id.store(new_host_id, Ordering::SeqCst);
                                     let my_id = node.my_peer_id.load(Ordering::Relaxed);
                                     if new_host_id == my_id {
@@ -1661,18 +1774,49 @@ async fn run_sfu_client_connection(
                                                 *host_name = my_name;
                                             }
                                         }
+                                        // Punch all existing clients so NAT opens to all of them immediately
+                                        let ep_list: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
+                                        let punch_pkt = Packet::Punch {
+                                            nonce: rand::random(),
+                                            sender_name: node.my_nickname.read().clone(),
+                                            sender_id: my_id,
+                                        };
+                                        if let Ok(pb) = punch_pkt.encode() {
+                                            for addr in ep_list {
+                                                for _ in 0..3 {
+                                                    let _ = socket.send_to(&pb, addr).await;
+                                                }
+                                            }
+                                        }
+
                                         let update = Packet::PeerListUpdate {
                                             host_id: my_id,
                                             backup_host_id: *node.backup_host_id.read(),
                                             peers: build_host_peer_list(&node),
                                         };
                                         node.broadcast_packet(&update).await;
+                                        break;
                                     } else {
+                                        node.logger.info(&format!("👑 Роль хоста перешла к узлу {}", new_host_id));
+                                        let target_addr = new_host_addr.or_else(|| {
+                                            node.peers.read().get(&new_host_id).and_then(|p| p.addr.parse::<SocketAddr>().ok())
+                                        });
+                                        if let Some(target) = target_addr {
+                                            *node.host_socket_addr.write() = Some(target);
+                                            // Punch the new host immediately so NAT hole opens from this client to the new host
+                                            let punch_pkt = Packet::Punch {
+                                                nonce: rand::random(),
+                                                sender_name: node.my_nickname.read().clone(),
+                                                sender_id: my_id,
+                                            };
+                                            if let Ok(pb) = punch_pkt.encode() {
+                                                for _ in 0..5 {
+                                                    let _ = socket.send_to(&pb, target).await;
+                                                }
+                                            }
+                                        }
                                         if let Some(p) = node.peers.write().get_mut(&new_host_id) {
                                             p.is_host = true;
-                                            if let Ok(parsed) = p.addr.parse::<SocketAddr>() {
-                                                *node.host_socket_addr.write() = Some(parsed);
-                                            }
                                         }
                                         if let Some(p) = node.peers.write().get_mut(&old_host_id) {
                                             p.is_host = false;
@@ -1680,7 +1824,7 @@ async fn run_sfu_client_connection(
                                     }
                                 }
                                 Packet::NicknameUpdate { sender_id, new_nickname } => {
-                                    node.logger.info(&format!("Участник (id={}) обновил имя на '{}'", sender_id, new_nickname));
+                                    node.logger.info(&format!("РЈС‡Р°СЃС‚РЅРёРє (id={}) РѕР±РЅРѕРІРёР» РёРјСЏ РЅР° '{}'", sender_id, new_nickname));
                                     if sender_id == node.current_host_id.load(Ordering::Relaxed) {
                                         let mut st = node.status.write();
                                         if let ConnectionStatus::Connected { host_name, .. } = &mut *st {
@@ -1689,17 +1833,6 @@ async fn run_sfu_client_connection(
                                     }
                                     if let Some(p) = node.peers.write().get_mut(&sender_id) {
                                         p.name = new_nickname.clone();
-                                    }
-                                    if node.is_host.load(Ordering::Relaxed) {
-                                        let fwd = Packet::NicknameUpdate { sender_id, new_nickname };
-                                        if let Ok(fb) = fwd.encode() {
-                                            let endpoints: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
-                                            for caddr in endpoints {
-                                                if caddr != sender_addr {
-                                                    let _ = socket.send_to(&fb, caddr).await;
-                                                }
-                                            }
-                                        }
                                     }
                                 }
                                 Packet::Ping { sender_id, seq, timestamp_ms } => {
@@ -1721,11 +1854,11 @@ async fn run_sfu_client_connection(
                                 }
                                 Packet::Disconnect { sender_id, reason } => {
                                     if sender_id == node.current_host_id.load(Ordering::Relaxed) {
-                                        node.logger.warn(&format!("Хост вышел: {}. Проверка смены хоста...", reason));
+                                        node.logger.warn(&format!("РҐРѕСЃС‚ РІС‹С€РµР»: {}. РџСЂРѕРІРµСЂРєР° СЃРјРµРЅС‹ С…РѕСЃС‚Р°...", reason));
                                         let backup_id = *node.backup_host_id.read();
                                         let my_id = node.my_peer_id.load(Ordering::Relaxed);
                                         if backup_id == Some(my_id) {
-                                            node.logger.warn("👑 Принимаем роль SFU Хоста вместо отключившегося хоста!");
+                                            node.logger.warn("рџ‘‘ РџСЂРёРЅРёРјР°РµРј СЂРѕР»СЊ SFU РҐРѕСЃС‚Р° РІРјРµСЃС‚Рѕ РѕС‚РєР»СЋС‡РёРІС€РµРіРѕСЃСЏ С…РѕСЃС‚Р°!");
                                             node.is_host.store(true, Ordering::SeqCst);
                                             node.current_host_id.store(my_id, Ordering::SeqCst);
                                             *node.host_socket_addr.write() = None;
@@ -1735,6 +1868,7 @@ async fn run_sfu_client_connection(
                                                 *is_host = true;
                                                 *host_name = my_name;
                                             }
+                                            break;
                                         }
                                     } else {
                                         node.peers.write().remove(&sender_id);
@@ -1757,6 +1891,44 @@ async fn run_sfu_client_connection(
 
     audio_tx_task.abort();
     node.audio_engine.stop();
+
+    if node.is_host.load(Ordering::Relaxed) && !node.shutdown_signal.load(Ordering::Relaxed) {
+        let opt_room = node.current_room_code.read().clone();
+        if let Some(room) = opt_room {
+            let my_name = node.my_nickname.read().clone();
+            let actual_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+            let opt_physical_ip = configure_socket_physical_if(&socket, &node.logger);
+            let candidates = gather_candidates(socket.clone(), actual_port, opt_physical_ip, &node.logger).await;
+            let offer_link = create_offer_link_with_id(&my_name, &room, candidates, Some(node.my_peer_id.load(Ordering::Relaxed)));
+
+            // Populate endpoints with known peers so we can reach them immediately
+            {
+                let peers = node.peers.read();
+                let mut endpoints = node.client_endpoints.write();
+                let mut addrs = node.peer_addrs.write();
+                for p in peers.values() {
+                    if p.id != node.my_peer_id.load(Ordering::Relaxed) {
+                        if let Ok(addr) = p.addr.parse::<SocketAddr>() {
+                            endpoints.insert(p.id, addr);
+                            addrs.insert(addr, p.id);
+                        }
+                    }
+                }
+            }
+
+            match MqttSignaling::start_host_session(&room, &offer_link, &node.logger).await {
+                Ok(host_signaling) => {
+                    if let Err(e) = node.audio_engine.start() {
+                        node.logger.error(&format!("РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ Р°СѓРґРёРѕ РґРІРёР¶РѕРє С…РѕСЃС‚Р°: {}", e));
+                    }
+                    run_sfu_host_loop(socket, host_signaling, room, node).await;
+                }
+                Err(e) => {
+                    node.logger.error(&format!("РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ СЃРµСЃСЃРёСЋ С…РѕСЃС‚Р°: {}", e));
+                }
+            }
+        }
+    }
 }
 
 /// Fallback WSS Relay loop for rooms behind strict CGNAT
@@ -1772,9 +1944,9 @@ async fn run_relay_connected_loop(
     *node.status.write() = ConnectionStatus::Connected {
         my_id,
         is_host: false,
-        host_name: "WSS Релей".into(),
-        peer_name: "WSS Релей".into(),
-        peer_addr: "Релей TLS/443".into(),
+        host_name: "WSS Р РµР»РµР№".into(),
+        peer_name: "WSS Р РµР»РµР№".into(),
+        peer_addr: "Р РµР»РµР№ TLS/443".into(),
         room_name: room_code.clone(),
         room_code: Some(room_code),
         ping_ms: 35,
@@ -1782,7 +1954,7 @@ async fn run_relay_connected_loop(
     };
 
     if let Err(e) = node.audio_engine.start() {
-        node.logger.error(&format!("(Релей) Не удалось запустить аудио: {}", e));
+        node.logger.error(&format!("(Р РµР»РµР№) РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РїСѓСЃС‚РёС‚СЊ Р°СѓРґРёРѕ: {}", e));
     } else {
         node.audio_engine.play_connect_chime();
     }
@@ -1808,8 +1980,11 @@ async fn run_relay_connected_loop(
         tokio::select! {
             Some(pkt) = relay_session.incoming_rx.recv() => {
                 match pkt {
-                    Packet::AudioData { sender_id, data, .. } => {
-                        node.audio_engine.feed_incoming_packet(sender_id, &data);
+                    Packet::AudioData { sender_id, seq, data } => {
+                        let my_id = node.my_peer_id.load(Ordering::Relaxed);
+                        if sender_id != my_id {
+                            node.audio_engine.feed_incoming_packet(sender_id, seq, &data);
+                        }
                     }
                     Packet::VideoChunk { sender_id, frame_id, chunk_idx, chunk_total, is_screen, data } => {
                         video_reassembler.handle_chunk(sender_id, frame_id, chunk_idx, chunk_total, is_screen, data, &node.latest_remote_video);
@@ -1913,15 +2088,15 @@ async fn gather_candidates(
     let lan_ip = opt_physical_ip.map(IpAddr::V4).unwrap_or_else(detect_local_lan_ip);
     let local_addr = SocketAddr::new(lan_ip, port);
     list.push(local_addr);
-    logger.info(&format!("Локальный адрес кандидата: {}", local_addr));
+    logger.info(&format!("Р›РѕРєР°Р»СЊРЅС‹Р№ Р°РґСЂРµСЃ РєР°РЅРґРёРґР°С‚Р°: {}", local_addr));
 
     if let Some(pub_addr) = discover_public_ip_via_stun(socket, logger).await {
-        logger.info(&format!("STUN публичный адрес кандидата: {}", pub_addr));
+        logger.info(&format!("STUN РїСѓР±Р»РёС‡РЅС‹Р№ Р°РґСЂРµСЃ РєР°РЅРґРёРґР°С‚Р°: {}", pub_addr));
         if !list.contains(&pub_addr) {
             list.push(pub_addr);
         }
     } else {
-        logger.warn("STUN: не удалось определить публичный адрес (будет использован LAN адрес)");
+        logger.warn("STUN: РЅРµ СѓРґР°Р»РѕСЃСЊ РѕРїСЂРµРґРµР»РёС‚СЊ РїСѓР±Р»РёС‡РЅС‹Р№ Р°РґСЂРµСЃ (Р±СѓРґРµС‚ РёСЃРїРѕР»СЊР·РѕРІР°РЅ LAN Р°РґСЂРµСЃ)");
     }
 
     list
@@ -2007,7 +2182,7 @@ async fn discover_public_ip_via_stun(socket: Arc<UdpSocket>, logger: &AppLogger)
     }
 
     if targets.is_empty() {
-        logger.warn("STUN: Не удалось разрешить STUN-серверы");
+        logger.warn("STUN: РќРµ СѓРґР°Р»РѕСЃСЊ СЂР°Р·СЂРµС€РёС‚СЊ STUN-СЃРµСЂРІРµСЂС‹");
         return None;
     }
 
@@ -2038,7 +2213,7 @@ async fn discover_public_ip_via_stun(socket: Arc<UdpSocket>, logger: &AppLogger)
                 if let Ok((len, from)) = res {
                     if len >= 20 {
                         if let Some(pub_addr) = parse_stun_response(&buf[..len], &tx_id) {
-                            logger.info(&format!("STUN: получен ответ от {} -> {}", from, pub_addr));
+                            logger.info(&format!("STUN: РїРѕР»СѓС‡РµРЅ РѕС‚РІРµС‚ РѕС‚ {} -> {}", from, pub_addr));
                             return Some(pub_addr);
                         }
                     }
@@ -2133,7 +2308,7 @@ pub fn configure_socket_physical_if(socket: &UdpSocket, logger: &AppLogger) -> O
             );
             if res == 0 {
                 logger.info(&format!(
-                    "UDP сокет привязан к физическому интерфейсу #{} (LAN IP: {:?})",
+                    "UDP СЃРѕРєРµС‚ РїСЂРёРІСЏР·Р°РЅ Рє С„РёР·РёС‡РµСЃРєРѕРјСѓ РёРЅС‚РµСЂС„РµР№СЃСѓ #{} (LAN IP: {:?})",
                     if_idx,
                     opt_ip.unwrap_or(Ipv4Addr::UNSPECIFIED)
                 ));
@@ -2289,7 +2464,7 @@ mod tests {
         let pkt = Packet::TextMessage {
             id: 999,
             sender_id: 1,
-            text: "Тестовое сообщение".into(),
+            text: "РўРµСЃС‚РѕРІРѕРµ СЃРѕРѕР±С‰РµРЅРёРµ".into(),
             sender_name: "Alice".into(),
             timestamp_ms: now_ms(),
         };
@@ -2319,7 +2494,7 @@ mod tests {
 
         let msgs = node_b.get_chat_messages();
         assert_eq!(msgs.len(), 1, "Duplicate UDP arrivals must be deduplicated to exactly 1 message!");
-        assert_eq!(msgs[0].text, "Тестовое сообщение");
+        assert_eq!(msgs[0].text, "РўРµСЃС‚РѕРІРѕРµ СЃРѕРѕР±С‰РµРЅРёРµ");
     }
 
     #[test]
@@ -2344,6 +2519,7 @@ mod tests {
         let handover = Packet::HostHandover {
             old_host_id: 1,
             new_host_id: 2,
+            new_host_addr: Some("127.0.0.1:9999".parse().unwrap()),
         };
         let b = handover.encode().unwrap();
         assert_eq!(Packet::decode(&b).unwrap(), handover);
