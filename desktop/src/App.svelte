@@ -39,6 +39,7 @@
 
   let status = { type: "Disconnected" };
   let peers = [];
+  let peerVolumes = {};
   let chatMessages = [];
   let pollInterval = null;
   let videoPollInterval = null;
@@ -99,12 +100,13 @@
   let localVideoEl;
   let canvasEl;
   let videoCaptureTimer = null;
-  let peerVolume = parseInt(localStorage.getItem("balabol_peer_vol") || "100");
   let activeTab = "split"; // 'split' | 'stage' | 'chat'
-  let showVolumeSlider = false;
 
-  // Audio Settings & Sensitivity Controls
+  // Audio Settings & Master Volume Controls
   let showAudioSettingsModal = false;
+  let masterVolume = parseInt(
+    localStorage.getItem("balabol_master_volume") || "100",
+  );
   let micSensitivity = parseInt(
     localStorage.getItem("balabol_mic_sens") || "50",
   );
@@ -113,12 +115,12 @@
   let audioRestartFeedback = "";
 
   // Sound Notifications (Join / Leave Audio Cues)
-  let soundCuesEnabled = localStorage.getItem("balabol_sound_cues") !== "false";
   let previousStatusType = "Disconnected";
 
-  function playConnectSound(forced = false) {
-    if (!soundCuesEnabled && !forced) return;
+  function playConnectSound() {
     try {
+      const vol = (masterVolume / 100) * 0.18;
+      if (vol <= 0.001) return;
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (!AudioCtx) return;
       const ctx = new AudioCtx();
@@ -130,7 +132,7 @@
       osc1.type = "sine";
       osc1.frequency.setValueAtTime(587.33, now);
       gain1.gain.setValueAtTime(0.001, now);
-      gain1.gain.linearRampToValueAtTime(0.18, now + 0.02);
+      gain1.gain.linearRampToValueAtTime(vol, now + 0.02);
       gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
       osc1.connect(gain1);
       gain1.connect(ctx.destination);
@@ -143,7 +145,7 @@
       osc2.type = "sine";
       osc2.frequency.setValueAtTime(880.0, now + 0.08);
       gain2.gain.setValueAtTime(0.001, now + 0.08);
-      gain2.gain.linearRampToValueAtTime(0.18, now + 0.1);
+      gain2.gain.linearRampToValueAtTime(vol, now + 0.1);
       gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
       osc2.connect(gain2);
       gain2.connect(ctx.destination);
@@ -154,9 +156,10 @@
     }
   }
 
-  function playDisconnectSound(forced = false) {
-    if (!soundCuesEnabled && !forced) return;
+  function playDisconnectSound() {
     try {
+      const vol = (masterVolume / 100) * 0.18;
+      if (vol <= 0.001) return;
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
       if (!AudioCtx) return;
       const ctx = new AudioCtx();
@@ -168,7 +171,7 @@
       osc1.type = "sine";
       osc1.frequency.setValueAtTime(659.25, now);
       gain1.gain.setValueAtTime(0.001, now);
-      gain1.gain.linearRampToValueAtTime(0.18, now + 0.02);
+      gain1.gain.linearRampToValueAtTime(vol, now + 0.02);
       gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
       osc1.connect(gain1);
       gain1.connect(ctx.destination);
@@ -181,7 +184,7 @@
       osc2.type = "sine";
       osc2.frequency.setValueAtTime(440.0, now + 0.08);
       gain2.gain.setValueAtTime(0.001, now + 0.08);
-      gain2.gain.linearRampToValueAtTime(0.18, now + 0.1);
+      gain2.gain.linearRampToValueAtTime(vol, now + 0.1);
       gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.32);
       osc2.connect(gain2);
       gain2.connect(ctx.destination);
@@ -194,11 +197,13 @@
 
   onMount(async () => {
     try {
+      await invoke("set_master_volume", {
+        volume: masterVolume / 100,
+      });
       await invoke("set_mic_sensitivity", {
         sensitivity: micSensitivity / 100,
       });
       await invoke("set_mic_gain", { gain: micGain / 100 });
-      await invoke("set_peer_volume", { volume: peerVolume / 100 });
     } catch (e) {
       console.error("Audio parameters init error:", e);
     }
@@ -237,8 +242,12 @@
       }
 
       if (status.type === "Connected") {
-        const newChat = await invoke("get_chat_messages");
+                const newChat = await invoke("get_chat_messages");
         if (newChat.length !== chatMessages.length) {
+          const lastMsg = newChat[newChat.length - 1];
+          if (lastMsg && !lastMsg.is_me) {
+            invoke("play_notification_sound", { soundType: "chat" }).catch(() => {});
+          }
           chatMessages = newChat;
           scrollToChatBottom();
         }
@@ -308,10 +317,10 @@
     voiceStatus.deafened = newDeafened;
   }
 
-  async function handleVolumeChange(e) {
-    peerVolume = parseInt(e.target.value);
-    localStorage.setItem("balabol_peer_vol", peerVolume.toString());
-    await invoke("set_peer_volume", { volume: peerVolume / 100 });
+  async function handleMasterVolumeChange(e) {
+    masterVolume = parseInt(e.target.value);
+    localStorage.setItem("balabol_master_volume", masterVolume.toString());
+    await invoke("set_master_volume", { volume: masterVolume / 100 });
   }
 
   async function handleSensitivityChange(e) {
@@ -582,6 +591,22 @@
       scrollToChatBottom();
     } catch (err) {
       console.error("Send error:", err);
+    }
+  }
+
+  
+  function handleChatPaste(e) {
+    const items = (e.clipboardData || e.originalEvent.clipboardData).items;
+    for (let index in items) {
+      const item = items[index];
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const blob = item.getAsFile();
+        const reader = new FileReader();
+        reader.onload = (event) => {
+          chatInput = event.target.result; // Data URL
+        };
+        reader.readAsDataURL(blob);
+      }
     }
   }
 
@@ -1289,9 +1314,30 @@
                               {/if}
                             </div>
 
+                            
                             <div class="font-bold text-sm text-white">
                               {peer.name}
                             </div>
+                            
+                            <div class="mt-4 w-full px-2">
+                              <div class="flex items-center justify-between text-[11px] text-[#8a8e98] mb-1.5">
+                                <span>Громкость</span>
+                                <span>{peerVolumes[peer.id] ?? 100}%</span>
+                              </div>
+                              <input
+                                type="range"
+                                min="0"
+                                max="200"
+                                step="5"
+                                value={peerVolumes[peer.id] ?? 100}
+                                on:input={(e) => {
+                                  peerVolumes[peer.id] = parseInt(e.target.value);
+                                  invoke("set_peer_volume", { peerId: peer.id, volume: peerVolumes[peer.id] / 100 });
+                                }}
+                                class="w-full accent-indigo-500 h-1.5 bg-[#232632] rounded-lg appearance-none cursor-pointer"
+                              />
+                            </div>
+
 
                             <div class="mt-2 flex items-center gap-2">
                               {#if peer.is_speaking}
@@ -1512,37 +1558,6 @@
                     >
                       <Sliders class="w-4 h-4 text-emerald-400" />
                     </button>
-
-                    <button
-                      on:click={() => (showVolumeSlider = !showVolumeSlider)}
-                      class="p-2.5 rounded-lg bg-[#22242e] hover:bg-[#2c2f3c] text-white text-xs flex items-center gap-1.5 transition"
-                      title="Громкость собеседника"
-                    >
-                      <Volume2 class="w-4 h-4 text-blue-400" />
-                      <span class="font-mono">{peerVolume}%</span>
-                    </button>
-
-                    {#if showVolumeSlider}
-                      <div
-                        class="absolute bottom-12 right-0 bg-[#1e2028] border border-[#2d303e] rounded-xl p-3 shadow-2xl w-48 z-50 space-y-2"
-                      >
-                        <div
-                          class="text-[11px] font-semibold text-[#8a8e98] flex justify-between"
-                        >
-                          <span>Громкость собеседника</span>
-                          <span class="text-white font-mono">{peerVolume}%</span
-                          >
-                        </div>
-                        <input
-                          type="range"
-                          min="0"
-                          max="200"
-                          bind:value={peerVolume}
-                          on:input={handleVolumeChange}
-                          class="w-full accent-blue-500"
-                        />
-                      </div>
-                    {/if}
                   </div>
                 </div>
               </div>
@@ -1620,6 +1635,7 @@
                     type="text"
                     bind:value={chatInput}
                     on:keydown={handleChatKeyDown}
+                    on:paste={handleChatPaste}
                     placeholder="Сообщение..."
                     class="flex-1 bg-[#1a1c24] border border-[#2b2d38] rounded-xl px-3 py-2 text-xs text-white placeholder-[#555866] focus:outline-none focus:border-blue-500 transition"
                   />
@@ -1961,76 +1977,47 @@
             </div>
           </div>
 
-          <!-- 3. Output Volume -->
-          <div
-            class="bg-[#13141a] p-4 rounded-xl border border-[#252834] space-y-2"
-          >
-            <div
-              class="flex justify-between items-center text-xs font-semibold text-white"
-            >
-              <label for="peer-vol-range" class="flex items-center gap-1.5">
-                <Volume2 class="w-4 h-4 text-blue-400" />
-                Громкость собеседника
-              </label>
-              <span class="font-mono text-blue-400">{peerVolume}%</span>
-            </div>
-            <input
-              id="peer-vol-range"
-              type="range"
-              min="0"
-              max="200"
-              bind:value={peerVolume}
-              on:input={handleVolumeChange}
-              class="w-full accent-blue-500 cursor-pointer"
-            />
-          </div>
 
-          <!-- Sound Notifications (Connect / Disconnect cues) -->
+          <!-- 3. Master Volume (Общая громкость приложения 0 - 100) -->
           <div
-            class="bg-[#13141a] p-4 rounded-xl border border-[#252834] space-y-3"
+            class="space-y-3 bg-[#13141a] p-4 rounded-xl border border-[#252834]"
           >
             <div class="flex items-center justify-between">
-              <div class="flex items-center gap-2">
-                <Bell class="w-4 h-4 text-amber-400" />
-                <span class="text-xs font-semibold text-white"
-                  >Звуковые сигналы входа и выхода</span
-                >
-              </div>
-              <label class="relative inline-flex items-center cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={soundCuesEnabled}
-                  on:change={(e) => {
-                    soundCuesEnabled = e.target.checked;
-                    localStorage.setItem(
-                      "balabol_sound_cues",
-                      soundCuesEnabled ? "true" : "false",
-                    );
-                  }}
-                  class="sr-only peer"
-                />
-                <div
-                  class="w-9 h-5 bg-[#252834] peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"
-                ></div>
+              <label
+                for="master-vol-range"
+                class="text-xs font-semibold text-white flex items-center gap-2"
+              >
+                <Volume2 class="w-4 h-4 text-purple-400" />
+                Общая громкость приложения
               </label>
+              <span
+                class="text-xs font-mono font-bold text-purple-400 bg-purple-500/10 px-2 py-0.5 rounded border border-purple-500/20"
+              >
+                {masterVolume}%
+              </span>
             </div>
-            <p class="text-[10px] text-[#787c8a]">
-              Воспроизводить звуковые сигналы (TeamSpeak / Discord стиль), когда
-              собеседник подключается или покидает голосовой чат.
+
+            <p class="text-[11px] text-[#8a8e98] leading-relaxed">
+              Регулирует громкость всех входящих голосов и звуковых сигналов приложения (0 - 100%).
             </p>
-            <div class="flex gap-2 pt-1">
-              <button
-                on:click={() => playConnectSound(true)}
-                class="py-1.5 px-3 bg-[#20222c] hover:bg-[#2b2e3c] text-white rounded-lg text-xs font-medium transition flex items-center gap-1.5 border border-[#303342]"
+
+            <div class="pt-1">
+              <input
+                id="master-vol-range"
+                type="range"
+                min="0"
+                max="100"
+                bind:value={masterVolume}
+                on:input={handleMasterVolumeChange}
+                class="w-full accent-purple-500 cursor-pointer"
+              />
+              <div
+                class="flex justify-between text-[10px] text-[#6b7080] mt-1 font-medium"
               >
-                <span>🔔 Вход (тест)</span>
-              </button>
-              <button
-                on:click={() => playDisconnectSound(true)}
-                class="py-1.5 px-3 bg-[#20222c] hover:bg-[#2b2e3c] text-white rounded-lg text-xs font-medium transition flex items-center gap-1.5 border border-[#303342]"
-              >
-                <span>🔕 Выход (тест)</span>
-              </button>
+                <span>0% (Без звука)</span>
+                <span>50%</span>
+                <span>100% (Максимум)</span>
+              </div>
             </div>
           </div>
 

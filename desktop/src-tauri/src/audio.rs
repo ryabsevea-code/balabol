@@ -126,6 +126,7 @@ pub struct JitterBuffer {
     max_samples: usize,
     last_sample: f32,
     consecutive_starved: usize,
+    pub volume: f32,
 }
 
 impl JitterBuffer {
@@ -137,6 +138,7 @@ impl JitterBuffer {
             max_samples,
             last_sample: 0.0,
             consecutive_starved: usize::MAX,
+            volume: 1.0,
         }
     }
 
@@ -169,7 +171,7 @@ impl JitterBuffer {
         if let Some(s) = self.queue.pop_front() {
             self.last_sample = s;
             self.consecutive_starved = 0;
-            s
+            s * self.volume
         } else {
             // Buffer starved: smoothly decay last sample (PLC) to prevent digital click/pop
             self.consecutive_starved += 1;
@@ -292,12 +294,13 @@ pub struct AudioEngine {
     // Queues & Multi-Peer Jitter Buffers
     outgoing_audio_packets: Arc<Mutex<VecDeque<Vec<u8>>>>,
     peer_jitter_buffers: Arc<Mutex<HashMap<u32, JitterBuffer>>>,
+    peer_seq_history: Arc<Mutex<HashMap<u32, (u64, VecDeque<u64>)>>>,
     chime_queue: Arc<Mutex<VecDeque<f32>>>,
 
     // Controls
     mic_muted: Arc<AtomicBool>,
     deafened: Arc<AtomicBool>,
-    peer_volume: Arc<AtomicU32>,       // stored as f32 bits
+    master_volume: Arc<AtomicU32>,     // stored as f32 bits (0.0 to 1.0)
     mic_sensitivity: Arc<AtomicU32>,   // 0.0 to 1.0 slider, stored as f32 bits
     mic_gain: Arc<AtomicU32>,          // 0.0 to 3.0 multiplier, stored as f32 bits
     mic_level: Arc<AtomicU32>,         // live RMS level 0.0 to 1.0, stored as f32 bits
@@ -344,10 +347,11 @@ impl AudioEngine {
             output_stream: Mutex::new(None),
             outgoing_audio_packets: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
             peer_jitter_buffers: Arc::new(Mutex::new(initial_buffers)),
+            peer_seq_history: Arc::new(Mutex::new(HashMap::new())),
             chime_queue: Arc::new(Mutex::new(VecDeque::with_capacity(16384))),
             mic_muted: Arc::new(AtomicBool::new(false)),
             deafened: Arc::new(AtomicBool::new(false)),
-            peer_volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            master_volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             mic_sensitivity: Arc::new(AtomicU32::new(0.50f32.to_bits())), // Default 50%
             mic_gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),        // Default 100%
             mic_level: Arc::new(AtomicU32::new(0.0f32.to_bits())),
@@ -422,13 +426,27 @@ impl AudioEngine {
         self.deafened.load(Ordering::SeqCst)
     }
 
-    pub fn set_peer_volume(&self, volume: f32) {
-        let clamped = volume.clamp(0.0, 2.0);
-        self.peer_volume.store(clamped.to_bits(), Ordering::SeqCst);
+    pub fn set_master_volume(&self, volume: f32) {
+        let clamped = volume.clamp(0.0, 1.0);
+        self.master_volume.store(clamped.to_bits(), Ordering::SeqCst);
     }
 
-    pub fn get_peer_volume(&self) -> f32 {
-        f32::from_bits(self.peer_volume.load(Ordering::SeqCst))
+    pub fn get_master_volume(&self) -> f32 {
+        f32::from_bits(self.master_volume.load(Ordering::SeqCst))
+    }
+
+    pub fn set_peer_volume(&self, peer_id: u32, volume: f32) {
+        let clamped = volume.clamp(0.0, 2.0);
+        let mut buffers = self.peer_jitter_buffers.lock();
+        let b = buffers.entry(peer_id).or_insert_with(|| {
+            JitterBuffer::new(JITTER_TARGET_SAMPLES, JITTER_MAX_SAMPLES)
+        });
+        b.volume = clamped;
+    }
+
+    pub fn get_peer_volume(&self, peer_id: u32) -> f32 {
+        let buffers = self.peer_jitter_buffers.lock();
+        buffers.get(&peer_id).map(|b| b.volume).unwrap_or(1.0)
     }
 
     pub fn set_mic_sensitivity(&self, sensitivity: f32) {
@@ -491,6 +509,26 @@ impl AudioEngine {
     }
 
     /// Synthesizes and plays a rising double-tone chime (587 Hz D5 -> 880 Hz A5) when peer joins
+    
+    pub fn play_chat_chime(&self) {
+        let mut chimes = Vec::with_capacity(2400);
+        for i in 0..960 {
+            let t = (i as f32) / (VOICE_SAMPLE_RATE as f32);
+            let attack = ((i as f32) / 100.0).min(1.0);
+            let decay = (1.0 - (i as f32) / 960.0).max(0.0);
+            chimes.push((t * 880.0 * std::f32::consts::TAU).sin() * 0.1 * attack * decay);
+        }
+        for _ in 0..480 { chimes.push(0.0); }
+        for i in 0..960 {
+            let t = (i as f32) / (VOICE_SAMPLE_RATE as f32);
+            let attack = ((i as f32) / 100.0).min(1.0);
+            let decay = (1.0 - (i as f32) / 960.0).max(0.0);
+            chimes.push((t * 1046.5 * std::f32::consts::TAU).sin() * 0.1 * attack * decay);
+        }
+        let mut q = self.chime_queue.lock();
+        q.extend(chimes);
+    }
+
     pub fn play_connect_chime(&self) {
         let mut chimes = Vec::with_capacity(7200);
         // Note 1: 587.33 Hz (D5) for 120ms (2880 samples @ 24kHz)
@@ -559,10 +597,34 @@ impl AudioEngine {
     }
 
     /// Feed incoming HD audio packet from remote peer to that peer's JitterBuffer
-    pub fn feed_incoming_packet(&self, sender_id: u32, data: &[u8]) {
+    pub fn feed_incoming_packet(&self, sender_id: u32, seq: u64, data: &[u8]) {
         if self.deafened.load(Ordering::Relaxed) || data.is_empty() {
             return;
         }
+
+        // Deduplicate audio packets per peer to eliminate duplicate packets / network echo (robot voice)
+        {
+            let mut history = self.peer_seq_history.lock();
+            let (max_seq, recent) = history
+                .entry(sender_id)
+                .or_insert_with(|| (0, VecDeque::with_capacity(64)));
+            if *max_seq > 0 {
+                if recent.contains(&seq) {
+                    return; // Exact duplicate packet received, drop
+                }
+                if seq + 64 < *max_seq && seq > 0 {
+                    return; // Stale delayed packet outside sequence window, drop
+                }
+            }
+            if seq > *max_seq || max_seq.saturating_sub(seq) > 2000 {
+                *max_seq = seq;
+            }
+            recent.push_back(seq);
+            if recent.len() > 64 {
+                recent.pop_front();
+            }
+        }
+
         self.rx_packet_count.fetch_add(1, Ordering::Relaxed);
 
         let pcm: Vec<i16> = match data[0] {
@@ -723,7 +785,7 @@ impl AudioEngine {
         let peer_buffers = self.peer_jitter_buffers.clone();
         let chimes = self.chime_queue.clone();
         let deafened_flag = self.deafened.clone();
-        let volume_bits = self.peer_volume.clone();
+        let master_volume_bits = self.master_volume.clone();
         let errored_flag = self.output_stream_errored.clone();
 
         let step = (VOICE_SAMPLE_RATE as f64) / dev_sample_rate;
@@ -741,7 +803,7 @@ impl AudioEngine {
                 &config.into(),
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let is_deaf = deafened_flag.load(Ordering::Relaxed);
-                    let vol = f32::from_bits(volume_bits.load(Ordering::Relaxed));
+                    let master_vol = f32::from_bits(master_volume_bits.load(Ordering::Relaxed));
                     let mut buffers = peer_buffers.lock();
                     let mut chime_q = chimes.lock();
 
@@ -764,12 +826,12 @@ impl AudioEngine {
 
                         let voice_sample = if !is_deaf {
                             let interp = current_sample + (next_sample - current_sample) * (phase as f32);
-                            interp * vol
+                            interp * master_vol
                         } else {
                             0.0
                         };
 
-                        let chime_sample = chime_q.pop_front().unwrap_or(0.0);
+                        let chime_sample = chime_q.pop_front().unwrap_or(0.0) * master_vol;
                         let final_sample = soft_limiter(voice_sample + chime_sample);
 
                         for c in 0..channels {
@@ -786,7 +848,7 @@ impl AudioEngine {
                 &config.into(),
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     let is_deaf = deafened_flag.load(Ordering::Relaxed);
-                    let vol = f32::from_bits(volume_bits.load(Ordering::Relaxed));
+                    let master_vol = f32::from_bits(master_volume_bits.load(Ordering::Relaxed));
                     let mut buffers = peer_buffers.lock();
                     let mut chime_q = chimes.lock();
 
@@ -809,12 +871,12 @@ impl AudioEngine {
 
                         let voice_sample = if !is_deaf {
                             let interp = current_sample + (next_sample - current_sample) * (phase as f32);
-                            interp * vol
+                            interp * master_vol
                         } else {
                             0.0
                         };
 
-                        let chime_sample = chime_q.pop_front().unwrap_or(0.0);
+                        let chime_sample = chime_q.pop_front().unwrap_or(0.0) * master_vol;
                         let final_sample = soft_limiter(voice_sample + chime_sample);
                         let sample_i16 = (final_sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
 
@@ -1016,6 +1078,7 @@ impl AudioEngine {
         *self.output_stream.lock() = None;
         self.outgoing_audio_packets.lock().clear();
         self.peer_jitter_buffers.lock().clear();
+        self.peer_seq_history.lock().clear();
         self.peer_last_speech.lock().clear();
         self.peer_speaking.lock().clear();
         self.chime_queue.lock().clear();
@@ -1079,8 +1142,11 @@ mod tests {
         engine.set_deafened(true);
         assert!(engine.is_deafened());
 
-        engine.set_peer_volume(1.5);
-        assert!((engine.get_peer_volume() - 1.5).abs() < 0.001);
+        engine.set_master_volume(0.85);
+        assert!((engine.get_master_volume() - 0.85).abs() < 0.001);
+
+        engine.set_peer_volume(1, 1.5);
+        assert!((engine.get_peer_volume(1) - 1.5).abs() < 0.001);
 
         engine.set_mic_sensitivity(0.75);
         assert!((engine.get_mic_sensitivity() - 0.75).abs() < 0.001);
@@ -1135,5 +1201,23 @@ mod tests {
 
         engine.play_disconnect_chime();
         assert!(engine.chime_queue.lock().len() > 0);
+    }
+
+    #[test]
+    fn test_audio_seq_deduplication() {
+        let engine = AudioEngine::new();
+        let pcm_data = vec![CODEC_PCM24K, 0, 0, 10, 0]; // 2 samples
+        
+        // Feed packet with seq = 1
+        engine.feed_incoming_packet(42, 1, &pcm_data);
+        assert_eq!(engine.rx_packet_count.load(Ordering::Relaxed), 1);
+
+        // Feed duplicate packet with identical seq = 1 -> must be dropped!
+        engine.feed_incoming_packet(42, 1, &pcm_data);
+        assert_eq!(engine.rx_packet_count.load(Ordering::Relaxed), 1, "Duplicate seq must be dropped");
+
+        // Feed next packet with seq = 2 -> must be accepted!
+        engine.feed_incoming_packet(42, 2, &pcm_data);
+        assert_eq!(engine.rx_packet_count.load(Ordering::Relaxed), 2);
     }
 }
