@@ -596,6 +596,11 @@ impl AudioEngine {
         packets
     }
 
+    pub fn reset_peer_sequence(&self, peer_id: u32) {
+        let mut history = self.peer_seq_history.lock();
+        history.remove(&peer_id);
+    }
+
     /// Feed incoming HD audio packet from remote peer to that peer's JitterBuffer
     pub fn feed_incoming_packet(&self, sender_id: u32, seq: u64, data: &[u8]) {
         if self.deafened.load(Ordering::Relaxed) || data.is_empty() {
@@ -608,15 +613,20 @@ impl AudioEngine {
             let (max_seq, recent) = history
                 .entry(sender_id)
                 .or_insert_with(|| (0, VecDeque::with_capacity(64)));
-            if *max_seq > 0 {
+
+            // If the peer sequence restarted (e.g. reconnected with seq <= 64 while previous max_seq was high), reset!
+            if seq <= 64 && *max_seq > 100 {
+                *max_seq = seq;
+                recent.clear();
+            } else if *max_seq > 0 {
                 if recent.contains(&seq) {
                     return; // Exact duplicate packet received, drop
                 }
-                if seq + 64 < *max_seq && seq > 0 {
+                if seq + 64 < *max_seq && seq > 0 && max_seq.saturating_sub(seq) < 3000 {
                     return; // Stale delayed packet outside sequence window, drop
                 }
             }
-            if seq > *max_seq || max_seq.saturating_sub(seq) > 2000 {
+            if seq > *max_seq || max_seq.saturating_sub(seq) >= 3000 {
                 *max_seq = seq;
             }
             recent.push_back(seq);

@@ -632,17 +632,6 @@
     }
   }
 
-  async function handleTransferHost(newHostId, newHostName) {
-    if (!confirm(`Передать роль хоста участнику "${newHostName}"?`)) {
-      return;
-    }
-    try {
-      await invoke("transfer_host", { newHostId });
-    } catch (e) {
-      alert("Ошибка передачи роли хоста: " + e);
-    }
-  }
-
   function copyText(text, label) {
     navigator.clipboard.writeText(text);
     copiedItem = label;
@@ -805,22 +794,11 @@
           <span class="font-medium text-white">{peers.length + 1} в звонке</span
           >
           <span class="text-[#454856]">•</span>
-          {#if status.is_host}
-            <span
-              class="bg-amber-500/20 text-amber-300 border border-amber-500/40 px-2 py-0.5 rounded-full text-[11px] font-bold flex items-center gap-1 shadow-sm"
-            >
-              👑 Вы — Хост
-            </span>
-          {:else}
-            <span
-              class="bg-[#20222e] text-[#a0a5b8] border border-white/5 px-2 py-0.5 rounded-full text-[11px] flex items-center gap-1"
-            >
-              <span>Хост:</span>
-              <span class="font-semibold text-amber-300"
-                >👑 {status.host_name || "Организатор"}</span
-              >
-            </span>
-          {/if}
+          <span
+            class="bg-blue-500/15 text-blue-300 border border-blue-500/30 px-2 py-0.5 rounded-full text-[11px] font-medium flex items-center gap-1 shadow-sm"
+          >
+            ⚡ Full Mesh P2P
+          </span>
           {#if status.ping_ms}
             <span
               class="text-[11px] bg-emerald-950/60 px-1.5 py-0.5 rounded text-emerald-300 border border-emerald-500/30 font-mono"
@@ -1196,17 +1174,6 @@
                             ? 'border-emerald-500/70 shadow-emerald-500/10'
                             : ''}"
                         >
-                          <!-- Role Badge -->
-                          {#if status.is_host}
-                            <div class="absolute top-3 left-3">
-                              <span
-                                class="bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[11px] font-bold p-1 rounded-full flex items-center justify-center shadow-sm"
-                                title="Организатор (Хост)"
-                              >
-                                👑
-                              </span>
-                            </div>
-                          {/if}
 
                           <div class="relative mb-3 mt-1">
                             <div
@@ -1271,17 +1238,6 @@
                               ? 'border-emerald-500/70 shadow-emerald-500/10'
                               : ''}"
                           >
-                            <!-- Role Badge & Ping -->
-                            {#if peer.is_host}
-                              <div class="absolute top-3 left-3">
-                                <span
-                                  class="bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[11px] font-bold p-1 rounded-full flex items-center justify-center shadow-sm"
-                                  title="Организатор (Хост)"
-                                >
-                                  👑
-                                </span>
-                              </div>
-                            {/if}
                             <div class="absolute top-3 right-3 flex items-center gap-1.5">
                               <span
                                 class="text-[10px] font-mono text-[#8a8e98] bg-black/40 px-1.5 py-0.5 rounded border border-white/5"
@@ -1361,17 +1317,6 @@
                               {/if}
                             </div>
 
-                            <!-- Host Transfer Button (if I am the host and this peer is not) -->
-                            {#if status.is_host && !peer.is_host}
-                              <button
-                                on:click={() =>
-                                  handleTransferHost(peer.id, peer.name)}
-                                class="mt-3.5 text-xs font-semibold flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-500/10 hover:bg-amber-500/25 text-amber-300 border border-amber-500/35 transition shadow cursor-pointer"
-                                title="Передать роль организатора и управление комнатой этому участнику"
-                              >
-                                <span>👑 Передать права хоста</span>
-                              </button>
-                            {/if}
                           </div>
                         {/each}
 

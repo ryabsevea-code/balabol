@@ -48,11 +48,213 @@ impl Drop for HostSignalingSession {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MeshAnnounce {
+    pub peer_id: u32,
+    pub session_id: String,
+    pub peer_name: String,
+    pub candidates: Vec<std::net::SocketAddr>,
+    pub nonce: u64,
+}
+
+pub struct MeshSignalingSession {
+    pub incoming_announces: tokio::sync::mpsc::Receiver<MeshAnnounce>,
+    pub shutdown: Arc<AtomicBool>,
+    pub abort_handle: tokio::task::AbortHandle,
+}
+
+impl Drop for MeshSignalingSession {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.abort_handle.abort();
+    }
+}
+
 pub struct Signaling;
 
 pub type MqttSignaling = Signaling; // Backward compatibility alias
 
 impl Signaling {
+    /// Starts symmetric decentralized Full Mesh signaling for a room.
+    /// Every peer in the room periodically broadcasts its candidates and receives candidates from all other peers.
+    pub async fn start_mesh_session(
+        room_code: &str,
+        my_announce: MeshAnnounce,
+        logger: &AppLogger,
+    ) -> Result<MeshSignalingSession, String> {
+        let clean_code = sanitize_room_code(room_code);
+        let room_tag = format!("balabol_mesh_v5_{}", clean_code);
+
+        logger.info(&format!(
+            "Mesh сигналинг: параллельный запуск пула из {} WSS-релеев для комнаты '{}'...",
+            RELAYS.len(),
+            clean_code
+        ));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<MeshAnnounce>(64);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let last_announced = Arc::new(parking_lot::Mutex::new(
+            std::collections::HashMap::<u32, (u64, tokio::time::Instant)>::new(),
+        ));
+
+        let keypair = {
+            let mut rng = secp256k1::rand::rng();
+            Keypair::new(&mut rng)
+        };
+
+        let announce_json = serde_json::to_string(&my_announce).unwrap_or_default();
+        let mut join_handles = Vec::new();
+
+        for &relay in RELAYS {
+            let tx = tx.clone();
+            let shutdown = shutdown.clone();
+            let room_tag = room_tag.clone();
+            let announce_payload = announce_json.clone();
+            let keypair = keypair;
+            let last_announced = last_announced.clone();
+            let my_id = my_announce.peer_id;
+            let logger = logger.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut retry_count = 0u32;
+                while !shutdown.load(Ordering::Relaxed) {
+                    let connect_fut = connect_async(relay);
+                    let (mut ws, _) = match tokio::time::timeout(Duration::from_secs(4), connect_fut).await {
+                        Ok(Ok(pair)) => {
+                            logger.info(&format!("Mesh сигналинг: подключен к WSS-релею {}", relay));
+                            retry_count = 0;
+                            pair
+                        }
+                        _ => {
+                            if retry_count == 0 {
+                                logger.warn(&format!("Mesh сигналинг: релей {} временно недоступен", relay));
+                            }
+                            retry_count = retry_count.saturating_add(1);
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                            continue;
+                        }
+                    };
+
+                    let sub_id = format!("sub_mesh_{}", rand::random::<u32>());
+                    let sub_filter = json!(["REQ", sub_id, {
+                        "#t": [room_tag],
+                        "limit": 30
+                    }]);
+                    if ws.send(WsMessage::Text(sub_filter.to_string().into())).await.is_err() {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+
+                    // Send initial announce immediately on connect
+                    let initial_evt = create_signed_event(
+                        &keypair,
+                        1,
+                        vec![
+                            vec!["t".into(), room_tag.clone()],
+                            vec!["type".into(), "mesh_announce".into()],
+                        ],
+                        &announce_payload,
+                    );
+                    let _ = ws.send(WsMessage::Text(json!(["EVENT", initial_evt]).to_string().into())).await;
+
+                    let mut last_pub = tokio::time::Instant::now();
+                    let mut last_ping = tokio::time::Instant::now();
+
+                    while !shutdown.load(Ordering::Relaxed) {
+                        // Periodic announce broadcast every 2.0s
+                        if last_pub.elapsed() >= Duration::from_millis(2000) {
+                            let evt = create_signed_event(
+                                &keypair,
+                                1,
+                                vec![
+                                    vec!["t".into(), room_tag.clone()],
+                                    vec!["type".into(), "mesh_announce".into()],
+                                ],
+                                &announce_payload,
+                            );
+                            let pub_msg = json!(["EVENT", evt]).to_string();
+                            if ws.send(WsMessage::Text(pub_msg.into())).await.is_err() {
+                                break;
+                            }
+                            last_pub = tokio::time::Instant::now();
+                        }
+
+                        if last_ping.elapsed() >= Duration::from_secs(12) {
+                            if ws.send(WsMessage::Ping(vec![].into())).await.is_err() {
+                                break;
+                            }
+                            last_ping = tokio::time::Instant::now();
+                        }
+
+                        let read_fut = tokio::time::timeout(Duration::from_millis(150), ws.next());
+                        if let Ok(Some(Ok(msg))) = read_fut.await {
+                            if let WsMessage::Text(txt) = msg {
+                                if let Ok(parsed) = serde_json::from_str::<Value>(&txt) {
+                                    if let Some(arr) = parsed.as_array() {
+                                        if arr.len() >= 3 && arr[0] == "EVENT" {
+                                            if let Some(content) = arr[2].get("content").and_then(|c| c.as_str()) {
+                                                if let Ok(incoming) = serde_json::from_str::<MeshAnnounce>(content) {
+                                                    if incoming.peer_id != my_id {
+                                                        let should_emit = {
+                                                            let mut map = last_announced.lock();
+                                                            match map.get_mut(&incoming.peer_id) {
+                                                                Some((last_nonce, last_time)) => {
+                                                                    if *last_nonce != incoming.nonce
+                                                                        || last_time.elapsed() >= Duration::from_millis(2500)
+                                                                    {
+                                                                        *last_nonce = incoming.nonce;
+                                                                        *last_time = tokio::time::Instant::now();
+                                                                        true
+                                                                    } else {
+                                                                        false
+                                                                    }
+                                                                }
+                                                                None => {
+                                                                    map.insert(
+                                                                        incoming.peer_id,
+                                                                        (incoming.nonce, tokio::time::Instant::now()),
+                                                                    );
+                                                                    true
+                                                                }
+                                                            }
+                                                        };
+                                                        if should_emit {
+                                                            logger.info(&format!(
+                                                                "📡 [Mesh Сигналинг] Получен анонс от пира {} ('{}') через {}, кандидаты: {:?}",
+                                                                incoming.peer_id,
+                                                                incoming.peer_name,
+                                                                relay,
+                                                                incoming.candidates
+                                                            ));
+                                                            let _ = tx.send(incoming).await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            });
+            join_handles.push(handle);
+        }
+
+        let shutdown_clone = shutdown.clone();
+        let supervisor = tokio::spawn(async move {
+            futures_util::future::join_all(join_handles).await;
+            shutdown_clone.store(true, Ordering::Relaxed);
+        });
+
+        Ok(MeshSignalingSession {
+            incoming_announces: rx,
+            shutdown,
+            abort_handle: supervisor.abort_handle(),
+        })
+    }
     /// Starts continuous multi-guest host signaling session for Star-SFU
     pub async fn start_host_session(
         room_code: &str,
@@ -409,8 +611,8 @@ impl Signaling {
         let clean_code = sanitize_room_code(room_code);
         let relay_tag = format!("balabol_p2p_{}", clean_code);
 
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Packet>(64);
-        let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Packet>(64);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Packet>(128);
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Packet>(128);
 
         let keypair = {
             let mut rng = secp256k1::rand::rng();
@@ -423,45 +625,85 @@ impl Signaling {
         let my_name = my_name.to_string();
 
         let task = tokio::spawn(async move {
-            // Connect to available relays (top 4 fast relays from pool)
-            let mut connected_ws_list = Vec::new();
+            let mut writers = Vec::new();
+
             for &relay in &RELAYS[..5.min(RELAYS.len())] {
                 let connect_fut = connect_async(relay);
-                if let Ok(Ok((mut ws, _))) = tokio::time::timeout(Duration::from_millis(2500), connect_fut).await {
+                if let Ok(Ok((ws, _))) = tokio::time::timeout(Duration::from_millis(3000), connect_fut).await {
+                    let (mut ws_write, mut ws_read) = ws.split();
+
                     let sub_id = format!("sub_r_{}", rand::random::<u32>());
                     let sub_filter = json!(["REQ", sub_id, {
                         "#t": [relay_tag],
                         "limit": 0
                     }]);
-                    if ws.send(WsMessage::Text(sub_filter.to_string().into())).await.is_ok() {
-                        connected_ws_list.push(ws);
+                    if ws_write.send(WsMessage::Text(sub_filter.to_string().into())).await.is_ok() {
+                        let ws_write_arc = Arc::new(tokio::sync::Mutex::new(ws_write));
+                        writers.push(ws_write_arc);
+
+                        let in_tx_ws = in_tx.clone();
+                        let my_pubkey_ws = my_pubkey_hex.clone();
+
+                        tokio::spawn(async move {
+                            while let Some(Ok(msg)) = ws_read.next().await {
+                                if let WsMessage::Text(txt) = msg {
+                                    if let Ok(parsed) = serde_json::from_str::<Value>(&txt) {
+                                        if let Some(arr) = parsed.as_array() {
+                                            if arr.len() >= 3 && arr[0] == "EVENT" {
+                                                let sender_pubkey = arr[2]
+                                                    .get("pubkey")
+                                                    .and_then(|p| p.as_str())
+                                                    .unwrap_or_default();
+                                                if sender_pubkey != my_pubkey_ws {
+                                                    if let Some(content) =
+                                                        arr[2].get("content").and_then(|c| c.as_str())
+                                                    {
+                                                        if let Some(stripped) = content.strip_prefix("bala://pkt/") {
+                                                            if let Ok(bytes) = BASE64.decode(stripped) {
+                                                                if let Ok(pkt) = Packet::decode(&bytes) {
+                                                                    let _ = in_tx_ws.send(pkt).await;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
                     }
                 }
             }
 
-            if connected_ws_list.is_empty() {
+            if writers.is_empty() {
                 logger_clone.error("Релей-сессия: не удалось подключиться ни к одному WSS-релею");
                 return;
             }
 
             logger_clone.info(&format!(
                 "Релей-сессия активна через {} WSS-релеев (комната '{}')",
-                connected_ws_list.len(),
+                writers.len(),
                 clean_code
             ));
 
+            let writers_arc = Arc::new(writers);
             let mut last_ping = tokio::time::Instant::now();
 
             loop {
                 // Keep-alive ping every 10s
                 if last_ping.elapsed() >= Duration::from_secs(10) {
-                    for ws in &mut connected_ws_list {
-                        let _ = ws.send(WsMessage::Ping(vec![].into())).await;
+                    for w in writers_arc.iter() {
+                        let w_clone = w.clone();
+                        tokio::spawn(async move {
+                            let mut lock = w_clone.lock().await;
+                            let _ = lock.send(WsMessage::Ping(vec![].into())).await;
+                        });
                     }
                     last_ping = tokio::time::Instant::now();
                 }
 
-                // Check outgoing packets to send
                 tokio::select! {
                     Some(packet) = out_rx.recv() => {
                         if let Ok(bytes) = packet.encode() {
@@ -477,44 +719,17 @@ impl Signaling {
                                 &payload,
                             );
                             let pub_msg = json!(["EVENT", evt]).to_string();
-                            for ws in &mut connected_ws_list {
-                                let _ = ws.send(WsMessage::Text(pub_msg.clone().into())).await;
+                            for w in writers_arc.iter() {
+                                let w_clone = w.clone();
+                                let msg = pub_msg.clone();
+                                tokio::spawn(async move {
+                                    let mut lock = w_clone.lock().await;
+                                    let _ = lock.send(WsMessage::Text(msg.into())).await;
+                                });
                             }
                         }
                     }
-                    // Read incoming from any active websocket
-                    _ = tokio::time::sleep(Duration::from_millis(15)) => {
-                        let mut i = 0;
-                        while i < connected_ws_list.len() {
-                            let read_fut = tokio::time::timeout(Duration::from_millis(10), connected_ws_list[i].next());
-                            if let Ok(Some(Ok(msg))) = read_fut.await {
-                                if let WsMessage::Text(txt) = msg {
-                                    if let Ok(parsed) = serde_json::from_str::<Value>(&txt) {
-                                        if let Some(arr) = parsed.as_array() {
-                                            if arr.len() >= 3 && arr[0] == "EVENT" {
-                                                let sender_pubkey = arr[2].get("pubkey").and_then(|p| p.as_str()).unwrap_or_default();
-                                                // Ignore own events
-                                                if sender_pubkey != my_pubkey_hex {
-                                                    if let Some(content) = arr[2].get("content").and_then(|c| c.as_str()) {
-                                                        if let Some(stripped) = content.strip_prefix("bala://pkt/") {
-                                                            if let Ok(bytes) = BASE64.decode(stripped) {
-                                                                if let Ok(pkt) = Packet::decode(&bytes) {
-                                                                    let _ = in_tx.send(pkt).await;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                i += 1;
-                            } else {
-                                i += 1;
-                            }
-                        }
-                    }
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
                 }
             }
         });
