@@ -2,6 +2,7 @@ pub mod audio;
 mod invite;
 mod logger;
 pub mod p2p;
+pub mod screen_capture;
 mod signaling;
 
 use logger::AppLogger;
@@ -192,15 +193,35 @@ async fn set_nickname(nickname: String, state: State<'_, AppState>) -> Result<()
     state.node.update_nickname(nickname).await
 }
 
+#[tauri::command]
+async fn start_screen_capture(state: State<'_, AppState>) -> Result<(), String> {
+    state.node.start_screen_capture().await
+}
+
+#[tauri::command]
+async fn stop_screen_capture(state: State<'_, AppState>) -> Result<(), String> {
+    state.node.stop_screen_capture().await
+}
+
 pub fn run() {
     let logger = AppLogger::init();
     logger.info("Запуск приложения Balabol P2P...");
 
     let node = Arc::new(P2pNode::new(logger.clone()));
-    let app_state = AppState { node, logger };
+    let app_state = AppState { node: node.clone(), logger };
 
+    let node_clone = node.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(move |app| {
+            let handle = app.handle().clone();
+            node_clone.set_video_frame_callback(move |frame| {
+                use tauri::Emitter;
+                let _ = handle.emit("video-frame", &frame);
+                let _ = handle.emit("p2p://video_frame", &frame);
+            });
+            Ok(())
+        })
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             start_room,
@@ -233,6 +254,8 @@ pub fn run() {
             request_full_image,
             get_cached_image,
             request_history,
+            start_screen_capture,
+            stop_screen_capture,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

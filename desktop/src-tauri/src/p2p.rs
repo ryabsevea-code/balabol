@@ -297,6 +297,9 @@ pub struct P2pNode {
     pub current_room_code: Arc<RwLock<Option<String>>>,
     pub image_store: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     pub image_reassemblers: Arc<RwLock<HashMap<String, ImageReassembler>>>,
+    pub video_frame_callback: Arc<RwLock<Option<Box<dyn Fn(RemoteVideoFrame) + Send + Sync>>>>,
+    pub screen_capturer: Arc<crate::screen_capture::ScreenCapturer>,
+    pub is_screen_sharing: Arc<AtomicBool>,
 }
 
 impl P2pNode {
@@ -305,7 +308,7 @@ impl P2pNode {
             logger,
             status: Arc::new(RwLock::new(ConnectionStatus::Disconnected)),
             my_peer_id: Arc::new(AtomicU32::new(1)),
-            my_nickname: Arc::new(RwLock::new("РЈР·РµР»".into())),
+            my_nickname: Arc::new(RwLock::new("Узел".into())),
             is_host: Arc::new(AtomicBool::new(false)),
             current_host_id: Arc::new(AtomicU32::new(1)),
             backup_host_id: Arc::new(RwLock::new(None)),
@@ -331,6 +334,9 @@ impl P2pNode {
             current_room_code: Arc::new(RwLock::new(None)),
             image_store: Arc::new(RwLock::new(HashMap::new())),
             image_reassemblers: Arc::new(RwLock::new(HashMap::new())),
+            video_frame_callback: Arc::new(RwLock::new(None)),
+            screen_capturer: Arc::new(crate::screen_capture::ScreenCapturer::new()),
+            is_screen_sharing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -392,6 +398,7 @@ impl P2pNode {
         }
 
         self.logger.info("РћС‚РєР»СЋС‡РµРЅРёРµ P2P СЃРѕРµРґРёРЅРµРЅРёСЏ...");
+        self.screen_capturer.stop();
         self.audio_engine.stop();
         *self.latest_remote_video.write() = None;
         *self.remote_media_state.write() = RemoteMediaState::default();
@@ -493,13 +500,61 @@ impl P2pNode {
         None
     }
 
-    pub async fn send_video_frame(&self, jpeg_base64: String, is_screen: bool) -> Result<(), String> {
-        use base64::Engine;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&jpeg_base64)
-            .map_err(|e| format!("Base64 decode error: {}", e))?;
+    pub fn set_video_frame_callback<F>(&self, cb: F)
+    where
+        F: Fn(RemoteVideoFrame) + Send + Sync + 'static,
+    {
+        *self.video_frame_callback.write() = Some(Box::new(cb));
+    }
 
+    pub async fn start_screen_capture(self: &Arc<Self>) -> Result<(), String> {
+        self.is_screen_sharing.store(true, Ordering::SeqCst);
+        self.logger.info("🖥️ [Экран] Запуск демонстрации рабочего стола...");
+        let rt_handle = tokio::runtime::Handle::current();
+        let node_weak = Arc::downgrade(self);
+        self.screen_capturer.start(move |jpeg_bytes| {
+            if let Some(node) = node_weak.upgrade() {
+                let node_clone = node.clone();
+                rt_handle.spawn(async move {
+                    let _ = node_clone.send_video_frame_bytes(jpeg_bytes, true).await;
+                });
+            }
+        });
+
+        // Send media state a few times to ensure reception over UDP
+        for _ in 0..2 {
+            let _ = self.send_media_state(false, true).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+
+    pub async fn stop_screen_capture(&self) -> Result<(), String> {
+        self.is_screen_sharing.store(false, Ordering::SeqCst);
+        self.logger.info("🖥️ [Экран] Остановка демонстрации рабочего стола");
+        self.screen_capturer.stop();
+        for _ in 0..2 {
+            let _ = self.send_media_state(false, false).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    }
+
+    pub async fn send_video_frame_bytes(&self, bytes: Vec<u8>, is_screen: bool) -> Result<(), String> {
         if bytes.is_empty() {
+            return Ok(());
+        }
+
+        let sock_opt = self.active_socket.read().clone();
+        let sock = match sock_opt {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+
+        let client_addrs: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
+        let host_addr_opt = *self.host_socket_addr.read();
+
+        if client_addrs.is_empty() && host_addr_opt.is_none() {
             return Ok(());
         }
 
@@ -507,6 +562,16 @@ impl P2pNode {
         let frame_id = self.video_frame_seq.fetch_add(1, Ordering::SeqCst);
         const CHUNK_SIZE: usize = 1200;
         let chunk_total = ((bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u16;
+
+        if frame_id == 1 || frame_id % 60 == 0 {
+            self.logger.info(&format!(
+                "🖥️ [Экран] Отправка кадра #{} ({:.1} KB, {} чанков) пирам: {:?}",
+                frame_id,
+                bytes.len() as f64 / 1024.0,
+                chunk_total,
+                client_addrs
+            ));
+        }
 
         for (idx, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
             let pkt = Packet::VideoChunk {
@@ -518,11 +583,28 @@ impl P2pNode {
                 data: chunk.to_vec(),
             };
 
-            self.broadcast_packet(&pkt).await;
-            tokio::time::sleep(Duration::from_micros(150)).await;
+            if let Ok(pkt_bytes) = pkt.encode() {
+                for &addr in &client_addrs {
+                    let _ = sock.send_to(&pkt_bytes, addr).await;
+                }
+                if let Some(host_addr) = host_addr_opt {
+                    let _ = sock.send_to(&pkt_bytes, host_addr).await;
+                }
+            }
+
+            tokio::task::yield_now().await;
         }
 
         Ok(())
+    }
+
+    pub async fn send_video_frame(&self, jpeg_base64: String, is_screen: bool) -> Result<(), String> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&jpeg_base64)
+            .map_err(|e| format!("Base64 decode error: {}", e))?;
+
+        self.send_video_frame_bytes(bytes, is_screen).await
     }
 
     pub async fn send_media_state(&self, video_active: bool, screen_active: bool) -> Result<(), String> {
@@ -540,12 +622,13 @@ impl P2pNode {
 
     fn broadcast_media_state(&self) -> Result<(), String> {
         let my_id = self.my_peer_id.load(Ordering::Relaxed);
+        let is_screen = self.is_screen_sharing.load(Ordering::Relaxed);
         let pkt = Packet::MediaState {
             sender_id: my_id,
             mic_muted: self.audio_engine.is_mic_muted(),
             deafened: self.audio_engine.is_deafened(),
             video_active: false,
-            screen_active: false,
+            screen_active: is_screen,
         };
         let self_clone = self.clone();
         tokio::spawn(async move {
@@ -557,21 +640,37 @@ impl P2pNode {
     pub async fn broadcast_packet(&self, packet: &Packet) {
         if let Ok(bytes) = packet.encode() {
             let sock_opt = self.active_socket.read().clone();
+            let mut has_direct_udp = false;
             if let Some(sock) = sock_opt {
                 // If Host: send to all connected clients
                 let client_addrs: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
                 for addr in client_addrs {
                     let _ = sock.send_to(&bytes, addr).await;
+                    has_direct_udp = true;
                 }
                 // If Client: send to Host
                 let host_addr_opt = *self.host_socket_addr.read();
                 if let Some(host_addr) = host_addr_opt {
                     let _ = sock.send_to(&bytes, host_addr).await;
+                    has_direct_udp = true;
                 }
             }
+
+            // NEVER route heavy video frames through public Nostr relays!
+            if matches!(packet, Packet::VideoChunk { .. }) {
+                return;
+            }
+
+            // For non-video packets: only fallback to WSS relay if any peer lacks direct UDP
             let relay_tx_opt = self.relay_sender.read().clone();
             if let Some(relay_tx) = relay_tx_opt {
-                let _ = relay_tx.send(packet.clone()).await;
+                let has_relay_peers = {
+                    let ep_guard = self.client_endpoints.read();
+                    self.peers.read().keys().any(|pid| !ep_guard.contains_key(pid))
+                };
+                if !has_direct_udp || has_relay_peers {
+                    let _ = relay_tx.try_send(packet.clone());
+                }
             }
         }
     }
@@ -834,7 +933,7 @@ async fn run_mesh_peer_loop(
     node.logger.info("============================================================");
 
     let mut buf = [0u8; 4096];
-    let mut video_reassembler = VideoReassembler::new();
+    let mut video_reassemblers: HashMap<u32, VideoReassembler> = HashMap::new();
     let mut last_ping_broadcast = Instant::now();
     let mut last_cleanup = Instant::now();
     let mut ping_seq = 0u64;
@@ -926,9 +1025,9 @@ async fn run_mesh_peer_loop(
 
             let already_connected = node.client_endpoints.read().contains_key(&ann.peer_id);
             let punch_needed = !already_connected
-                || last_punch_attempt
+                && last_punch_attempt
                     .get(&ann.peer_id)
-                    .map(|t| t.elapsed() > Duration::from_secs(5))
+                    .map(|t| t.elapsed() > Duration::from_secs(2))
                     .unwrap_or(true);
 
             if punch_needed {
@@ -1039,7 +1138,7 @@ async fn run_mesh_peer_loop(
                                 &socket,
                                 &relay_session.outgoing_tx,
                                 &node,
-                                &mut video_reassembler,
+                                &mut video_reassemblers,
                                 &mut discovered_candidates,
                                 &mut discovered_sessions,
                             ).await;
@@ -1060,7 +1159,7 @@ async fn run_mesh_peer_loop(
                         &socket,
                         &relay_session.outgoing_tx,
                         &node,
-                        &mut video_reassembler,
+                        &mut video_reassemblers,
                         &mut discovered_candidates,
                         &mut discovered_sessions,
                     ).await;
@@ -1116,7 +1215,7 @@ async fn handle_mesh_packet(
     socket: &Arc<UdpSocket>,
     relay_tx: &tokio::sync::mpsc::Sender<Packet>,
     node: &P2pNode,
-    video_reassembler: &mut VideoReassembler,
+    video_reassemblers: &mut HashMap<u32, VideoReassembler>,
     discovered_candidates: &mut HashMap<u32, Vec<SocketAddr>>,
     discovered_sessions: &mut HashMap<u32, String>,
 ) {
@@ -1283,15 +1382,42 @@ async fn handle_mesh_packet(
 
         Packet::VideoChunk { sender_id, frame_id, chunk_idx, chunk_total, is_screen, data } => {
             if sender_id != my_id {
-                video_reassembler.handle_chunk(
+                let reassembler = video_reassemblers.entry(sender_id).or_insert_with(VideoReassembler::new);
+                if let Some(frame) = reassembler.handle_chunk(
                     sender_id,
                     frame_id,
                     chunk_idx,
                     chunk_total,
                     is_screen,
                     data,
-                    &node.latest_remote_video,
-                );
+                ) {
+                    if frame.frame_id == 1 || frame.frame_id % 60 == 0 {
+                        node.logger.info(&format!(
+                            "🖥️ [Экран] Кадр #{} успешно собран от пира {} (экран: {})",
+                            frame.frame_id, sender_id, frame.is_screen
+                        ));
+                    }
+                    *node.latest_remote_video.write() = Some(frame.clone());
+                    {
+                        let mut peers_guard = node.peers.write();
+                        if let Some(peer) = peers_guard.get_mut(&sender_id) {
+                            if is_screen {
+                                peer.screen_active = true;
+                            } else {
+                                peer.video_active = true;
+                            }
+                            peer.last_seen_ms = now_ms();
+                        }
+                    }
+                    if is_screen {
+                        node.remote_media_state.write().screen_active = true;
+                    } else {
+                        node.remote_media_state.write().video_active = true;
+                    }
+                    if let Some(cb) = node.video_frame_callback.read().as_ref() {
+                        cb(frame);
+                    }
+                }
             }
         }
 
@@ -1424,6 +1550,10 @@ async fn handle_mesh_packet(
 
         Packet::MediaState { sender_id, mic_muted, deafened, video_active, screen_active } => {
             if sender_id != my_id {
+                node.logger.info(&format!(
+                    "📡 [Медиа-статус] Пир {}: mic_muted={}, deafened={}, video={}, screen={}",
+                    sender_id, mic_muted, deafened, video_active, screen_active
+                ));
                 let mut peers_guard = node.peers.write();
                 if let Some(peer) = peers_guard.get_mut(&sender_id) {
                     peer.mic_muted = mic_muted;
@@ -1431,6 +1561,19 @@ async fn handle_mesh_packet(
                     peer.video_active = video_active;
                     peer.screen_active = screen_active;
                     peer.last_seen_ms = now_ms();
+                }
+                let any_mic_muted = peers_guard.values().all(|p| p.mic_muted);
+                let any_deafened = peers_guard.values().any(|p| p.deafened);
+                let any_video = peers_guard.values().any(|p| p.video_active);
+                let any_screen = peers_guard.values().any(|p| p.screen_active);
+                *node.remote_media_state.write() = RemoteMediaState {
+                    mic_muted: any_mic_muted,
+                    deafened: any_deafened,
+                    video_active: any_video,
+                    screen_active: any_screen,
+                };
+                if !any_video && !any_screen {
+                    *node.latest_remote_video.write() = None;
                 }
             }
         }
@@ -1452,10 +1595,21 @@ async fn handle_mesh_packet(
                     node.peer_addrs.write().remove(&addr);
                 }
                 node.peers.write().remove(&sender_id);
+                video_reassemblers.remove(&sender_id);
                 discovered_candidates.remove(&sender_id);
                 discovered_sessions.remove(&sender_id);
                 node.audio_engine.play_disconnect_chime();
                 let cnt = node.peers.read().len();
+                let any_mic_muted = node.peers.read().values().all(|p| p.mic_muted);
+                let any_deafened = node.peers.read().values().any(|p| p.deafened);
+                let any_video = node.peers.read().values().any(|p| p.video_active);
+                let any_screen = node.peers.read().values().any(|p| p.screen_active);
+                *node.remote_media_state.write() = RemoteMediaState {
+                    mic_muted: any_mic_muted,
+                    deafened: any_deafened,
+                    video_active: any_video,
+                    screen_active: any_screen,
+                };
                 let mut st = node.status.write();
                 if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
                     *connected_count = cnt;
@@ -1496,10 +1650,13 @@ impl VideoReassembler {
         chunk_total: u16,
         is_screen: bool,
         data: Vec<u8>,
-        target: &Arc<RwLock<Option<RemoteVideoFrame>>>,
-    ) {
+    ) -> Option<RemoteVideoFrame> {
         use base64::Engine;
-        if frame_id > self.current_frame_id || sender_id != self.sender_id || self.created_at.elapsed() > Duration::from_millis(800) {
+        if self.chunks.is_empty()
+            || frame_id > self.current_frame_id
+            || sender_id != self.sender_id
+            || self.created_at.elapsed() > Duration::from_millis(800)
+        {
             self.current_frame_id = frame_id;
             self.sender_id = sender_id;
             self.chunk_total = chunk_total;
@@ -1519,16 +1676,18 @@ impl VideoReassembler {
                     }
                 }
                 let base64_str = base64::engine::general_purpose::STANDARD.encode(&full_bytes);
-                *target.write() = Some(RemoteVideoFrame {
+                let frame = RemoteVideoFrame {
                     sender_id,
                     frame_id,
                     is_screen: self.is_screen,
                     jpeg_base64: base64_str,
                     timestamp_ms: now_ms(),
-                });
+                };
                 self.chunks.clear();
+                return Some(frame);
             }
         }
+        None
     }
 }
 

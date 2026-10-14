@@ -1,6 +1,7 @@
 <script>
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import {
     Radio,
     Users,
@@ -46,6 +47,8 @@
   let chatMessages = [];
   let pollInterval = null;
   let videoPollInterval = null;
+  let unlistenVideo = null;
+  let lastVideoFrameReceivedAt = 0;
 
   // Chat input & image attachment state
   let chatInputEl;
@@ -221,19 +224,57 @@
     await pollState();
     // High-responsiveness state poll (150ms) for instant chat, status & speaking indicators
     pollInterval = setInterval(pollState, 150);
-    // Independent video frame poll (120ms) - only transfers frames when changed
-    videoPollInterval = setInterval(pollVideoFrame, 120);
+    // Direct memory frame poll (60ms) for ultra-fast, stutter-free video and screen share rendering
+    videoPollInterval = setInterval(pollVideoFrame, 60);
+
+    try {
+      unlistenVideo = await listen("video-frame", (event) => {
+        if (event && event.payload) {
+          remoteVideoFrame = event.payload;
+          lastReceivedFrameId = event.payload.frame_id;
+          lastVideoFrameReceivedAt = Date.now();
+        }
+      });
+    } catch (e) {
+      // Fallback: pollVideoFrame handles frames directly via memory buffer
+    }
   });
 
   onDestroy(() => {
     if (pollInterval) clearInterval(pollInterval);
     if (videoPollInterval) clearInterval(videoPollInterval);
+    if (unlistenVideo) unlistenVideo();
     if (isMicTesting) {
       invoke("stop_mic_test").catch(() => {});
     }
     if (lightboxPollTimer) clearInterval(lightboxPollTimer);
     stopMediaStream();
   });
+
+  async function pollVideoFrame() {
+    if (status.type === "Connected") {
+      try {
+        const frame = await invoke("get_remote_video_frame", {
+          lastFrameId: lastReceivedFrameId,
+        });
+        if (frame) {
+          lastReceivedFrameId = frame.frame_id;
+          remoteVideoFrame = frame;
+          lastVideoFrameReceivedAt = Date.now();
+        } else if (
+          !peers.some((p) => p.video_active || p.screen_active) &&
+          !voiceStatus.remote_media?.video_active &&
+          !voiceStatus.remote_media?.screen_active &&
+          Date.now() - lastVideoFrameReceivedAt > 4000
+        ) {
+          if (remoteVideoFrame) {
+            remoteVideoFrame = null;
+            lastReceivedFrameId = 0;
+          }
+        }
+      } catch (e) {}
+    }
+  }
 
   async function pollState() {
     try {
@@ -277,27 +318,6 @@
     }
   }
 
-  async function pollVideoFrame() {
-    if (status.type === "Connected") {
-      const anyVideo =
-        (peers && peers.some((p) => p.video_active || p.screen_active)) ||
-        voiceStatus.remote_media?.video_active ||
-        voiceStatus.remote_media?.screen_active;
-      if (anyVideo) {
-        try {
-          const frame = await invoke("get_remote_video_frame", {
-            lastFrameId: lastReceivedFrameId,
-          });
-          if (frame) {
-            lastReceivedFrameId = frame.frame_id;
-            remoteVideoFrame = frame;
-          }
-        } catch (e) {
-          // ignore
-        }
-      }
-    }
-  }
 
   function scrollToChatBottom() {
     setTimeout(() => {
@@ -378,10 +398,12 @@
   // --- Video & Screen Share Controls ---
   async function toggleCamera() {
     if (isCameraOn) {
-      stopMediaStream();
+      stopCamera();
       return;
     }
-    stopMediaStream();
+    if (isScreenOn) {
+      await stopScreenShare();
+    }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: {
@@ -398,7 +420,7 @@
         localVideoEl.srcObject = stream;
         localVideoEl.play().catch(() => {});
       }
-      startVideoCapture(false);
+      startCameraCapture();
       await invoke("send_media_state", {
         videoActive: true,
         screenActive: false,
@@ -411,39 +433,33 @@
 
   async function toggleScreenShare() {
     if (isScreenOn) {
-      stopMediaStream();
+      await stopScreenShare();
       return;
     }
-    stopMediaStream();
+    if (isCameraOn) {
+      stopCamera();
+    }
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { max: 15 } },
-        audio: false,
-      });
-      localStream = stream;
+      await invoke("start_screen_capture");
       isScreenOn = true;
       isCameraOn = false;
-      if (localVideoEl) {
-        localVideoEl.srcObject = stream;
-        localVideoEl.play().catch(() => {});
-      }
-      stream.getVideoTracks()[0].onended = () => {
-        stopMediaStream();
-      };
-      startVideoCapture(true);
-      await invoke("send_media_state", {
-        videoActive: false,
-        screenActive: true,
-      });
     } catch (e) {
-      console.error("Screen share error:", e);
-      if (e.name !== "NotAllowedError") {
-        alert("Не удалось запустить демонстрацию экрана: " + e.message);
-      }
+      console.error("Screen capture error:", e);
+      alert("Не удалось запустить демонстрацию экрана: " + e);
     }
   }
 
-  function stopMediaStream() {
+  async function stopScreenShare() {
+    if (!isScreenOn) return;
+    isScreenOn = false;
+    try {
+      await invoke("stop_screen_capture");
+    } catch (e) {
+      console.error("Stop screen error:", e);
+    }
+  }
+
+  function stopCamera() {
     if (videoCaptureTimer) {
       clearInterval(videoCaptureTimer);
       videoCaptureTimer = null;
@@ -455,50 +471,48 @@
     if (localVideoEl) {
       localVideoEl.srcObject = null;
     }
-    const wasActive = isCameraOn || isScreenOn;
-    isCameraOn = false;
-    isScreenOn = false;
-    if (wasActive && status.type === "Connected") {
-      invoke("send_media_state", {
-        videoActive: false,
-        screenActive: false,
-      }).catch(() => {});
+    if (isCameraOn) {
+      isCameraOn = false;
+      if (status.type === "Connected") {
+        invoke("send_media_state", {
+          videoActive: false,
+          screenActive: isScreenOn,
+        }).catch(() => {});
+      }
     }
   }
 
-  function startVideoCapture(isScreen) {
-    if (videoCaptureTimer) clearInterval(videoCaptureTimer);
-    // 180ms for screen (~5.5 fps, low packet burst, crisp text)
-    // 120ms for webcam (~8 fps, smooth motion)
-    videoCaptureTimer = setInterval(
-      () => {
-        captureAndSendVideoFrame(isScreen);
-      },
-      isScreen ? 180 : 120,
-    );
+  function stopMediaStream() {
+    stopCamera();
+    if (isScreenOn) {
+      stopScreenShare();
+    }
   }
 
-  function captureAndSendVideoFrame(isScreen) {
+  function startCameraCapture() {
+    if (videoCaptureTimer) clearInterval(videoCaptureTimer);
+    videoCaptureTimer = setInterval(captureAndSendCameraFrame, 120);
+  }
+
+  function captureAndSendCameraFrame() {
     if (!localVideoEl || !canvasEl || localVideoEl.videoWidth === 0) return;
     try {
-      // 640x360 for screen, 480x360 for webcam
-      const targetW = isScreen ? 640 : 480;
+      const targetW = 480;
       const targetH = 360;
       canvasEl.width = targetW;
       canvasEl.height = targetH;
       const ctx = canvasEl.getContext("2d");
       ctx.drawImage(localVideoEl, 0, 0, targetW, targetH);
-      // Quality 0.42 yields ~12-16 KB JPEG, keeping total network bandwidth under 50-80 KB/s
-      const dataUrl = canvasEl.toDataURL("image/jpeg", isScreen ? 0.42 : 0.4);
+      const dataUrl = canvasEl.toDataURL("image/jpeg", 0.4);
       const commaIdx = dataUrl.indexOf(",");
       if (commaIdx !== -1) {
         const base64 = dataUrl.substring(commaIdx + 1);
-        invoke("send_video_frame", { jpegBase64: base64, isScreen }).catch(
+        invoke("send_video_frame", { jpegBase64: base64, isScreen: false }).catch(
           () => {},
         );
       }
     } catch (e) {
-      console.error("Capture frame error:", e);
+      console.error("Capture camera frame error:", e);
     }
   }
 
@@ -1266,7 +1280,7 @@
                 <div
                   class="flex-1 relative bg-[#0b0c0f] flex items-center justify-center overflow-hidden"
                 >
-                  {#if remoteVideoFrame && (voiceStatus.remote_media.video_active || voiceStatus.remote_media.screen_active)}
+                  {#if remoteVideoFrame && (Date.now() - lastVideoFrameReceivedAt < 7000 || peers.some((p) => p.video_active || p.screen_active) || voiceStatus.remote_media?.video_active || voiceStatus.remote_media?.screen_active)}
                     <!-- Remote Video Stream -->
                     <div
                       class="relative w-full h-full flex items-center justify-center bg-black"
@@ -1274,17 +1288,17 @@
                       <img
                         src="data:image/jpeg;base64,{remoteVideoFrame.jpeg_base64}"
                         alt="Remote Feed"
-                        class="w-full h-full object-contain"
+                        class="w-full h-full object-contain select-none pointer-events-none"
                       />
                       <div
-                        class="absolute top-4 left-4 bg-black/70 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/10 flex items-center gap-2 text-xs font-semibold text-white"
+                        class="absolute top-4 left-4 bg-black/75 backdrop-blur-md px-3 py-1.5 rounded-lg border border-white/10 flex items-center gap-2 text-xs font-semibold text-white shadow-lg"
                       >
                         {#if remoteVideoFrame.is_screen}
                           <Monitor class="w-4 h-4 text-purple-400" />
-                          <span>Трансляция экрана</span>
+                          <span>{peers.find((p) => p.id === remoteVideoFrame.sender_id)?.name || "Собеседник"} — Трансляция экрана</span>
                         {:else}
                           <Video class="w-4 h-4 text-emerald-400" />
-                          <span>Видеопоток камеры</span>
+                          <span>{peers.find((p) => p.id === remoteVideoFrame.sender_id)?.name || "Собеседник"} — Видеопоток камеры</span>
                         {/if}
                       </div>
 
@@ -1566,22 +1580,26 @@
                     <div
                       class="relative rounded-xl overflow-hidden border border-white/20 shadow-2xl bg-[#111215]"
                     >
-                      <video
-                        bind:this={localVideoEl}
-                        autoplay
-                        muted
-                        playsinline
-                        class="w-48 h-32 object-cover"
-                      ></video>
-                      <div
-                        class="absolute top-2 left-2 bg-black/70 backdrop-blur-sm px-2 py-0.5 rounded text-[10px] text-white font-medium flex items-center gap-1"
-                      >
-                        {#if isScreenOn}
-                          <Monitor class="w-3 h-3 text-purple-400" /> Экран
-                        {:else}
+                      {#if isCameraOn}
+                        <video
+                          bind:this={localVideoEl}
+                          autoplay
+                          muted
+                          playsinline
+                          class="w-48 h-32 object-cover"
+                        ></video>
+                        <div
+                          class="absolute top-2 left-2 bg-black/70 backdrop-blur-sm px-2 py-0.5 rounded text-[10px] text-white font-medium flex items-center gap-1"
+                        >
                           <Video class="w-3 h-3 text-blue-400" /> Вы
-                        {/if}
-                      </div>
+                        </div>
+                      {:else if isScreenOn}
+                        <div class="w-48 h-28 bg-[#181a24] flex flex-col items-center justify-center p-3 text-center border border-purple-500/20">
+                          <Monitor class="w-7 h-7 text-purple-400 mb-1.5 animate-pulse" />
+                          <span class="text-xs font-semibold text-white">Вы делитесь экраном</span>
+                          <span class="text-[10px] text-[#8a8e98] mt-0.5">Трансляция активна</span>
+                        </div>
+                      {/if}
                     </div>
                   </div>
                 </div>
