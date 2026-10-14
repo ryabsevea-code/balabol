@@ -56,9 +56,27 @@ pub enum Packet {
         text: String,
         sender_name: String,
         timestamp_ms: u64,
+        image_thumb: Option<String>,
+        image_id: Option<String>,
     },
     TextAck {
         id: u64,
+    },
+    ImageRequest {
+        image_id: String,
+        requester_id: u32,
+    },
+    ImageChunk {
+        image_id: String,
+        chunk_idx: u32,
+        chunk_total: u32,
+        data: Vec<u8>,
+    },
+    HistoryRequest {
+        requester_id: u32,
+    },
+    HistoryMessage {
+        message: ChatMessage,
     },
     Disconnect {
         sender_id: u32,
@@ -121,13 +139,17 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     pub id: u64,
     pub sender: String,
     pub text: String,
     pub timestamp_ms: u64,
     pub is_me: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_thumb: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -211,6 +233,39 @@ pub enum ConnectionStatus {
     },
 }
 
+#[derive(Debug, Clone)]
+pub struct ImageReassembler {
+    pub chunk_total: u32,
+    pub chunks: Vec<Option<Vec<u8>>>,
+    pub created_at: Instant,
+}
+
+impl ImageReassembler {
+    pub fn new(chunk_total: u32) -> Self {
+        Self {
+            chunk_total,
+            chunks: vec![None; chunk_total as usize],
+            created_at: Instant::now(),
+        }
+    }
+
+    pub fn handle_chunk(&mut self, chunk_idx: u32, data: Vec<u8>) -> Option<Vec<u8>> {
+        if (chunk_idx as usize) < self.chunks.len() {
+            self.chunks[chunk_idx as usize] = Some(data);
+            if self.chunks.iter().all(|c| c.is_some()) {
+                let mut full_bytes = Vec::new();
+                for c in &self.chunks {
+                    if let Some(bytes) = c {
+                        full_bytes.extend_from_slice(bytes);
+                    }
+                }
+                return Some(full_bytes);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Clone)]
 pub struct P2pNode {
     logger: AppLogger,
@@ -240,6 +295,8 @@ pub struct P2pNode {
     pub remote_media_state: Arc<RwLock<RemoteMediaState>>,
     pub video_frame_seq: Arc<AtomicU32>,
     pub current_room_code: Arc<RwLock<Option<String>>>,
+    pub image_store: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    pub image_reassemblers: Arc<RwLock<HashMap<String, ImageReassembler>>>,
 }
 
 impl P2pNode {
@@ -272,6 +329,8 @@ impl P2pNode {
             remote_media_state: Arc::new(RwLock::new(RemoteMediaState::default())),
             video_frame_seq: Arc::new(AtomicU32::new(1)),
             current_room_code: Arc::new(RwLock::new(None)),
+            image_store: Arc::new(RwLock::new(HashMap::new())),
+            image_reassemblers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -517,10 +576,17 @@ impl P2pNode {
         }
     }
 
-    pub async fn send_chat_message(&self, text: String, my_name: String) -> Result<ChatMessage, String> {
+    pub async fn send_chat_message(
+        &self,
+        text: String,
+        my_name: String,
+        image_thumb: Option<String>,
+        image_id: Option<String>,
+        full_image_base64: Option<String>,
+    ) -> Result<ChatMessage, String> {
         let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Err("РЎРѕРѕР±С‰РµРЅРёРµ РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РїСѓСЃС‚С‹Рј".into());
+        if trimmed.is_empty() && image_thumb.is_none() {
+            return Err("Сообщение не может быть пустым".into());
         }
 
         let my_id = self.my_peer_id.load(Ordering::Relaxed);
@@ -528,15 +594,24 @@ impl P2pNode {
         let timestamp_ms = now_ms();
         self.seen_msg_ids.write().insert(id);
 
+        if let (Some(ref img_id), Some(ref full_b64)) = (&image_id, &full_image_base64) {
+            use base64::Engine;
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(full_b64) {
+                self.image_store.write().insert(img_id.clone(), bytes);
+            }
+        }
+
         let packet = Packet::TextMessage {
             id,
             sender_id: my_id,
             text: trimmed.to_string(),
             sender_name: my_name.clone(),
             timestamp_ms,
+            image_thumb: image_thumb.clone(),
+            image_id: image_id.clone(),
         };
 
-        // Broadcast with retry
+        // Broadcast to all peers
         self.broadcast_packet(&packet).await;
 
         let msg = ChatMessage {
@@ -545,11 +620,44 @@ impl P2pNode {
             text: trimmed.to_string(),
             timestamp_ms,
             is_me: true,
+            image_thumb,
+            image_id,
         };
 
         self.chat_messages.write().push(msg.clone());
-        self.logger.info(&format!("[Р§РђРў] РЇ: {}", trimmed));
+        if !trimmed.is_empty() {
+            self.logger.info(&format!("[ЧАТ] Я: {}", trimmed));
+        } else {
+            self.logger.info("[ЧАТ] Я отправил(а) изображение");
+        }
         Ok(msg)
+    }
+
+    pub async fn request_full_image(&self, image_id: String) -> Result<(), String> {
+        if self.image_store.read().contains_key(&image_id) {
+            return Ok(());
+        }
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
+        let pkt = Packet::ImageRequest {
+            image_id,
+            requester_id: my_id,
+        };
+        self.broadcast_packet(&pkt).await;
+        Ok(())
+    }
+
+    pub fn get_cached_image(&self, image_id: &str) -> Option<String> {
+        use base64::Engine;
+        self.image_store
+            .read()
+            .get(image_id)
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub async fn request_history(&self) {
+        let my_id = self.my_peer_id.load(Ordering::Relaxed);
+        let pkt = Packet::HistoryRequest { requester_id: my_id };
+        self.broadcast_packet(&pkt).await;
     }
 
     /// Update local nickname and broadcast to all peers in call
@@ -735,6 +843,15 @@ async fn run_mesh_peer_loop(
     let mut discovered_candidates: HashMap<u32, Vec<SocketAddr>> = HashMap::new();
     let mut discovered_sessions: HashMap<u32, String> = HashMap::new();
     let mut last_punch_attempt: HashMap<u32, Instant> = HashMap::new();
+
+    // Background History Sync on room join
+    let node_history = node.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        node_history.request_history().await;
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        node_history.request_history().await;
+    });
 
     // Background Audio Transmitter
     let audio_sock = socket.clone();
@@ -1178,7 +1295,7 @@ async fn handle_mesh_packet(
             }
         }
 
-        Packet::TextMessage { id, sender_id, text, sender_name, timestamp_ms } => {
+        Packet::TextMessage { id, sender_id, text, sender_name, timestamp_ms, image_thumb, image_id } => {
             if sender_id != my_id {
                 let is_new = node.seen_msg_ids.write().insert(id);
                 if is_new {
@@ -1189,6 +1306,8 @@ async fn handle_mesh_packet(
                         text,
                         timestamp_ms,
                         is_me: false,
+                        image_thumb,
+                        image_id,
                     });
                 }
                 ensure_relay_peer(node, sender_id, &sender_name);
@@ -1200,6 +1319,100 @@ async fn handle_mesh_packet(
                 } else {
                     let _ = relay_tx.send(ack).await;
                 }
+            }
+        }
+
+        Packet::ImageRequest { image_id, requester_id } => {
+            if requester_id != my_id {
+                let opt_bytes = node.image_store.read().get(&image_id).cloned();
+                if let Some(bytes) = opt_bytes {
+                    node.logger.info(&format!(
+                        "🖼️ [Изображение] Отправка чанков '{}' ({:.1} KB) пиру {}",
+                        image_id,
+                        bytes.len() as f64 / 1024.0,
+                        requester_id
+                    ));
+                    let sock_opt = node.active_socket.read().clone();
+                    let relay_tx_clone = relay_tx.clone();
+                    let target_addr_opt = node.client_endpoints.read().get(&requester_id).cloned();
+                    tokio::spawn(async move {
+                        const CHUNK_SIZE: usize = 1200;
+                        let chunk_total = ((bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
+                        for (idx, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
+                            let pkt = Packet::ImageChunk {
+                                image_id: image_id.clone(),
+                                chunk_idx: idx as u32,
+                                chunk_total,
+                                data: chunk.to_vec(),
+                            };
+                            if let Ok(b) = pkt.encode() {
+                                if let (Some(sock), Some(addr)) = (&sock_opt, target_addr_opt) {
+                                    let _ = sock.send_to(&b, addr).await;
+                                } else {
+                                    let _ = relay_tx_clone.send(pkt).await;
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_millis(4)).await;
+                        }
+                    });
+                }
+            }
+        }
+
+        Packet::ImageChunk { image_id, chunk_idx, chunk_total, data } => {
+            let mut reassemblers = node.image_reassemblers.write();
+            let reassembler = reassemblers
+                .entry(image_id.clone())
+                .or_insert_with(|| ImageReassembler::new(chunk_total));
+            if let Some(full_bytes) = reassembler.handle_chunk(chunk_idx, data) {
+                node.logger.info(&format!(
+                    "🖼️ [Изображение] Полное изображение '{}' получено ({:.1} KB)",
+                    image_id,
+                    full_bytes.len() as f64 / 1024.0
+                ));
+                node.image_store.write().insert(image_id.clone(), full_bytes);
+                reassemblers.remove(&image_id);
+            }
+        }
+
+        Packet::HistoryRequest { requester_id } => {
+            if requester_id != my_id {
+                let msgs = node.chat_messages.read().clone();
+                if !msgs.is_empty() {
+                    node.logger.info(&format!(
+                        "📜 [История] Отправка {} сообщений пиру {}",
+                        msgs.len(),
+                        requester_id
+                    ));
+                    let sock_opt = node.active_socket.read().clone();
+                    let relay_tx_clone = relay_tx.clone();
+                    let target_addr_opt = node.client_endpoints.read().get(&requester_id).cloned();
+                    tokio::spawn(async move {
+                        let start_idx = msgs.len().saturating_sub(50);
+                        for msg in &msgs[start_idx..] {
+                            let pkt = Packet::HistoryMessage { message: msg.clone() };
+                            if let Ok(b) = pkt.encode() {
+                                if let (Some(sock), Some(addr)) = (&sock_opt, target_addr_opt) {
+                                    let _ = sock.send_to(&b, addr).await;
+                                } else {
+                                    let _ = relay_tx_clone.send(pkt).await;
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_millis(8)).await;
+                        }
+                    });
+                }
+            }
+        }
+
+        Packet::HistoryMessage { mut message } => {
+            let is_new = node.seen_msg_ids.write().insert(message.id);
+            if is_new {
+                let my_nickname = node.my_nickname.read().clone();
+                message.is_me = message.sender == my_nickname;
+                let mut chat = node.chat_messages.write();
+                chat.push(message);
+                chat.sort_by_key(|m| m.timestamp_ms);
             }
         }
 
@@ -1799,6 +2012,8 @@ mod tests {
             text: "Тестовое сообщение".into(),
             sender_name: "Alice".into(),
             timestamp_ms: now_ms(),
+            image_thumb: None,
+            image_id: None,
         };
         let b = pkt.encode().unwrap();
 
@@ -1810,7 +2025,7 @@ mod tests {
         for _ in 0..3 {
             let (len, _) = sock_b.recv_from(&mut buf).await.unwrap();
             let decoded = Packet::decode(&buf[..len]).unwrap();
-            if let Packet::TextMessage { id, text, sender_name, timestamp_ms, .. } = decoded {
+            if let Packet::TextMessage { id, text, sender_name, timestamp_ms, image_thumb, image_id, .. } = decoded {
                 let is_new = node_b.seen_msg_ids.write().insert(id);
                 if is_new {
                     node_b.chat_messages.write().push(ChatMessage {
@@ -1819,6 +2034,8 @@ mod tests {
                         text,
                         timestamp_ms,
                         is_me: false,
+                        image_thumb,
+                        image_id,
                     });
                 }
             }

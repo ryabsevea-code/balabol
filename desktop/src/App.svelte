@@ -35,6 +35,9 @@
     User,
     PenLine,
     Crown,
+    Paperclip,
+    Download,
+    Image as ImageIcon,
   } from "lucide-svelte";
 
   let status = { type: "Disconnected" };
@@ -43,6 +46,13 @@
   let chatMessages = [];
   let pollInterval = null;
   let videoPollInterval = null;
+
+  // Chat input & image attachment state
+  let chatInputEl;
+  let fileInputEl;
+  let attachedImage = null; // { thumbDataUrl, fullDataUrl, name, sizeStr }
+  let lightboxImage = null; // { url, sender, time, id, loading }
+  let lightboxPollTimer = null;
 
   // Modals state
   let showConnectModal = false;
@@ -221,6 +231,7 @@
     if (isMicTesting) {
       invoke("stop_mic_test").catch(() => {});
     }
+    if (lightboxPollTimer) clearInterval(lightboxPollTimer);
     stopMediaStream();
   });
 
@@ -564,27 +575,145 @@
     }
   }
 
-  // --- Actions: Chat (Optimistic 0ms Local Update) ---
+  // --- Actions: Chat (Optimistic 0ms Local Update + Image Sharing) ---
+  function processSelectedImage(file) {
+    if (!file || !file.type.startsWith("image/")) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const rawDataUrl = e.target.result;
+      const img = new Image();
+      img.onload = () => {
+        // 1. Full-res canvas (max 1920x1080)
+        const maxFullDim = 1920;
+        let fw = img.width;
+        let fh = img.height;
+        if (fw > maxFullDim || fh > maxFullDim) {
+          if (fw > fh) {
+            fh = Math.round((fh * maxFullDim) / fw);
+            fw = maxFullDim;
+          } else {
+            fw = Math.round((fw * maxFullDim) / fh);
+            fh = maxFullDim;
+          }
+        }
+        const fullCanvas = document.createElement("canvas");
+        fullCanvas.width = fw;
+        fullCanvas.height = fh;
+        const fctx = fullCanvas.getContext("2d");
+        fctx.drawImage(img, 0, 0, fw, fh);
+        const fullDataUrl = fullCanvas.toDataURL("image/jpeg", 0.85);
+
+        // 2. Compact thumbnail canvas (max 320x320, ~10-20 KB)
+        const maxThumbDim = 320;
+        let tw = img.width;
+        let th = img.height;
+        if (tw > maxThumbDim || th > maxThumbDim) {
+          if (tw > th) {
+            th = Math.round((th * maxThumbDim) / tw);
+            tw = maxThumbDim;
+          } else {
+            tw = Math.round((tw * maxThumbDim) / th);
+            th = maxThumbDim;
+          }
+        }
+        const thumbCanvas = document.createElement("canvas");
+        thumbCanvas.width = tw;
+        thumbCanvas.height = th;
+        const tctx = thumbCanvas.getContext("2d");
+        tctx.drawImage(img, 0, 0, tw, th);
+        const thumbDataUrl = thumbCanvas.toDataURL("image/jpeg", 0.65);
+
+        attachedImage = {
+          thumbDataUrl,
+          fullDataUrl,
+          name: file.name || "Скриншот",
+          sizeStr: (file.size / 1024).toFixed(1) + " KB",
+        };
+      };
+      img.src = rawDataUrl;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function handleAttachClick() {
+    if (fileInputEl) fileInputEl.click();
+  }
+
+  function handleFileInputChange(e) {
+    const file = e.target.files?.[0];
+    if (file) {
+      processSelectedImage(file);
+    }
+    e.target.value = "";
+  }
+
+  function handleChatPaste(e) {
+    const items = (e.clipboardData || window.clipboardData)?.items;
+    if (!items) return;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === "file" && item.type.startsWith("image/")) {
+        e.preventDefault();
+        const blob = item.getAsFile();
+        processSelectedImage(blob);
+        return;
+      }
+    }
+  }
+
+  function insertPoopEmoji() {
+    if (!chatInputEl) {
+      chatInput += "💩";
+      return;
+    }
+    const start = chatInputEl.selectionStart ?? chatInput.length;
+    const end = chatInputEl.selectionEnd ?? chatInput.length;
+    chatInput = chatInput.slice(0, start) + "💩" + chatInput.slice(end);
+    setTimeout(() => {
+      chatInputEl.focus();
+      chatInputEl.setSelectionRange(start + 2, start + 2);
+    }, 10);
+  }
+
   async function handleSendMessage() {
     const text = chatInput.trim();
-    if (!text) return;
+    if (!text && !attachedImage) return;
+
+    let imgThumb = null;
+    let imgId = null;
+    let fullB64 = null;
+
+    if (attachedImage) {
+      imgId = "img_" + Date.now() + "_" + Math.floor(Math.random() * 100000);
+      imgThumb = attachedImage.thumbDataUrl;
+      const commaIdx = attachedImage.fullDataUrl.indexOf(",");
+      fullB64 = commaIdx >= 0 ? attachedImage.fullDataUrl.slice(commaIdx + 1) : attachedImage.fullDataUrl;
+    }
+
+    const textToSend = text;
     chatInput = "";
+    attachedImage = null;
 
     // Instant optimistic UI update (0ms delay!)
     const optimisticMsg = {
       id: Date.now() + Math.random(),
       sender: nickname.trim() || "Я",
-      text,
+      text: textToSend,
       timestamp_ms: Date.now(),
       is_me: true,
+      image_thumb: imgThumb,
+      image_id: imgId,
     };
     chatMessages = [...chatMessages, optimisticMsg];
     scrollToChatBottom();
 
     try {
       await invoke("send_chat_message", {
-        text,
+        text: textToSend,
         nickname: nickname.trim() || "Я",
+        imageThumb: imgThumb,
+        imageId: imgId,
+        fullImageBase64: fullB64,
       });
       const updated = await invoke("get_chat_messages");
       chatMessages = updated;
@@ -594,26 +723,91 @@
     }
   }
 
-  
-  function handleChatPaste(e) {
-    const items = (e.clipboardData || e.originalEvent.clipboardData).items;
-    for (let index in items) {
-      const item = items[index];
-      if (item.kind === 'file' && item.type.startsWith('image/')) {
-        const blob = item.getAsFile();
-        const reader = new FileReader();
-        reader.onload = (event) => {
-          chatInput = event.target.result; // Data URL
-        };
-        reader.readAsDataURL(blob);
-      }
-    }
-  }
-
   function handleChatKeyDown(e) {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSendMessage();
+    }
+  }
+
+  async function openLightbox(msg) {
+    if (!msg.image_thumb && !msg.image_id) return;
+
+    lightboxImage = {
+      url: msg.image_thumb,
+      sender: msg.sender,
+      time: new Date(msg.timestamp_ms).toLocaleTimeString(),
+      id: msg.image_id,
+      loading: true,
+    };
+
+    if (!msg.image_id) {
+      lightboxImage.loading = false;
+      return;
+    }
+
+    try {
+      const cachedB64 = await invoke("get_cached_image", { imageId: msg.image_id });
+      if (cachedB64) {
+        lightboxImage.url = "data:image/jpeg;base64," + cachedB64;
+        lightboxImage.loading = false;
+        return;
+      }
+    } catch (e) {
+      console.error("Get cached image error:", e);
+    }
+
+    try {
+      await invoke("request_full_image", { imageId: msg.image_id });
+    } catch (e) {
+      console.error("Request full image error:", e);
+    }
+
+    if (lightboxPollTimer) clearInterval(lightboxPollTimer);
+    let attempts = 0;
+    lightboxPollTimer = setInterval(async () => {
+      attempts++;
+      if (!lightboxImage || attempts > 50) {
+        clearInterval(lightboxPollTimer);
+        if (lightboxImage) lightboxImage.loading = false;
+        return;
+      }
+      try {
+        const cachedB64 = await invoke("get_cached_image", { imageId: msg.image_id });
+        if (cachedB64) {
+          clearInterval(lightboxPollTimer);
+          if (lightboxImage) {
+            lightboxImage.url = "data:image/jpeg;base64," + cachedB64;
+            lightboxImage.loading = false;
+          }
+        }
+      } catch (e) {
+        console.error("Poll full image error:", e);
+      }
+    }, 200);
+  }
+
+  function closeLightbox() {
+    lightboxImage = null;
+    if (lightboxPollTimer) {
+      clearInterval(lightboxPollTimer);
+      lightboxPollTimer = null;
+    }
+  }
+
+  function downloadCurrentImage() {
+    if (!lightboxImage?.url) return;
+    const a = document.createElement("a");
+    a.href = lightboxImage.url;
+    a.download = `balabol_${lightboxImage.id || "image"}.jpg`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  function handleWindowKeyDown(e) {
+    if (e.key === "Escape" && lightboxImage) {
+      closeLightbox();
     }
   }
 
@@ -640,6 +834,8 @@
     }, 2000);
   }
 </script>
+
+<svelte:window on:keydown={handleWindowKeyDown} />
 
 <!-- Hidden Offscreen Canvas for Video Frame Encoding -->
 <canvas bind:this={canvasEl} class="hidden"></canvas>
@@ -1565,7 +1761,32 @@
                             ? 'bg-blue-600 text-white rounded-tr-none'
                             : 'bg-[#222530] text-[#e0e2e8] border border-[#2d303e] rounded-tl-none'}"
                         >
-                          {msg.text}
+                          {#if msg.image_thumb}
+                            <button
+                              type="button"
+                              class="my-1 block relative group cursor-pointer overflow-hidden rounded-xl border border-white/10 text-left"
+                              on:click={() => openLightbox(msg)}
+                              title="Нажмите для увеличения"
+                            >
+                              <img
+                                src={msg.image_thumb}
+                                alt="Изображение"
+                                class="max-h-44 max-w-full rounded-xl object-contain bg-black/40 transition group-hover:scale-[1.02]"
+                                loading="lazy"
+                              />
+                              <div
+                                class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition flex items-center justify-center gap-1.5 text-[11px] font-medium text-white"
+                              >
+                                <Maximize2 class="w-3.5 h-3.5 text-blue-400" />
+                                <span>Увеличить</span>
+                              </div>
+                            </button>
+                          {/if}
+                          {#if msg.text}
+                            <div class="{msg.image_thumb ? 'mt-1' : ''}">
+                              {msg.text}
+                            </div>
+                          {/if}
                         </div>
                       </div>
                     {/each}
@@ -1573,25 +1794,84 @@
                 </div>
 
                 <!-- Chat Input Area -->
-                <div
-                  class="p-2.5 bg-[#13141a] border-t border-[#262832] flex items-center gap-2"
-                >
-                  <input
-                    type="text"
-                    bind:value={chatInput}
-                    on:keydown={handleChatKeyDown}
-                    on:paste={handleChatPaste}
-                    placeholder="Сообщение..."
-                    class="flex-1 bg-[#1a1c24] border border-[#2b2d38] rounded-xl px-3 py-2 text-xs text-white placeholder-[#555866] focus:outline-none focus:border-blue-500 transition"
-                  />
-                  <button
-                    on:click={handleSendMessage}
-                    disabled={!chatInput.trim()}
-                    class="p-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white rounded-xl transition shadow-md shadow-blue-600/20"
-                    title="Отправить"
-                  >
-                    <Send class="w-4 h-4" />
-                  </button>
+                <div class="bg-[#13141a] border-t border-[#262832] flex flex-col">
+                  <!-- Attached Image Preview Chip -->
+                  {#if attachedImage}
+                    <div class="px-3 py-2 bg-[#1b1d26] border-b border-[#262832] flex items-center justify-between text-xs animate-fadeIn">
+                      <div class="flex items-center gap-2.5 overflow-hidden">
+                        <img
+                          src={attachedImage.thumbDataUrl}
+                          alt="Превью вложения"
+                          class="w-10 h-10 object-cover rounded-lg border border-white/10 shrink-0"
+                        />
+                        <div class="truncate">
+                          <div class="font-semibold text-white truncate max-w-[200px]">{attachedImage.name}</div>
+                          <div class="text-[10px] text-[#707482]">{attachedImage.sizeStr} • Готово к отправке</div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        on:click={() => (attachedImage = null)}
+                        class="p-1 hover:bg-white/10 rounded-full text-[#8a8e98] hover:text-white transition cursor-pointer"
+                        title="Удалить прикрепленное изображение"
+                      >
+                        <X class="w-4 h-4" />
+                      </button>
+                    </div>
+                  {/if}
+
+                  <div class="p-2.5 flex items-center gap-1.5">
+                    <!-- Hidden file input for images -->
+                    <input
+                      type="file"
+                      accept="image/*"
+                      bind:this={fileInputEl}
+                      on:change={handleFileInputChange}
+                      class="hidden"
+                    />
+
+                    <!-- Paperclip Button for picking images -->
+                    <button
+                      type="button"
+                      on:click={handleAttachClick}
+                      class="p-2 rounded-xl bg-[#1e202a] hover:bg-[#282b38] text-[#9a9ea8] hover:text-white transition cursor-pointer shrink-0"
+                      title="Выбрать изображение с диска (📎)"
+                    >
+                      <Paperclip class="w-4 h-4" />
+                    </button>
+
+                    <!-- Poop Emoji Button -->
+                    <button
+                      type="button"
+                      on:click={insertPoopEmoji}
+                      class="p-1 px-2 rounded-xl bg-[#1e202a] hover:bg-[#282b38] text-base hover:scale-110 active:scale-95 transition cursor-pointer shrink-0 select-none"
+                      title="Вставить 💩"
+                    >
+                      💩
+                    </button>
+
+                    <!-- Text Input -->
+                    <input
+                      type="text"
+                      bind:this={chatInputEl}
+                      bind:value={chatInput}
+                      on:keydown={handleChatKeyDown}
+                      on:paste={handleChatPaste}
+                      placeholder={attachedImage ? "Добавьте подпись (Enter для отправки)..." : "Сообщение..."}
+                      class="flex-1 bg-[#1a1c24] border border-[#2b2d38] rounded-xl px-3 py-2 text-xs text-white placeholder-[#555866] focus:outline-none focus:border-blue-500 transition"
+                    />
+
+                    <!-- Send Button -->
+                    <button
+                      type="button"
+                      on:click={handleSendMessage}
+                      disabled={!chatInput.trim() && !attachedImage}
+                      class="p-2 bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white rounded-xl transition shadow-md shadow-blue-600/20 cursor-pointer shrink-0"
+                      title="Отправить (Enter)"
+                    >
+                      <Send class="w-4 h-4" />
+                    </button>
+                  </div>
                 </div>
               </div>
             {/if}
@@ -2066,6 +2346,70 @@
             Готово
           </button>
         </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- Lightbox Modal for Fullscreen Image Viewing -->
+  {#if lightboxImage}
+    <div
+      class="fixed inset-0 bg-black/90 backdrop-blur-md flex flex-col items-center justify-between p-4 z-50 animate-fadeIn"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Просмотр изображения"
+      tabindex="-1"
+      on:click|self={closeLightbox}
+    >
+      <!-- Top header bar -->
+      <div class="w-full max-w-5xl flex items-center justify-between py-2 text-xs text-white/80">
+        <div class="flex items-center gap-2">
+          <span class="font-bold text-white">{lightboxImage.sender}</span>
+          <span class="text-white/40">•</span>
+          <span class="text-white/60">{lightboxImage.time}</span>
+          {#if lightboxImage.loading}
+            <span class="bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[10px] px-2 py-0.5 rounded-full flex items-center gap-1.5 ml-2">
+              <RefreshCw class="w-3 h-3 animate-spin" />
+              <span>Загрузка оригинала...</span>
+            </span>
+          {/if}
+        </div>
+        <div class="flex items-center gap-2">
+          <button
+            type="button"
+            on:click={downloadCurrentImage}
+            class="p-2 rounded-xl bg-white/10 hover:bg-white/20 text-white flex items-center gap-1.5 px-3 transition cursor-pointer text-xs font-semibold"
+            title="Скачать изображение"
+          >
+            <Download class="w-4 h-4 text-emerald-400" />
+            <span>Скачать</span>
+          </button>
+          <button
+            type="button"
+            on:click={closeLightbox}
+            class="p-2 rounded-xl bg-white/10 hover:bg-red-500/40 text-white transition cursor-pointer"
+            title="Закрыть (Esc)"
+          >
+            <X class="w-5 h-5" />
+          </button>
+        </div>
+      </div>
+
+      <!-- Center image area -->
+      <div
+        class="flex-1 flex items-center justify-center p-2 max-w-full max-h-[82vh] overflow-hidden"
+        role="presentation"
+        on:click|self={closeLightbox}
+      >
+        <img
+          src={lightboxImage.url}
+          alt="Просмотр изображения"
+          class="max-w-full max-h-[80vh] rounded-2xl object-contain shadow-2xl border border-white/10 transition"
+        />
+      </div>
+
+      <!-- Bottom hints -->
+      <div class="text-[11px] text-white/40 pb-2">
+        Нажмите <kbd class="px-1.5 py-0.5 bg-white/10 rounded text-white/70 font-mono text-[10px]">Esc</kbd> или кликните за пределами изображения, чтобы закрыть
       </div>
     </div>
   {/if}

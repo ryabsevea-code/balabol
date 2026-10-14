@@ -36,9 +36,31 @@ async fn join_room(
 async fn send_chat_message(
     text: String,
     nickname: String,
+    image_thumb: Option<String>,
+    image_id: Option<String>,
+    full_image_base64: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<ChatMessage, String> {
-    state.node.send_chat_message(text, nickname).await
+    state
+        .node
+        .send_chat_message(text, nickname, image_thumb, image_id, full_image_base64)
+        .await
+}
+
+#[tauri::command]
+async fn request_full_image(image_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state.node.request_full_image(image_id).await
+}
+
+#[tauri::command]
+fn get_cached_image(image_id: String, state: State<'_, AppState>) -> Option<String> {
+    state.node.get_cached_image(&image_id)
+}
+
+#[tauri::command]
+async fn request_history(state: State<'_, AppState>) -> Result<(), String> {
+    state.node.request_history().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -208,6 +230,9 @@ pub fn run() {
             send_media_state,
             transfer_host,
             set_nickname,
+            request_full_image,
+            get_cached_image,
+            request_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
