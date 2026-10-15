@@ -6,7 +6,7 @@ pub mod screen_capture;
 mod signaling;
 
 use logger::AppLogger;
-use p2p::{ChatMessage, ConnectionStatus, P2pNode, PeerInfo, RemoteVideoFrame, VoiceStatus};
+use p2p::{ChatMessage, ConnectionStatus, P2pNode, PeerInfo, RemoteVideoFrame, SignalingStatus, VoiceStatus};
 use std::sync::Arc;
 use tauri::State;
 
@@ -83,6 +83,16 @@ fn get_status(state: State<'_, AppState>) -> ConnectionStatus {
 #[tauri::command]
 fn get_peers(state: State<'_, AppState>) -> Vec<PeerInfo> {
     state.node.get_peers()
+}
+
+#[tauri::command]
+fn get_signaling_status(state: State<'_, AppState>) -> SignalingStatus {
+    state.node.get_signaling_status()
+}
+
+#[tauri::command]
+fn reopen_signaling(state: State<'_, AppState>) -> Result<(), String> {
+    state.node.reopen_signaling()
 }
 
 #[tauri::command]
@@ -231,6 +241,8 @@ pub fn run() {
             disconnect,
             get_status,
             get_peers,
+            get_signaling_status,
+            reopen_signaling,
             get_logs,
             get_log_file_path,
             set_mic_muted,

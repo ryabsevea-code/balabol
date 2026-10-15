@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
@@ -15,11 +15,13 @@ pub const PROTOCOL_VERSION: u32 = 4;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Packet {
     Punch {
+        room_code: String,
         nonce: u64,
         sender_name: String,
         sender_id: u32,
     },
     PunchAck {
+        room_code: String,
         nonce: u64,
         sender_name: String,
         sender_id: u32,
@@ -119,6 +121,12 @@ pub enum Packet {
     NicknameUpdate {
         sender_id: u32,
         new_nickname: String,
+    },
+    PeerIntroduce {
+        room_code: String,
+        peer_id: u32,
+        peer_name: String,
+        endpoints: Vec<SocketAddr>,
     },
 }
 
@@ -233,6 +241,14 @@ pub enum ConnectionStatus {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalingStatus {
+    pub is_open: bool,
+    pub is_waiting_first_peer: bool,
+    pub remaining_seconds: u32,
+}
+
+
 #[derive(Debug, Clone)]
 pub struct ImageReassembler {
     pub chunk_total: u32,
@@ -263,6 +279,29 @@ impl ImageReassembler {
             }
         }
         None
+    }
+}
+
+fn get_cache_file_path() -> std::path::PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("balabol_room_cache.json")
+}
+
+pub fn load_room_peer_cache() -> HashMap<String, HashSet<SocketAddr>> {
+    let path = get_cache_file_path();
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(map) = serde_json::from_slice::<HashMap<String, HashSet<SocketAddr>>>(&bytes) {
+            return map;
+        }
+    }
+    HashMap::new()
+}
+
+pub fn save_room_peer_cache(cache: &HashMap<String, HashSet<SocketAddr>>) {
+    let path = get_cache_file_path();
+    if let Ok(json) = serde_json::to_vec_pretty(cache) {
+        let _ = std::fs::write(&path, json);
     }
 }
 
@@ -300,6 +339,9 @@ pub struct P2pNode {
     pub video_frame_callback: Arc<RwLock<Option<Box<dyn Fn(RemoteVideoFrame) + Send + Sync>>>>,
     pub screen_capturer: Arc<crate::screen_capture::ScreenCapturer>,
     pub is_screen_sharing: Arc<AtomicBool>,
+    pub room_peer_cache: Arc<RwLock<HashMap<String, HashSet<SocketAddr>>>>,
+    pub signaling_until_ms: Arc<AtomicU64>,
+    pub reopen_signaling_requested: Arc<AtomicBool>,
 }
 
 impl P2pNode {
@@ -337,6 +379,40 @@ impl P2pNode {
             video_frame_callback: Arc::new(RwLock::new(None)),
             screen_capturer: Arc::new(crate::screen_capture::ScreenCapturer::new()),
             is_screen_sharing: Arc::new(AtomicBool::new(false)),
+            room_peer_cache: Arc::new(RwLock::new(load_room_peer_cache())),
+            signaling_until_ms: Arc::new(AtomicU64::new(0)),
+            reopen_signaling_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn get_known_endpoints_for_room(&self, clean_code: &str) -> Vec<SocketAddr> {
+        let cache = self.room_peer_cache.read();
+        cache
+            .get(clean_code)
+            .cloned()
+            .map(|s| s.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn record_room_peer_endpoints(&self, clean_code: &str, endpoints: &[SocketAddr]) {
+        if clean_code.is_empty() {
+            return;
+        }
+        let mut modified = false;
+        {
+            let mut cache = self.room_peer_cache.write();
+            let set = cache.entry(clean_code.to_string()).or_insert_with(HashSet::new);
+            for &ep in endpoints {
+                if !ep.ip().is_loopback() && !ep.ip().is_unspecified() {
+                    if set.insert(ep) {
+                        modified = true;
+                    }
+                }
+            }
+        }
+        if modified {
+            let cache_clone = self.room_peer_cache.read().clone();
+            save_room_peer_cache(&cache_clone);
         }
     }
 
@@ -360,6 +436,54 @@ impl P2pNode {
         self.chat_messages.read().clone()
     }
 
+    pub fn get_signaling_status(&self) -> SignalingStatus {
+        if self.current_room_code.read().is_none() {
+            return SignalingStatus {
+                is_open: false,
+                is_waiting_first_peer: false,
+                remaining_seconds: 0,
+            };
+        }
+        let until = self.signaling_until_ms.load(Ordering::SeqCst);
+        if until == u64::MAX {
+            SignalingStatus {
+                is_open: true,
+                is_waiting_first_peer: true,
+                remaining_seconds: 300,
+            }
+        } else {
+            let now = now_ms();
+            if until > now {
+                let rem = ((until - now) / 1000) as u32;
+                SignalingStatus {
+                    is_open: true,
+                    is_waiting_first_peer: false,
+                    remaining_seconds: rem,
+                }
+            } else {
+                SignalingStatus {
+                    is_open: false,
+                    is_waiting_first_peer: false,
+                    remaining_seconds: 0,
+                }
+            }
+        }
+    }
+
+    pub fn reopen_signaling(&self) -> Result<(), String> {
+        if self.current_room_code.read().is_none() {
+            return Err("Узел не находится в комнате".into());
+        }
+        self.reopen_signaling_requested.store(true, Ordering::SeqCst);
+        let my_name = self.my_nickname.read().clone();
+        let sys_msg = format!("🔓 {} открыл(а) комнату на 5 минут для подключения новых участников", my_name);
+        let node_clone = self.clone();
+        tokio::spawn(async move {
+            let _ = node_clone.send_chat_message(sys_msg, "Система".into(), None, None, None).await;
+        });
+        Ok(())
+    }
+
     pub fn disconnect(&self) {
         if let Some(handle) = self.session_abort.write().take() {
             handle.abort();
@@ -369,7 +493,7 @@ impl P2pNode {
         let my_id = self.my_peer_id.load(Ordering::Relaxed);
         let disc = Packet::Disconnect {
             sender_id: my_id,
-            reason: "РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РІС‹С€РµР» РёР· РєРѕРјРЅР°С‚С‹".into(),
+            reason: "Пользователь вышел из комнаты".into(),
         };
 
         if let Ok(bytes) = disc.encode() {
@@ -406,9 +530,11 @@ impl P2pNode {
         self.seen_msg_ids.write().clear();
         self.pending_acks.write().clear();
         self.is_host.store(false, Ordering::SeqCst);
+        self.signaling_until_ms.store(0, Ordering::SeqCst);
+        self.reopen_signaling_requested.store(false, Ordering::SeqCst);
         *self.current_room_code.write() = None;
         *self.status.write() = ConnectionStatus::Disconnected;
-        self.logger.info("РЎРѕСЃС‚РѕСЏРЅРёРµ СЃР±СЂРѕС€РµРЅРѕ РІ Disconnected");
+        self.logger.info("Состояние сброшено в Disconnected");
     }
 
     pub fn set_mic_muted(&self, muted: bool) {
@@ -847,16 +973,16 @@ impl P2pNode {
         let session_id = format!("{:08x}", rand::random::<u32>());
         let my_nonce = rand::random::<u64>();
 
+        let is_creator = self.is_host.load(Ordering::SeqCst);
         self.my_peer_id.store(my_id, Ordering::SeqCst);
         *self.my_nickname.write() = nickname.clone();
-        self.is_host.store(false, Ordering::SeqCst);
         self.current_host_id.store(my_id, Ordering::SeqCst);
         *self.backup_host_id.write() = None;
         *self.current_room_code.write() = Some(clean_code.clone());
 
         *self.status.write() = ConnectionStatus::Connected {
             my_id,
-            is_host: false,
+            is_host: is_creator,
             host_name: "P2P Full Mesh".into(),
             peer_name: "Комната".into(),
             peer_addr: pub_str.clone().or(local_str.clone()).unwrap_or_default(),
@@ -883,18 +1009,20 @@ impl P2pNode {
             nonce: my_nonce,
         };
 
-        let mesh_signaling = crate::signaling::Signaling::start_mesh_session(&clean_code, my_announce, &self.logger).await?;
+        let mesh_signaling = crate::signaling::Signaling::start_mesh_session(&clean_code, my_announce.clone(), &self.logger).await?;
 
         // 5. Spawn Full Mesh peer communication loop (pure direct UDP P2P)
         let node_clone = self.clone();
         let code_for_task = clean_code.clone();
 
+        let my_announce_task = my_announce.clone();
         let task = tokio::spawn(async move {
             run_mesh_peer_loop(
                 arc_socket,
                 mesh_signaling,
                 code_for_task,
                 node_clone,
+                my_announce_task,
             ).await;
         });
 
@@ -908,6 +1036,7 @@ impl P2pNode {
         room_code: String,
         nickname: String,
     ) -> Result<String, String> {
+        self.is_host.store(true, Ordering::SeqCst);
         self.connect_mesh(room_code, nickname).await
     }
 
@@ -917,6 +1046,7 @@ impl P2pNode {
         room_code: String,
         nickname: String,
     ) -> Result<(), String> {
+        self.is_host.store(false, Ordering::SeqCst);
         self.connect_mesh(room_code, nickname).await.map(|_| ())
     }
 }
@@ -924,9 +1054,10 @@ impl P2pNode {
 /// Full Mesh P2P Loop: fully symmetric communication between all peers over direct UDP
 async fn run_mesh_peer_loop(
     socket: Arc<UdpSocket>,
-    mut mesh_signaling: crate::signaling::MeshSignalingSession,
+    mesh_signaling: crate::signaling::MeshSignalingSession,
     room_code: String,
     node: P2pNode,
+    my_announce: crate::signaling::MeshAnnounce,
 ) {
     node.logger.info("============================================================");
     node.logger.info(&format!("FULL MESH P2P УЗЕЛ АКТИВЕН ДЛЯ КОМНАТЫ '{}'", room_code));
@@ -936,12 +1067,53 @@ async fn run_mesh_peer_loop(
     let mut video_reassemblers: HashMap<u32, VideoReassembler> = HashMap::new();
     let mut last_ping_broadcast = Instant::now();
     let mut last_cleanup = Instant::now();
+    let mut last_known_punch = Instant::now();
     let mut ping_seq = 0u64;
 
     // Discovered remote peers' candidates: peer_id -> Vec<SocketAddr>
     let mut discovered_candidates: HashMap<u32, Vec<SocketAddr>> = HashMap::new();
     let mut discovered_sessions: HashMap<u32, String> = HashMap::new();
     let mut last_punch_attempt: HashMap<u32, Instant> = HashMap::new();
+
+    // 1. Signaling lifetime management:
+    // While the creator sits alone in the room, signaling runs indefinitely.
+    // Once someone joins (peers.len() > 0), signaling runs for 5 more minutes, then closes WSS.
+    let mut mesh_signaling: Option<crate::signaling::MeshSignalingSession> = Some(mesh_signaling);
+    let mut first_peer_joined_at: Option<Instant> = None;
+    let mut signaling_closed = false;
+
+    if node.peers.read().is_empty() {
+        node.signaling_until_ms.store(u64::MAX, Ordering::SeqCst);
+    } else {
+        node.signaling_until_ms.store(now_ms() + 300_000, Ordering::SeqCst);
+    }
+
+    // 2. Preload known interlocutors from room memory
+    let known_room_addrs = node.get_known_endpoints_for_room(&room_code);
+    let mut known_unconnected_addrs: HashSet<SocketAddr> = HashSet::new();
+    if !known_room_addrs.is_empty() {
+        node.logger.info(&format!(
+            "🧠 [Память комнаты '{}'] Найдено {} ранее известных адресов собеседников. Запуск прямого P2P опроса...",
+            room_code,
+            known_room_addrs.len()
+        ));
+        for target in expand_candidates_with_port_spray(&known_room_addrs) {
+            known_unconnected_addrs.insert(target);
+        }
+        let my_id = node.my_peer_id.load(Ordering::Relaxed);
+        let my_name = node.my_nickname.read().clone();
+        let punch_pkt = Packet::Punch {
+            room_code: room_code.clone(),
+            nonce: rand::random(),
+            sender_name: my_name,
+            sender_id: my_id,
+        };
+        if let Ok(pb) = punch_pkt.encode() {
+            for target in &known_unconnected_addrs {
+                let _ = socket.send_to(&pb, *target).await;
+            }
+        }
+    }
 
     // Background History Sync on room join
     let node_history = node.clone();
@@ -989,48 +1161,102 @@ async fn run_mesh_peer_loop(
         let my_id = node.my_peer_id.load(Ordering::Relaxed);
         let my_name = node.my_nickname.read().clone();
 
-        // 1. Process incoming peer announcements from Nostr signaling (room creation / discovery only)
-        while let Ok(ann) = mesh_signaling.incoming_announces.try_recv() {
-            if ann.peer_id == my_id {
-                continue;
+        // Check if user requested to reopen/extend signaling from UI
+        if node.reopen_signaling_requested.swap(false, Ordering::SeqCst) {
+            first_peer_joined_at = Some(Instant::now());
+            signaling_closed = false;
+            node.signaling_until_ms.store(now_ms() + 300_000, Ordering::SeqCst);
+            if mesh_signaling.is_none() {
+                match crate::signaling::Signaling::start_mesh_session(&room_code, my_announce.clone(), &node.logger).await {
+                    Ok(new_sig) => {
+                        mesh_signaling = Some(new_sig);
+                        node.logger.info("🔓 [Nostr] Сигналинг комнаты снова открыт на 5 минут для входа новых участников.");
+                    }
+                    Err(e) => {
+                        node.logger.error(&format!("Не удалось перезапустить сигналинг: {}", e));
+                    }
+                }
+            } else {
+                node.logger.info("⏳ [Nostr] Окно сигналинга продлено еще на 5 минут.");
             }
+        }
 
-            // Detect if peer reconnected with a new session
-            let prev_session = discovered_sessions.insert(ann.peer_id, ann.session_id.clone());
-            if let Some(prev) = prev_session {
-                if prev != ann.session_id {
+        // Manage Signaling Lifecycle: 5 minutes after first participant joins
+        let active_peers_count = node.peers.read().len();
+        if active_peers_count > 0 && first_peer_joined_at.is_none() {
+            first_peer_joined_at = Some(Instant::now());
+            node.signaling_until_ms.store(now_ms() + 300_000, Ordering::SeqCst);
+            node.logger.info(&format!(
+                "🔔 В комнату '{}' подключился участник. Сигналинг через WSS активен еще 5 минут для подключения остальных гостей, после чего комната закроется для новых подключений по коду.",
+                room_code
+            ));
+        }
+
+        if !signaling_closed {
+            if let Some(joined_time) = first_peer_joined_at {
+                if joined_time.elapsed() >= Duration::from_secs(300) {
+                    signaling_closed = true;
+                    node.signaling_until_ms.store(0, Ordering::SeqCst);
+                    if let Some(sig) = mesh_signaling.take() {
+                        sig.stop();
+                        drop(sig);
+                    }
                     node.logger.info(&format!(
-                        "Пир {} ('{}') переподключился (новая сессия {}). Сброс аудио-последовательности.",
-                        ann.peer_id, ann.peer_name, ann.session_id
+                        "🔒 Сигналинг комнаты '{}' закрыт (прошло 5 минут после первого подключения). WSS релеи отключены. Новые участники по коду зайти не смогут.",
+                        room_code
                     ));
-                    node.audio_engine.reset_peer_sequence(ann.peer_id);
                 }
             }
+        }
 
-            let candidates = expand_candidates_with_port_spray(&ann.candidates);
-            discovered_candidates.insert(ann.peer_id, candidates.clone());
+        // 1. Process incoming peer announcements from Nostr signaling (if signaling is active)
+        if let Some(ref mut sig) = mesh_signaling {
+            while let Ok(ann) = sig.incoming_announces.try_recv() {
+                if ann.peer_id == my_id {
+                    continue;
+                }
 
-            let already_connected = node.client_endpoints.read().contains_key(&ann.peer_id);
-            let punch_needed = !already_connected
-                && last_punch_attempt
-                    .get(&ann.peer_id)
-                    .map(|t| t.elapsed() > Duration::from_secs(2))
-                    .unwrap_or(true);
+                // Record known candidates into room peer memory
+                node.record_room_peer_endpoints(&room_code, &ann.candidates);
 
-            if punch_needed {
-                last_punch_attempt.insert(ann.peer_id, Instant::now());
-                node.logger.info(&format!(
-                    "🥊 [NAT Punch] Отправка Punch пакетов пиру {} ('{}') на {} адресов...",
-                    ann.peer_id, ann.peer_name, candidates.len()
-                ));
-                let punch_pkt = Packet::Punch {
-                    nonce: ann.nonce,
-                    sender_name: my_name.clone(),
-                    sender_id: my_id,
-                };
-                if let Ok(pb) = punch_pkt.encode() {
-                    for target in &candidates {
-                        let _ = socket.send_to(&pb, *target).await;
+                // Detect if peer reconnected with a new session
+                let prev_session = discovered_sessions.insert(ann.peer_id, ann.session_id.clone());
+                if let Some(prev) = prev_session {
+                    if prev != ann.session_id {
+                        node.logger.info(&format!(
+                            "Пир {} ('{}') переподключился (новая сессия {}). Сброс аудио-последовательности.",
+                            ann.peer_id, ann.peer_name, ann.session_id
+                        ));
+                        node.audio_engine.reset_peer_sequence(ann.peer_id);
+                    }
+                }
+
+                let candidates = expand_candidates_with_port_spray(&ann.candidates);
+                discovered_candidates.insert(ann.peer_id, candidates.clone());
+
+                let already_connected = node.client_endpoints.read().contains_key(&ann.peer_id);
+                let punch_needed = !already_connected
+                    && last_punch_attempt
+                        .get(&ann.peer_id)
+                        .map(|t| t.elapsed() > Duration::from_secs(2))
+                        .unwrap_or(true);
+
+                if punch_needed {
+                    last_punch_attempt.insert(ann.peer_id, Instant::now());
+                    node.logger.info(&format!(
+                        "🥊 [NAT Punch] Отправка Punch пакетов пиру {} ('{}') на {} адресов...",
+                        ann.peer_id, ann.peer_name, candidates.len()
+                    ));
+                    let punch_pkt = Packet::Punch {
+                        room_code: room_code.clone(),
+                        nonce: ann.nonce,
+                        sender_name: my_name.clone(),
+                        sender_id: my_id,
+                    };
+                    if let Ok(pb) = punch_pkt.encode() {
+                        for target in &candidates {
+                            let _ = socket.send_to(&pb, *target).await;
+                        }
                     }
                 }
             }
@@ -1046,6 +1272,7 @@ async fn run_mesh_peer_loop(
                 if should_try {
                     last_punch_attempt.insert(pid, Instant::now());
                     let punch_pkt = Packet::Punch {
+                        room_code: room_code.clone(),
                         nonce: rand::random(),
                         sender_name: my_name.clone(),
                         sender_id: my_id,
@@ -1054,6 +1281,27 @@ async fn run_mesh_peer_loop(
                         for &target in cands {
                             let _ = socket.send_to(&pb, target).await;
                         }
+                    }
+                }
+            }
+        }
+
+        // 2b. Periodic Punch retry for remembered interlocutors from room memory
+        if !known_unconnected_addrs.is_empty() {
+            let current_connected: HashSet<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
+            known_unconnected_addrs.retain(|addr| !current_connected.contains(addr));
+
+            if last_known_punch.elapsed() >= Duration::from_millis(2000) && !known_unconnected_addrs.is_empty() {
+                last_known_punch = Instant::now();
+                let punch_pkt = Packet::Punch {
+                    room_code: room_code.clone(),
+                    nonce: rand::random(),
+                    sender_name: my_name.clone(),
+                    sender_id: my_id,
+                };
+                if let Ok(pb) = punch_pkt.encode() {
+                    for target in &known_unconnected_addrs {
+                        let _ = socket.send_to(&pb, *target).await;
                     }
                 }
             }
@@ -1095,6 +1343,8 @@ async fn run_mesh_peer_loop(
                     let opt_addr = node.client_endpoints.write().remove(&pid);
                     if let Some(addr) = opt_addr {
                         node.peer_addrs.write().remove(&addr);
+                        // Retain endpoint in known_unconnected_addrs so auto-reconnection can recover connection
+                        known_unconnected_addrs.insert(addr);
                     }
                     node.peers.write().remove(&pid);
                     discovered_candidates.remove(&pid);
@@ -1138,8 +1388,78 @@ async fn run_mesh_peer_loop(
         }
     }
 
+    if let Some(sig) = mesh_signaling.take() {
+        sig.stop();
+    }
     audio_tx_task.abort();
     node.audio_engine.stop();
+}
+
+async fn perform_peer_exchange(
+    node: &P2pNode,
+    socket: &Arc<UdpSocket>,
+    room_code: &str,
+    newcomer_id: u32,
+    newcomer_name: &str,
+    newcomer_addr: SocketAddr,
+) {
+    if room_code.is_empty() {
+        return;
+    }
+
+    let my_id = node.my_peer_id.load(Ordering::Relaxed);
+    let existing_peers: Vec<(u32, String, SocketAddr)> = {
+        let endpoints = node.client_endpoints.read();
+        let peers = node.peers.read();
+        endpoints
+            .iter()
+            .filter(|(&pid, _)| pid != newcomer_id && pid != my_id)
+            .map(|(&pid, &addr)| {
+                let name = peers
+                    .get(&pid)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| format!("Peer-{}", pid));
+                (pid, name, addr)
+            })
+            .collect()
+    };
+
+    if existing_peers.is_empty() {
+        return;
+    }
+
+    node.logger.info(&format!(
+        "🤝 [Peer Exchange] Новый пир {} ('{}') подключился. Знакомим его с {} активными участниками...",
+        newcomer_id, newcomer_name, existing_peers.len()
+    ));
+
+    for (existing_id, existing_name, existing_addr) in existing_peers {
+        // 1. Introduce existing peer to newcomer
+        let intro_to_newcomer = Packet::PeerIntroduce {
+            room_code: room_code.to_string(),
+            peer_id: existing_id,
+            peer_name: existing_name.clone(),
+            endpoints: vec![existing_addr],
+        };
+        if let Ok(b) = intro_to_newcomer.encode() {
+            for _ in 0..2 {
+                let _ = socket.send_to(&b, newcomer_addr).await;
+            }
+        }
+
+        // 2. Introduce newcomer to existing peer
+        let intro_to_existing = Packet::PeerIntroduce {
+            room_code: room_code.to_string(),
+            peer_id: newcomer_id,
+            peer_name: newcomer_name.to_string(),
+            endpoints: vec![newcomer_addr],
+        };
+        if let Ok(b) = intro_to_existing.encode() {
+            for _ in 0..2 {
+                let _ = socket.send_to(&b, existing_addr).await;
+            }
+        }
+    }
 }
 
 async fn handle_mesh_packet(
@@ -1155,12 +1475,22 @@ async fn handle_mesh_packet(
     let my_name = node.my_nickname.read().clone();
 
     match packet {
-        Packet::Punch { nonce, sender_name, sender_id } => {
+        Packet::Punch { room_code, nonce, sender_name, sender_id } => {
             if sender_id == my_id {
                 return;
             }
 
+            let current_code = node.current_room_code.read().clone().unwrap_or_default();
+            if !current_code.is_empty() && room_code != current_code {
+                node.logger.warn(&format!(
+                    "🥊 [NAT Punch] Отклонен Punch от {} (код комнаты '{}' != '{}')",
+                    sender_addr, room_code, current_code
+                ));
+                return;
+            }
+
             let ack = Packet::PunchAck {
+                room_code: current_code.clone(),
                 nonce,
                 sender_name: my_name.clone(),
                 sender_id: my_id,
@@ -1171,6 +1501,8 @@ async fn handle_mesh_packet(
                     let _ = socket.send_to(&b, sender_addr).await;
                 }
             }
+
+            node.record_room_peer_endpoints(&current_code, &[sender_addr]);
 
             let is_new = !node.client_endpoints.read().contains_key(&sender_id);
             node.client_endpoints.write().insert(sender_id, sender_addr);
@@ -1204,18 +1536,32 @@ async fn handle_mesh_packet(
                     sender_id, sender_name, sender_addr
                 ));
                 node.audio_engine.play_connect_chime();
-                let cnt = node.peers.read().len();
-                let mut st = node.status.write();
-                if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
-                    *connected_count = cnt;
+                {
+                    let cnt = node.peers.read().len();
+                    let mut st = node.status.write();
+                    if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
+                        *connected_count = cnt;
+                    }
                 }
+                perform_peer_exchange(node, socket, &current_code, sender_id, &sender_name, sender_addr).await;
             }
         }
 
-        Packet::PunchAck { sender_name, sender_id, .. } => {
+        Packet::PunchAck { room_code, sender_name, sender_id, .. } => {
             if sender_id == my_id {
                 return;
             }
+
+            let current_code = node.current_room_code.read().clone().unwrap_or_default();
+            if !current_code.is_empty() && room_code != current_code {
+                node.logger.warn(&format!(
+                    "🥊 [NAT Punch] Отклонен PunchAck от {} (код комнаты '{}' != '{}')",
+                    sender_addr, room_code, current_code
+                ));
+                return;
+            }
+
+            node.record_room_peer_endpoints(&current_code, &[sender_addr]);
 
             let is_new = !node.client_endpoints.read().contains_key(&sender_id);
             node.client_endpoints.write().insert(sender_id, sender_addr);
@@ -1249,11 +1595,14 @@ async fn handle_mesh_packet(
                     sender_id, sender_name, sender_addr
                 ));
                 node.audio_engine.play_connect_chime();
-                let cnt = node.peers.read().len();
-                let mut st = node.status.write();
-                if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
-                    *connected_count = cnt;
+                {
+                    let cnt = node.peers.read().len();
+                    let mut st = node.status.write();
+                    if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
+                        *connected_count = cnt;
+                    }
                 }
+                perform_peer_exchange(node, socket, &current_code, sender_id, &sender_name, sender_addr).await;
             }
         }
 
@@ -1538,6 +1887,52 @@ async fn handle_mesh_packet(
                 let mut st = node.status.write();
                 if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
                     *connected_count = cnt;
+                }
+            }
+        }
+
+        Packet::PeerIntroduce { room_code, peer_id, peer_name, endpoints } => {
+            if peer_id == my_id {
+                return;
+            }
+
+            let current_code = node.current_room_code.read().clone().unwrap_or_default();
+            if !current_code.is_empty() && room_code != current_code {
+                node.logger.warn(&format!(
+                    "🤝 [Peer Exchange] Отклонена рекомендация пира {} (код комнаты '{}' != '{}')",
+                    peer_id, room_code, current_code
+                ));
+                return;
+            }
+
+            // Save newly introduced peer endpoints into persistent room cache
+            node.record_room_peer_endpoints(&current_code, &endpoints);
+
+            // If we are not yet connected to this peer, punch!
+            if !node.client_endpoints.read().contains_key(&peer_id) {
+                let candidates = expand_candidates_with_port_spray(&endpoints);
+                let entry = discovered_candidates.entry(peer_id).or_default();
+                for &c in &candidates {
+                    if !entry.contains(&c) {
+                        entry.push(c);
+                    }
+                }
+
+                node.logger.info(&format!(
+                    "🤝 [Peer Exchange] Получена рекомендация пира {} ('{}') на {} адресов. Запуск прямого NAT Punch...",
+                    peer_id, peer_name, candidates.len()
+                ));
+
+                let punch_pkt = Packet::Punch {
+                    room_code: current_code,
+                    nonce: rand::random(),
+                    sender_name: my_name.clone(),
+                    sender_id: my_id,
+                };
+                if let Ok(pb) = punch_pkt.encode() {
+                    for target in &candidates {
+                        let _ = socket.send_to(&pb, *target).await;
+                    }
                 }
             }
         }
@@ -2188,4 +2583,63 @@ mod tests {
         let b = peer_update.encode().unwrap();
         assert_eq!(Packet::decode(&b).unwrap(), peer_update);
     }
+
+    #[test]
+    fn test_punch_packet_room_code_validation_and_peer_memory() {
+        let punch = Packet::Punch {
+            room_code: "123456".into(),
+            nonce: 42,
+            sender_name: "Bob".into(),
+            sender_id: 100,
+        };
+        let bytes = punch.encode().expect("Punch encode");
+        let decoded = Packet::decode(&bytes).expect("Punch decode");
+        assert_eq!(decoded, punch);
+
+        let punch_ack = Packet::PunchAck {
+            room_code: "123456".into(),
+            nonce: 42,
+            sender_name: "Alice".into(),
+            sender_id: 200,
+        };
+        let ack_bytes = punch_ack.encode().expect("PunchAck encode");
+        let decoded_ack = Packet::decode(&ack_bytes).expect("PunchAck decode");
+        assert_eq!(decoded_ack, punch_ack);
+
+        // Test room peer memory recording
+        let logger = AppLogger::init();
+        let node = P2pNode::new(logger);
+        let ep1: SocketAddr = "192.168.1.50:50000".parse().unwrap();
+        let ep2: SocketAddr = "95.10.20.30:50000".parse().unwrap();
+        node.record_room_peer_endpoints("123456", &[ep1, ep2]);
+
+        let endpoints = node.get_known_endpoints_for_room("123456");
+        assert_eq!(endpoints.len(), 2);
+        assert!(endpoints.contains(&ep1));
+        assert!(endpoints.contains(&ep2));
+    }
+
+    #[test]
+    fn test_peer_introduce_packet_and_exchange() {
+        let ep1: SocketAddr = "192.168.1.100:40000".parse().unwrap();
+        let ep2: SocketAddr = "10.0.0.5:40000".parse().unwrap();
+        let intro = Packet::PeerIntroduce {
+            room_code: "ROOM-TEST".into(),
+            peer_id: 300,
+            peer_name: "Charlie".into(),
+            endpoints: vec![ep1, ep2],
+        };
+
+        let bytes = intro.encode().expect("PeerIntroduce encode");
+        let decoded = Packet::decode(&bytes).expect("PeerIntroduce decode");
+        assert_eq!(decoded, intro);
+
+        let logger = AppLogger::init();
+        let node = P2pNode::new(logger);
+        node.record_room_peer_endpoints("ROOM-TEST", &[ep1, ep2]);
+        let known = node.get_known_endpoints_for_room("ROOM-TEST");
+        assert!(known.contains(&ep1));
+        assert!(known.contains(&ep2));
+    }
 }
+

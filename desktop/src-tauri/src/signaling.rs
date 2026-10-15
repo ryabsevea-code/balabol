@@ -61,12 +61,22 @@ pub struct MeshSignalingSession {
     pub incoming_announces: tokio::sync::mpsc::Receiver<MeshAnnounce>,
     pub shutdown: Arc<AtomicBool>,
     pub abort_handle: tokio::task::AbortHandle,
+    pub relay_handles: Vec<tokio::task::AbortHandle>,
+}
+
+impl MeshSignalingSession {
+    pub fn stop(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.abort_handle.abort();
+        for handle in &self.relay_handles {
+            handle.abort();
+        }
+    }
 }
 
 impl Drop for MeshSignalingSession {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-        self.abort_handle.abort();
+        self.stop();
     }
 }
 
@@ -104,6 +114,7 @@ impl Signaling {
 
         let announce_json = serde_json::to_string(&my_announce).unwrap_or_default();
         let mut join_handles = Vec::new();
+        let mut relay_handles = Vec::new();
 
         for &relay in RELAYS {
             let tx = tx.clone();
@@ -248,6 +259,7 @@ impl Signaling {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             });
+            relay_handles.push(handle.abort_handle());
             join_handles.push(handle);
         }
 
@@ -261,6 +273,7 @@ impl Signaling {
             incoming_announces: rx,
             shutdown,
             abort_handle: supervisor.abort_handle(),
+            relay_handles,
         })
     }
     /// Starts continuous multi-guest host signaling session for Star-SFU

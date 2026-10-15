@@ -39,6 +39,8 @@
     Paperclip,
     Download,
     Image as ImageIcon,
+    Lock,
+    Unlock,
   } from "lucide-svelte";
 
   let status = { type: "Disconnected" };
@@ -49,6 +51,33 @@
   let videoPollInterval = null;
   let unlistenVideo = null;
   let lastVideoFrameReceivedAt = 0;
+
+  // Room Signaling Lifecycle state
+  let signalingStatus = {
+    is_open: false,
+    is_waiting_first_peer: false,
+    remaining_seconds: 0,
+  };
+  let isReopeningSignaling = false;
+
+  function formatRemainingTime(secs) {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}:${s < 10 ? "0" : ""}${s}`;
+  }
+
+  async function handleReopenSignaling() {
+    if (isReopeningSignaling) return;
+    try {
+      isReopeningSignaling = true;
+      await invoke("reopen_signaling");
+      signalingStatus = await invoke("get_signaling_status");
+    } catch (e) {
+      console.error("Failed to reopen signaling:", e);
+    } finally {
+      isReopeningSignaling = false;
+    }
+  }
 
   // Chat input & image attachment state
   let chatInputEl;
@@ -317,6 +346,16 @@
             }).catch(() => {});
           }
         }
+        // Auto-fetch signaling status
+        try {
+          signalingStatus = await invoke("get_signaling_status");
+        } catch (e) {}
+      } else {
+        signalingStatus = {
+          is_open: false,
+          is_waiting_first_peer: false,
+          remaining_seconds: 0,
+        };
       }
 
       // Poll voice status whenever connected OR while settings modal / mic test is active
@@ -1377,22 +1416,71 @@
                             </div>
                           </div>
 
-                          <button
-                            on:click={() =>
-                              copyText(status.room_code, "room_code_banner")}
-                            class="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-semibold flex items-center gap-2 transition shadow-md shadow-purple-600/20 cursor-pointer"
-                            title="Скопировать код комнаты в буфер обмена"
-                          >
-                            {#if copiedItem === "room_code_banner"}
-                              <Check class="w-4 h-4 text-emerald-300" />
-                              <span class="text-emerald-300 font-semibold"
-                                >Скопировано!</span
+                          <div class="flex items-center gap-2.5">
+                            {#if signalingStatus.is_waiting_first_peer}
+                              <span
+                                class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-medium"
+                                title="Сигналинг Nostr активен и ожидает подключения гостей"
                               >
+                                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                                Вход открыт (ожидание)
+                              </span>
+                            {:else if signalingStatus.is_open}
+                              <div class="flex items-center gap-1.5">
+                                <span
+                                  class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-medium"
+                                  title="Окно Nostr-сигналинга активно для подключения новых гостей"
+                                >
+                                  <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                                  Вход открыт: {formatRemainingTime(signalingStatus.remaining_seconds)}
+                                </span>
+                                <button
+                                  on:click={handleReopenSignaling}
+                                  disabled={isReopeningSignaling}
+                                  class="px-2.5 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl text-xs text-gray-300 font-medium transition cursor-pointer"
+                                  title="Продлить окно сигналинга еще на 5 минут"
+                                >
+                                  +5 мин
+                                </button>
+                              </div>
                             {:else}
-                              <Copy class="w-4 h-4" />
-                              <span>Скопировать код</span>
+                              <div class="flex items-center gap-1.5">
+                                <span
+                                  class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs font-medium"
+                                  title="Nostr WSS релеи отключены. Новые участники не смогут зайти по коду без открытого сигналинга."
+                                >
+                                  <Lock class="w-3.5 h-3.5 text-amber-400" />
+                                  Закрыта
+                                </span>
+                                <button
+                                  on:click={handleReopenSignaling}
+                                  disabled={isReopeningSignaling}
+                                  class="px-3 py-1.5 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/30 text-amber-300 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer shadow-sm"
+                                  title="Запустить Nostr-сигналинг на 5 минут, чтобы впустить нового участника"
+                                >
+                                  <Unlock class="w-3.5 h-3.5 text-amber-300" />
+                                  <span>{isReopeningSignaling ? "Открываем..." : "Впустить (+5 мин)"}</span>
+                                </button>
+                              </div>
                             {/if}
-                          </button>
+
+                            <button
+                              on:click={() =>
+                                copyText(status.room_code, "room_code_banner")}
+                              class="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-semibold flex items-center gap-2 transition shadow-md shadow-purple-600/20 cursor-pointer"
+                              title="Скопировать код комнаты в буфер обмена"
+                            >
+                              {#if copiedItem === "room_code_banner"}
+                                <Check class="w-4 h-4 text-emerald-300" />
+                                <span class="text-emerald-300 font-semibold"
+                                  >Скопировано!</span
+                                >
+                              {:else}
+                                <Copy class="w-4 h-4" />
+                                <span>Скопировать код</span>
+                              {/if}
+                            </button>
+                          </div>
                         </div>
                       {/if}
 

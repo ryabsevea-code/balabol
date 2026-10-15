@@ -37,3 +37,4 @@ Thumbs.db
 
 # Pending deletion / temporary
 client_delete_pending/
+*room_cache.json
