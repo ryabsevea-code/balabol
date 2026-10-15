@@ -391,13 +391,8 @@ impl P2pNode {
                 }
             }
         }
-        if let Some(relay_tx) = self.relay_sender.read().clone() {
-            tokio::spawn(async move {
-                let _ = relay_tx.send(disc).await;
-            });
-        }
 
-        self.logger.info("РћС‚РєР»СЋС‡РµРЅРёРµ P2P СЃРѕРµРґРёРЅРµРЅРёСЏ...");
+        self.logger.info("Отключение P2P соединения...");
         self.screen_capturer.stop();
         self.audio_engine.stop();
         *self.latest_remote_video.write() = None;
@@ -640,37 +635,38 @@ impl P2pNode {
     pub async fn broadcast_packet(&self, packet: &Packet) {
         if let Ok(bytes) = packet.encode() {
             let sock_opt = self.active_socket.read().clone();
-            let mut has_direct_udp = false;
             if let Some(sock) = sock_opt {
-                // If Host: send to all connected clients
                 let client_addrs: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
                 for addr in client_addrs {
                     let _ = sock.send_to(&bytes, addr).await;
-                    has_direct_udp = true;
                 }
-                // If Client: send to Host
                 let host_addr_opt = *self.host_socket_addr.read();
                 if let Some(host_addr) = host_addr_opt {
                     let _ = sock.send_to(&bytes, host_addr).await;
-                    has_direct_udp = true;
                 }
             }
+        }
+    }
 
-            // NEVER route heavy video frames through public Nostr relays!
-            if matches!(packet, Packet::VideoChunk { .. }) {
-                return;
-            }
-
-            // For non-video packets: only fallback to WSS relay if any peer lacks direct UDP
-            let relay_tx_opt = self.relay_sender.read().clone();
-            if let Some(relay_tx) = relay_tx_opt {
-                let has_relay_peers = {
-                    let ep_guard = self.client_endpoints.read();
-                    self.peers.read().keys().any(|pid| !ep_guard.contains_key(pid))
+    pub async fn send_image_chunks_broadcast(&self, image_id: &str, bytes: &[u8]) {
+        const CHUNK_SIZE: usize = 1200;
+        let chunk_total = ((bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
+        let sock_opt = self.active_socket.read().clone();
+        let endpoints: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
+        if let Some(sock) = sock_opt {
+            for (idx, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
+                let pkt = Packet::ImageChunk {
+                    image_id: image_id.to_string(),
+                    chunk_idx: idx as u32,
+                    chunk_total,
+                    data: chunk.to_vec(),
                 };
-                if !has_direct_udp || has_relay_peers {
-                    let _ = relay_tx.try_send(packet.clone());
+                if let Ok(b) = pkt.encode() {
+                    for &addr in &endpoints {
+                        let _ = sock.send_to(&b, addr).await;
+                    }
                 }
+                tokio::time::sleep(Duration::from_millis(3)).await;
             }
         }
     }
@@ -684,7 +680,7 @@ impl P2pNode {
         full_image_base64: Option<String>,
     ) -> Result<ChatMessage, String> {
         let trimmed = text.trim();
-        if trimmed.is_empty() && image_thumb.is_none() {
+        if trimmed.is_empty() && image_thumb.is_none() && image_id.is_none() {
             return Err("Сообщение не может быть пустым".into());
         }
 
@@ -693,10 +689,12 @@ impl P2pNode {
         let timestamp_ms = now_ms();
         self.seen_msg_ids.write().insert(id);
 
+        let mut image_bytes_opt = None;
         if let (Some(ref img_id), Some(ref full_b64)) = (&image_id, &full_image_base64) {
             use base64::Engine;
             if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(full_b64) {
-                self.image_store.write().insert(img_id.clone(), bytes);
+                self.image_store.write().insert(img_id.clone(), bytes.clone());
+                image_bytes_opt = Some((img_id.clone(), bytes));
             }
         }
 
@@ -710,8 +708,16 @@ impl P2pNode {
             image_id: image_id.clone(),
         };
 
-        // Broadcast to all peers
+        // Broadcast to all peers via direct UDP
         self.broadcast_packet(&packet).await;
+
+        // Proactively send image chunks directly via UDP
+        if let Some((img_id, bytes)) = image_bytes_opt {
+            let self_clone = self.clone();
+            tokio::spawn(async move {
+                self_clone.send_image_chunks_broadcast(&img_id, &bytes).await;
+            });
+        }
 
         let msg = ChatMessage {
             id,
@@ -879,11 +885,7 @@ impl P2pNode {
 
         let mesh_signaling = crate::signaling::Signaling::start_mesh_session(&clean_code, my_announce, &self.logger).await?;
 
-        // 5. Start WSS Relay session as seamless fallback and hybrid transport
-        let relay_session = crate::signaling::Signaling::start_relay_session(&clean_code, &nickname, &self.logger).await?;
-        *self.relay_sender.write() = Some(relay_session.outgoing_tx.clone());
-
-        // 6. Spawn Full Mesh peer communication loop
+        // 5. Spawn Full Mesh peer communication loop (pure direct UDP P2P)
         let node_clone = self.clone();
         let code_for_task = clean_code.clone();
 
@@ -891,7 +893,6 @@ impl P2pNode {
             run_mesh_peer_loop(
                 arc_socket,
                 mesh_signaling,
-                relay_session,
                 code_for_task,
                 node_clone,
             ).await;
@@ -920,11 +921,10 @@ impl P2pNode {
     }
 }
 
-/// Full Mesh P2P Loop: fully symmetric communication between all peers with hybrid UDP + WSS Relay fallback
+/// Full Mesh P2P Loop: fully symmetric communication between all peers over direct UDP
 async fn run_mesh_peer_loop(
     socket: Arc<UdpSocket>,
     mut mesh_signaling: crate::signaling::MeshSignalingSession,
-    mut relay_session: crate::signaling::RelaySession,
     room_code: String,
     node: P2pNode,
 ) {
@@ -932,7 +932,7 @@ async fn run_mesh_peer_loop(
     node.logger.info(&format!("FULL MESH P2P УЗЕЛ АКТИВЕН ДЛЯ КОМНАТЫ '{}'", room_code));
     node.logger.info("============================================================");
 
-    let mut buf = [0u8; 4096];
+    let mut buf = [0u8; 65535];
     let mut video_reassemblers: HashMap<u32, VideoReassembler> = HashMap::new();
     let mut last_ping_broadcast = Instant::now();
     let mut last_cleanup = Instant::now();
@@ -952,10 +952,9 @@ async fn run_mesh_peer_loop(
         node_history.request_history().await;
     });
 
-    // Background Audio Transmitter
+    // Background Audio Transmitter (direct UDP P2P)
     let audio_sock = socket.clone();
     let node_audio = node.clone();
-    let relay_audio_tx = relay_session.outgoing_tx.clone();
     let audio_tx_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(10));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -981,15 +980,6 @@ async fn run_mesh_peer_loop(
                     for caddr in &endpoints {
                         let _ = audio_sock.send_to(&b, *caddr).await;
                     }
-
-                    // Forward audio over WSS relay if there are peers not connected via UDP or endpoints is empty
-                    let has_relay_peers = {
-                        let ep_guard = node_audio.client_endpoints.read();
-                        node_audio.peers.read().keys().any(|pid| !ep_guard.contains_key(pid))
-                    };
-                    if has_relay_peers || endpoints.is_empty() {
-                        let _ = relay_audio_tx.send(audio_pkt).await;
-                    }
                 }
             }
         }
@@ -999,7 +989,7 @@ async fn run_mesh_peer_loop(
         let my_id = node.my_peer_id.load(Ordering::Relaxed);
         let my_name = node.my_nickname.read().clone();
 
-        // 1. Process incoming peer announcements from Nostr signaling
+        // 1. Process incoming peer announcements from Nostr signaling (room creation / discovery only)
         while let Ok(ann) = mesh_signaling.incoming_announces.try_recv() {
             if ann.peer_id == my_id {
                 continue;
@@ -1019,9 +1009,6 @@ async fn run_mesh_peer_loop(
 
             let candidates = expand_candidates_with_port_spray(&ann.candidates);
             discovered_candidates.insert(ann.peer_id, candidates.clone());
-
-            // Make sure peer is visible in the room immediately
-            ensure_relay_peer(&node, ann.peer_id, &ann.peer_name);
 
             let already_connected = node.client_endpoints.read().contains_key(&ann.peer_id);
             let punch_needed = !already_connected
@@ -1072,7 +1059,7 @@ async fn run_mesh_peer_loop(
             }
         }
 
-        // 3. Periodic Ping broadcast
+        // 3. Periodic Ping broadcast to connected UDP peers
         if last_ping_broadcast.elapsed() >= Duration::from_millis(1000) {
             last_ping_broadcast = Instant::now();
             ping_seq += 1;
@@ -1085,10 +1072,6 @@ async fn run_mesh_peer_loop(
                 let targets: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
                 for target in targets {
                     let _ = socket.send_to(&b, target).await;
-                }
-                let has_relay_peers = node.peers.read().keys().any(|pid| !node.client_endpoints.read().contains_key(pid));
-                if has_relay_peers {
-                    let _ = relay_session.outgoing_tx.send(ping_pkt).await;
                 }
             }
         }
@@ -1126,7 +1109,7 @@ async fn run_mesh_peer_loop(
             }
         }
 
-        // 5. Receive UDP packets & WSS Relay packets
+        // 5. Receive UDP packets
         tokio::select! {
             recv_res = socket.recv_from(&mut buf) => {
                 match recv_res {
@@ -1134,9 +1117,8 @@ async fn run_mesh_peer_loop(
                         if let Ok(packet) = Packet::decode(&buf[..len]) {
                             handle_mesh_packet(
                                 packet,
-                                Some(sender_addr),
+                                sender_addr,
                                 &socket,
-                                &relay_session.outgoing_tx,
                                 &node,
                                 &mut video_reassemblers,
                                 &mut discovered_candidates,
@@ -1146,23 +1128,10 @@ async fn run_mesh_peer_loop(
                     }
                     Err(e) => {
                         if e.raw_os_error() != Some(10054) {
+                            node.logger.warn(&format!("UDP recv_from error: {}", e));
                             tokio::time::sleep(Duration::from_millis(5)).await;
                         }
                     }
-                }
-            }
-            relay_pkt_res = relay_session.incoming_rx.recv() => {
-                if let Some(packet) = relay_pkt_res {
-                    handle_mesh_packet(
-                        packet,
-                        None,
-                        &socket,
-                        &relay_session.outgoing_tx,
-                        &node,
-                        &mut video_reassemblers,
-                        &mut discovered_candidates,
-                        &mut discovered_sessions,
-                    ).await;
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(15)) => {}
@@ -1173,47 +1142,10 @@ async fn run_mesh_peer_loop(
     node.audio_engine.stop();
 }
 
-fn ensure_relay_peer(node: &P2pNode, sender_id: u32, sender_name: &str) {
-    let is_new = !node.peers.read().contains_key(&sender_id);
-    if is_new {
-        let mut peers_guard = node.peers.write();
-        peers_guard.insert(sender_id, PeerInfo {
-            id: sender_id,
-            name: sender_name.to_string(),
-            addr: "WSS Релей TLS/443".into(),
-            ping_ms: 35,
-            last_seen_ms: now_ms(),
-            is_host: false,
-            is_speaking: false,
-            mic_muted: false,
-            deafened: false,
-            video_active: false,
-            screen_active: false,
-        });
-        drop(peers_guard);
-        node.logger.info(&format!(
-            "⚡ [Full Mesh] Пир {} ('{}') подключен (канал WSS Релей активен)",
-            sender_id, sender_name
-        ));
-        node.audio_engine.play_connect_chime();
-        let cnt = node.peers.read().len();
-        let mut st = node.status.write();
-        if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
-            *connected_count = cnt;
-        }
-    } else {
-        let mut peers_guard = node.peers.write();
-        if let Some(peer) = peers_guard.get_mut(&sender_id) {
-            peer.last_seen_ms = now_ms();
-        }
-    }
-}
-
 async fn handle_mesh_packet(
     packet: Packet,
-    sender_addr_opt: Option<SocketAddr>,
+    sender_addr: SocketAddr,
     socket: &Arc<UdpSocket>,
-    relay_tx: &tokio::sync::mpsc::Sender<Packet>,
     node: &P2pNode,
     video_reassemblers: &mut HashMap<u32, VideoReassembler>,
     discovered_candidates: &mut HashMap<u32, Vec<SocketAddr>>,
@@ -1234,54 +1166,49 @@ async fn handle_mesh_packet(
                 sender_id: my_id,
             };
 
-            if let Some(sender_addr) = sender_addr_opt {
-                if let Ok(b) = ack.encode() {
-                    for _ in 0..2 {
-                        let _ = socket.send_to(&b, sender_addr).await;
+            if let Ok(b) = ack.encode() {
+                for _ in 0..2 {
+                    let _ = socket.send_to(&b, sender_addr).await;
+                }
+            }
+
+            let is_new = !node.client_endpoints.read().contains_key(&sender_id);
+            node.client_endpoints.write().insert(sender_id, sender_addr);
+            node.peer_addrs.write().insert(sender_addr, sender_id);
+
+            {
+                let mut peers_guard = node.peers.write();
+                let peer = peers_guard.entry(sender_id).or_insert_with(|| {
+                    PeerInfo {
+                        id: sender_id,
+                        name: sender_name.clone(),
+                        addr: sender_addr.to_string(),
+                        ping_ms: 0,
+                        last_seen_ms: now_ms(),
+                        is_host: false,
+                        is_speaking: false,
+                        mic_muted: false,
+                        deafened: false,
+                        video_active: false,
+                        screen_active: false,
                     }
-                }
+                });
+                peer.addr = sender_addr.to_string();
+                peer.name = sender_name.clone();
+                peer.last_seen_ms = now_ms();
+            }
 
-                let is_new = !node.client_endpoints.read().contains_key(&sender_id);
-                node.client_endpoints.write().insert(sender_id, sender_addr);
-                node.peer_addrs.write().insert(sender_addr, sender_id);
-
-                {
-                    let mut peers_guard = node.peers.write();
-                    let peer = peers_guard.entry(sender_id).or_insert_with(|| {
-                        PeerInfo {
-                            id: sender_id,
-                            name: sender_name.clone(),
-                            addr: sender_addr.to_string(),
-                            ping_ms: 0,
-                            last_seen_ms: now_ms(),
-                            is_host: false,
-                            is_speaking: false,
-                            mic_muted: false,
-                            deafened: false,
-                            video_active: false,
-                            screen_active: false,
-                        }
-                    });
-                    peer.addr = sender_addr.to_string();
-                    peer.name = sender_name.clone();
-                    peer.last_seen_ms = now_ms();
+            if is_new {
+                node.logger.info(&format!(
+                    "⚡ [Full Mesh] Установлен прямой P2P UDP канал с пиром {} ('{}') на {}",
+                    sender_id, sender_name, sender_addr
+                ));
+                node.audio_engine.play_connect_chime();
+                let cnt = node.peers.read().len();
+                let mut st = node.status.write();
+                if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
+                    *connected_count = cnt;
                 }
-
-                if is_new {
-                    node.logger.info(&format!(
-                        "⚡ [Full Mesh] Установлен прямой P2P UDP канал с пиром {} ('{}') на {}",
-                        sender_id, sender_name, sender_addr
-                    ));
-                    node.audio_engine.play_connect_chime();
-                    let cnt = node.peers.read().len();
-                    let mut st = node.status.write();
-                    if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
-                        *connected_count = cnt;
-                    }
-                }
-            } else {
-                let _ = relay_tx.send(ack).await;
-                ensure_relay_peer(node, sender_id, &sender_name);
             }
         }
 
@@ -1290,47 +1217,43 @@ async fn handle_mesh_packet(
                 return;
             }
 
-            if let Some(sender_addr) = sender_addr_opt {
-                let is_new = !node.client_endpoints.read().contains_key(&sender_id);
-                node.client_endpoints.write().insert(sender_id, sender_addr);
-                node.peer_addrs.write().insert(sender_addr, sender_id);
+            let is_new = !node.client_endpoints.read().contains_key(&sender_id);
+            node.client_endpoints.write().insert(sender_id, sender_addr);
+            node.peer_addrs.write().insert(sender_addr, sender_id);
 
-                {
-                    let mut peers_guard = node.peers.write();
-                    let peer = peers_guard.entry(sender_id).or_insert_with(|| {
-                        PeerInfo {
-                            id: sender_id,
-                            name: sender_name.clone(),
-                            addr: sender_addr.to_string(),
-                            ping_ms: 0,
-                            last_seen_ms: now_ms(),
-                            is_host: false,
-                            is_speaking: false,
-                            mic_muted: false,
-                            deafened: false,
-                            video_active: false,
-                            screen_active: false,
-                        }
-                    });
-                    peer.addr = sender_addr.to_string();
-                    peer.name = sender_name.clone();
-                    peer.last_seen_ms = now_ms();
-                }
-
-                if is_new {
-                    node.logger.info(&format!(
-                        "⚡ [Full Mesh] Подтвержден прямой P2P UDP канал с пиром {} ('{}') на {}",
-                        sender_id, sender_name, sender_addr
-                    ));
-                    node.audio_engine.play_connect_chime();
-                    let cnt = node.peers.read().len();
-                    let mut st = node.status.write();
-                    if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
-                        *connected_count = cnt;
+            {
+                let mut peers_guard = node.peers.write();
+                let peer = peers_guard.entry(sender_id).or_insert_with(|| {
+                    PeerInfo {
+                        id: sender_id,
+                        name: sender_name.clone(),
+                        addr: sender_addr.to_string(),
+                        ping_ms: 0,
+                        last_seen_ms: now_ms(),
+                        is_host: false,
+                        is_speaking: false,
+                        mic_muted: false,
+                        deafened: false,
+                        video_active: false,
+                        screen_active: false,
                     }
+                });
+                peer.addr = sender_addr.to_string();
+                peer.name = sender_name.clone();
+                peer.last_seen_ms = now_ms();
+            }
+
+            if is_new {
+                node.logger.info(&format!(
+                    "⚡ [Full Mesh] Подтвержден прямой P2P UDP канал с пиром {} ('{}') на {}",
+                    sender_id, sender_name, sender_addr
+                ));
+                node.audio_engine.play_connect_chime();
+                let cnt = node.peers.read().len();
+                let mut st = node.status.write();
+                if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
+                    *connected_count = cnt;
                 }
-            } else {
-                ensure_relay_peer(node, sender_id, &sender_name);
             }
         }
 
@@ -1347,12 +1270,8 @@ async fn handle_mesh_packet(
                     seq,
                     timestamp_ms,
                 };
-                if let Some(sender_addr) = sender_addr_opt {
-                    if let Ok(b) = pong.encode() {
-                        let _ = socket.send_to(&b, sender_addr).await;
-                    }
-                } else {
-                    let _ = relay_tx.send(pong).await;
+                if let Ok(b) = pong.encode() {
+                    let _ = socket.send_to(&b, sender_addr).await;
                 }
             }
         }
@@ -1425,7 +1344,11 @@ async fn handle_mesh_packet(
             if sender_id != my_id {
                 let is_new = node.seen_msg_ids.write().insert(id);
                 if is_new {
-                    node.logger.info(&format!("[ЧАТ] {}: {}", sender_name, text));
+                    if !text.is_empty() {
+                        node.logger.info(&format!("[ЧАТ] {}: {}", sender_name, text));
+                    } else if image_id.is_some() || image_thumb.is_some() {
+                        node.logger.info(&format!("[ЧАТ] {}: [Изображение]", sender_name));
+                    }
                     node.chat_messages.write().push(ChatMessage {
                         id,
                         sender: sender_name.clone(),
@@ -1433,17 +1356,25 @@ async fn handle_mesh_packet(
                         timestamp_ms,
                         is_me: false,
                         image_thumb,
-                        image_id,
+                        image_id: image_id.clone(),
                     });
-                }
-                ensure_relay_peer(node, sender_id, &sender_name);
-                let ack = Packet::TextAck { id };
-                if let Some(sender_addr) = sender_addr_opt {
-                    if let Ok(b) = ack.encode() {
-                        let _ = socket.send_to(&b, sender_addr).await;
+
+                    // If message contains an image and we don't have it in store yet, request it
+                    if let Some(ref img_id) = image_id {
+                        if !node.image_store.read().contains_key(img_id) {
+                            let req = Packet::ImageRequest {
+                                image_id: img_id.clone(),
+                                requester_id: my_id,
+                            };
+                            if let Ok(b) = req.encode() {
+                                let _ = socket.send_to(&b, sender_addr).await;
+                            }
+                        }
                     }
-                } else {
-                    let _ = relay_tx.send(ack).await;
+                }
+                let ack = Packet::TextAck { id };
+                if let Ok(b) = ack.encode() {
+                    let _ = socket.send_to(&b, sender_addr).await;
                 }
             }
         }
@@ -1459,8 +1390,7 @@ async fn handle_mesh_packet(
                         requester_id
                     ));
                     let sock_opt = node.active_socket.read().clone();
-                    let relay_tx_clone = relay_tx.clone();
-                    let target_addr_opt = node.client_endpoints.read().get(&requester_id).cloned();
+                    let target_addr = node.client_endpoints.read().get(&requester_id).cloned().unwrap_or(sender_addr);
                     tokio::spawn(async move {
                         const CHUNK_SIZE: usize = 1200;
                         let chunk_total = ((bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
@@ -1472,13 +1402,11 @@ async fn handle_mesh_packet(
                                 data: chunk.to_vec(),
                             };
                             if let Ok(b) = pkt.encode() {
-                                if let (Some(sock), Some(addr)) = (&sock_opt, target_addr_opt) {
-                                    let _ = sock.send_to(&b, addr).await;
-                                } else {
-                                    let _ = relay_tx_clone.send(pkt).await;
+                                if let Some(sock) = &sock_opt {
+                                    let _ = sock.send_to(&b, target_addr).await;
                                 }
                             }
-                            tokio::time::sleep(Duration::from_millis(4)).await;
+                            tokio::time::sleep(Duration::from_millis(3)).await;
                         }
                     });
                 }
@@ -1511,20 +1439,17 @@ async fn handle_mesh_packet(
                         requester_id
                     ));
                     let sock_opt = node.active_socket.read().clone();
-                    let relay_tx_clone = relay_tx.clone();
-                    let target_addr_opt = node.client_endpoints.read().get(&requester_id).cloned();
+                    let target_addr = node.client_endpoints.read().get(&requester_id).cloned().unwrap_or(sender_addr);
                     tokio::spawn(async move {
                         let start_idx = msgs.len().saturating_sub(50);
                         for msg in &msgs[start_idx..] {
                             let pkt = Packet::HistoryMessage { message: msg.clone() };
                             if let Ok(b) = pkt.encode() {
-                                if let (Some(sock), Some(addr)) = (&sock_opt, target_addr_opt) {
-                                    let _ = sock.send_to(&b, addr).await;
-                                } else {
-                                    let _ = relay_tx_clone.send(pkt).await;
+                                if let Some(sock) = &sock_opt {
+                                    let _ = sock.send_to(&b, target_addr).await;
                                 }
                             }
-                            tokio::time::sleep(Duration::from_millis(8)).await;
+                            tokio::time::sleep(Duration::from_millis(5)).await;
                         }
                     });
                 }

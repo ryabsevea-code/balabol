@@ -159,10 +159,18 @@ impl Signaling {
 
                     let mut last_pub = tokio::time::Instant::now();
                     let mut last_ping = tokio::time::Instant::now();
+                    let joined_at = tokio::time::Instant::now();
 
                     while !shutdown.load(Ordering::Relaxed) {
-                        // Periodic announce broadcast every 2.0s
-                        if last_pub.elapsed() >= Duration::from_millis(2000) {
+                        // Room creation / handshake phase: announce every 2.5s during first 12s.
+                        // After initial handshake, back off to 45s to avoid flooding WSS relays.
+                        let pub_interval = if joined_at.elapsed() < Duration::from_secs(12) {
+                            Duration::from_millis(2500)
+                        } else {
+                            Duration::from_secs(45)
+                        };
+
+                        if last_pub.elapsed() >= pub_interval {
                             let evt = create_signed_event(
                                 &keypair,
                                 1,
@@ -200,7 +208,7 @@ impl Signaling {
                                                             match map.get_mut(&incoming.peer_id) {
                                                                 Some((last_nonce, last_time)) => {
                                                                     if *last_nonce != incoming.nonce
-                                                                        || last_time.elapsed() >= Duration::from_millis(2500)
+                                                                        || last_time.elapsed() >= Duration::from_secs(15)
                                                                     {
                                                                         *last_nonce = incoming.nonce;
                                                                         *last_time = tokio::time::Instant::now();

@@ -56,6 +56,7 @@
   let attachedImage = null; // { thumbDataUrl, fullDataUrl, name, sizeStr }
   let lightboxImage = null; // { url, sender, time, id, loading }
   let lightboxPollTimer = null;
+  let loadedImages = {}; // imageId -> "data:image/jpeg;base64," + base64
 
   // Modals state
   let showConnectModal = false;
@@ -294,7 +295,7 @@
       }
 
       if (status.type === "Connected") {
-                const newChat = await invoke("get_chat_messages");
+        const newChat = await invoke("get_chat_messages");
         if (newChat.length !== chatMessages.length) {
           const lastMsg = newChat[newChat.length - 1];
           if (lastMsg && !lastMsg.is_me) {
@@ -302,6 +303,19 @@
           }
           chatMessages = newChat;
           scrollToChatBottom();
+        }
+
+        // Auto-fetch full images from P2P node for any messages missing full image
+        for (const msg of newChat) {
+          if (msg.image_id && !loadedImages[msg.image_id]) {
+            invoke("get_cached_image", { imageId: msg.image_id }).then((b64) => {
+              if (b64) {
+                loadedImages = { ...loadedImages, [msg.image_id]: "data:image/jpeg;base64," + b64 };
+              } else {
+                invoke("request_full_image", { imageId: msg.image_id }).catch(() => {});
+              }
+            }).catch(() => {});
+          }
         }
       }
 
@@ -617,8 +631,8 @@
         fctx.drawImage(img, 0, 0, fw, fh);
         const fullDataUrl = fullCanvas.toDataURL("image/jpeg", 0.85);
 
-        // 2. Compact thumbnail canvas (max 320x320, ~10-20 KB)
-        const maxThumbDim = 320;
+        // 2. Ultra-compact LQIP thumbnail canvas (max 48x48, ~300-500 bytes for instant UDP packet delivery)
+        const maxThumbDim = 48;
         let tw = img.width;
         let th = img.height;
         if (tw > maxThumbDim || th > maxThumbDim) {
@@ -635,7 +649,7 @@
         thumbCanvas.height = th;
         const tctx = thumbCanvas.getContext("2d");
         tctx.drawImage(img, 0, 0, tw, th);
-        const thumbDataUrl = thumbCanvas.toDataURL("image/jpeg", 0.65);
+        const thumbDataUrl = thumbCanvas.toDataURL("image/jpeg", 0.5);
 
         attachedImage = {
           thumbDataUrl,
@@ -702,6 +716,7 @@
       imgThumb = attachedImage.thumbDataUrl;
       const commaIdx = attachedImage.fullDataUrl.indexOf(",");
       fullB64 = commaIdx >= 0 ? attachedImage.fullDataUrl.slice(commaIdx + 1) : attachedImage.fullDataUrl;
+      loadedImages = { ...loadedImages, [imgId]: attachedImage.fullDataUrl };
     }
 
     const textToSend = text;
@@ -747,15 +762,17 @@
   async function openLightbox(msg) {
     if (!msg.image_thumb && !msg.image_id) return;
 
+    const cachedUrl = msg.image_id ? loadedImages[msg.image_id] : null;
+
     lightboxImage = {
-      url: msg.image_thumb,
+      url: cachedUrl || msg.image_thumb,
       sender: msg.sender,
       time: new Date(msg.timestamp_ms).toLocaleTimeString(),
       id: msg.image_id,
-      loading: true,
+      loading: !cachedUrl,
     };
 
-    if (!msg.image_id) {
+    if (cachedUrl || !msg.image_id) {
       lightboxImage.loading = false;
       return;
     }
@@ -763,7 +780,9 @@
     try {
       const cachedB64 = await invoke("get_cached_image", { imageId: msg.image_id });
       if (cachedB64) {
-        lightboxImage.url = "data:image/jpeg;base64," + cachedB64;
+        const fullUrl = "data:image/jpeg;base64," + cachedB64;
+        loadedImages = { ...loadedImages, [msg.image_id]: fullUrl };
+        lightboxImage.url = fullUrl;
         lightboxImage.loading = false;
         return;
       }
@@ -790,8 +809,10 @@
         const cachedB64 = await invoke("get_cached_image", { imageId: msg.image_id });
         if (cachedB64) {
           clearInterval(lightboxPollTimer);
+          const fullUrl = "data:image/jpeg;base64," + cachedB64;
+          loadedImages = { ...loadedImages, [msg.image_id]: fullUrl };
           if (lightboxImage) {
-            lightboxImage.url = "data:image/jpeg;base64," + cachedB64;
+            lightboxImage.url = fullUrl;
             lightboxImage.loading = false;
           }
         }
@@ -1779,7 +1800,7 @@
                             ? 'bg-blue-600 text-white rounded-tr-none'
                             : 'bg-[#222530] text-[#e0e2e8] border border-[#2d303e] rounded-tl-none'}"
                         >
-                          {#if msg.image_thumb}
+                          {#if msg.image_thumb || msg.image_id}
                             <button
                               type="button"
                               class="my-1 block relative group cursor-pointer overflow-hidden rounded-xl border border-white/10 text-left"
@@ -1787,9 +1808,9 @@
                               title="Нажмите для увеличения"
                             >
                               <img
-                                src={msg.image_thumb}
+                                src={loadedImages[msg.image_id] || msg.image_thumb}
                                 alt="Изображение"
-                                class="max-h-44 max-w-full rounded-xl object-contain bg-black/40 transition group-hover:scale-[1.02]"
+                                class="max-h-56 max-w-full rounded-xl object-contain bg-black/40 transition group-hover:scale-[1.02]"
                                 loading="lazy"
                               />
                               <div
@@ -1801,7 +1822,7 @@
                             </button>
                           {/if}
                           {#if msg.text}
-                            <div class="{msg.image_thumb ? 'mt-1' : ''}">
+                            <div class="{msg.image_thumb || msg.image_id ? 'mt-1' : ''}">
                               {msg.text}
                             </div>
                           {/if}
@@ -1818,7 +1839,7 @@
                     <div class="px-3 py-2 bg-[#1b1d26] border-b border-[#262832] flex items-center justify-between text-xs animate-fadeIn">
                       <div class="flex items-center gap-2.5 overflow-hidden">
                         <img
-                          src={attachedImage.thumbDataUrl}
+                          src={attachedImage.fullDataUrl || attachedImage.thumbDataUrl}
                           alt="Превью вложения"
                           class="w-10 h-10 object-cover rounded-lg border border-white/10 shrink-0"
                         />
