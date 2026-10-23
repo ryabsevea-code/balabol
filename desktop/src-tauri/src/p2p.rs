@@ -128,6 +128,10 @@ pub enum Packet {
         peer_name: String,
         endpoints: Vec<SocketAddr>,
     },
+    KeyExchange {
+        sender_id: u32,
+        ephemeral_pubkey: [u8; 32],
+    },
 }
 
 impl Packet {
@@ -139,25 +143,27 @@ impl Packet {
         bincode::deserialize(buf)
     }
 
-    pub fn encode_wire(&self, key_opt: Option<&[u8; 32]>) -> Result<Vec<u8>, String> {
+    pub fn encode_wire(&self, key_opt: Option<&[u8; 32]>, seq: u64) -> Result<Vec<u8>, String> {
         let raw = self.encode().map_err(|e| e.to_string())?;
         if let Some(key) = key_opt {
-            crate::crypto::encrypt_packet(&raw, key)
+            crate::crypto::encrypt_packet(&raw, key, seq)
         } else {
             Ok(raw)
         }
     }
 
-    pub fn decode_wire(buf: &[u8], key_opt: Option<&[u8; 32]>) -> Result<Self, String> {
+    pub fn decode_wire(buf: &[u8], key_opt: Option<&[u8; 32]>) -> Result<(u64, Self), String> {
         if let Some(key) = key_opt {
-            if buf.len() >= 32 && &buf[0..4] == b"BALA" {
-                let decrypted = crate::crypto::decrypt_packet(buf, key)?;
-                Self::decode(&decrypted).map_err(|e| e.to_string())
+            if buf.len() >= 40 && &buf[0..4] == b"BALA" {
+                let (seq, decrypted) = crate::crypto::decrypt_packet(buf, key)?;
+                let pkt = Self::decode(&decrypted).map_err(|e| e.to_string())?;
+                Ok((seq, pkt))
             } else {
                 Err("Rejected unauthenticated packet (E2EE room key active)".into())
             }
         } else {
-            Self::decode(buf).map_err(|e| e.to_string())
+            let pkt = Self::decode(buf).map_err(|e| e.to_string())?;
+            Ok((0, pkt))
         }
     }
 }
@@ -312,6 +318,46 @@ impl ImageReassembler {
     }
 }
 
+/// Token Bucket rate-limiter for UDP packets by IP address to prevent CPU DoS
+#[derive(Debug)]
+pub struct IpRateLimiter {
+    buckets: HashMap<IpAddr, (f64, Instant)>,
+    last_cleanup: Instant,
+    capacity: f64,
+    refill_rate: f64,
+}
+
+impl IpRateLimiter {
+    pub fn new(capacity: f64, refill_rate: f64) -> Self {
+        Self {
+            buckets: HashMap::new(),
+            last_cleanup: Instant::now(),
+            capacity,
+            refill_rate,
+        }
+    }
+
+    pub fn check(&mut self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        if self.last_cleanup.elapsed() > Duration::from_secs(30) {
+            self.buckets.retain(|_, (_, last)| now.duration_since(*last) < Duration::from_secs(60));
+            self.last_cleanup = now;
+        }
+
+        let entry = self.buckets.entry(ip).or_insert((self.capacity, now));
+        let elapsed = now.duration_since(entry.1).as_secs_f64();
+        entry.0 = (entry.0 + elapsed * self.refill_rate).min(self.capacity);
+        entry.1 = now;
+
+        if entry.0 >= 1.0 {
+            entry.0 -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn get_cache_file_path() -> std::path::PathBuf {
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         let dir = std::path::PathBuf::from(local_app_data).join("Balabol");
@@ -379,6 +425,13 @@ pub struct P2pNode {
     pub room_peer_cache: Arc<RwLock<HashMap<String, HashSet<SocketAddr>>>>,
     pub signaling_until_ms: Arc<AtomicU64>,
     pub reopen_signaling_requested: Arc<AtomicBool>,
+
+    // Network security & PFS
+    pub out_packet_seq: Arc<AtomicU64>,
+    pub peer_replay_windows: Arc<RwLock<HashMap<SocketAddr, crate::crypto::AntiReplayWindow>>>,
+    pub ephemeral_kx: Arc<crate::crypto::EphemeralKeyExchange>,
+    pub peer_pfs_keys: Arc<RwLock<HashMap<u32, [u8; 32]>>>,
+    pub hide_lan_addresses: Arc<AtomicBool>,
 }
 
 impl P2pNode {
@@ -420,7 +473,44 @@ impl P2pNode {
             room_peer_cache: Arc::new(RwLock::new(load_room_peer_cache())),
             signaling_until_ms: Arc::new(AtomicU64::new(0)),
             reopen_signaling_requested: Arc::new(AtomicBool::new(false)),
+
+            out_packet_seq: Arc::new(AtomicU64::new(0)),
+            peer_replay_windows: Arc::new(RwLock::new(HashMap::new())),
+            ephemeral_kx: Arc::new(crate::crypto::EphemeralKeyExchange::new()),
+            peer_pfs_keys: Arc::new(RwLock::new(HashMap::new())),
+            hide_lan_addresses: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    pub fn next_packet_seq(&self) -> u64 {
+        self.out_packet_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub fn get_key_for_peer(&self, peer_id_opt: Option<u32>) -> Option<[u8; 32]> {
+        if let Some(peer_id) = peer_id_opt {
+            if let Some(pfs_key) = self.peer_pfs_keys.read().get(&peer_id).cloned() {
+                return Some(pfs_key);
+            }
+        }
+        self.current_room_key.read().clone()
+    }
+
+    pub fn encode_wire_for_peer(&self, packet: &Packet, peer_id_opt: Option<u32>) -> Result<Vec<u8>, String> {
+        let key = self.get_key_for_peer(peer_id_opt);
+        let seq = self.next_packet_seq();
+        packet.encode_wire(key.as_ref(), seq)
+    }
+
+    pub fn set_hide_lan_mode(&self, hide: bool) {
+        self.hide_lan_addresses.store(hide, Ordering::Relaxed);
+        self.logger.info(&format!(
+            "Режим повышенной анонимности (сокрытие LAN): {}",
+            if hide { "Включен" } else { "Выключен" }
+        ));
+    }
+
+    pub fn is_hide_lan_mode(&self) -> bool {
+        self.hide_lan_addresses.load(Ordering::Relaxed)
     }
 
     pub fn get_known_endpoints_for_room(&self, clean_code: &str) -> Vec<SocketAddr> {
@@ -534,8 +624,7 @@ impl P2pNode {
             reason: "Пользователь вышел из комнаты".into(),
         };
 
-        let key_opt = self.current_room_key.read().clone();
-        if let Ok(bytes) = disc.encode_wire(key_opt.as_ref()) {
+        if let Ok(bytes) = self.encode_wire_for_peer(&disc, None) {
             if let Some(sock) = self.active_socket.read().as_ref() {
                 let addrs: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
                 for addr in addrs {
@@ -566,6 +655,8 @@ impl P2pNode {
         self.client_endpoints.write().clear();
         self.peer_addrs.write().clear();
         self.peers.write().clear();
+        self.peer_pfs_keys.write().clear();
+        self.peer_replay_windows.write().clear();
         self.seen_msg_ids.write().clear();
         self.pending_acks.write().clear();
         self.image_store.write().clear();
@@ -746,12 +837,15 @@ impl P2pNode {
                 data: chunk.to_vec(),
             };
 
-            let key_opt = self.current_room_key.read().clone();
-            if let Ok(pkt_bytes) = pkt.encode_wire(key_opt.as_ref()) {
-                for &addr in &client_addrs {
+            for &addr in &client_addrs {
+                let peer_id_opt = self.peer_addrs.read().get(&addr).copied();
+                if let Ok(pkt_bytes) = self.encode_wire_for_peer(&pkt, peer_id_opt) {
                     let _ = sock.send_to(&pkt_bytes, addr).await;
                 }
-                if let Some(host_addr) = host_addr_opt {
+            }
+            if let Some(host_addr) = host_addr_opt {
+                let host_id = self.current_host_id.load(Ordering::Relaxed);
+                if let Ok(pkt_bytes) = self.encode_wire_for_peer(&pkt, Some(host_id)) {
                     let _ = sock.send_to(&pkt_bytes, host_addr).await;
                 }
             }
@@ -802,16 +896,19 @@ impl P2pNode {
     }
 
     pub async fn broadcast_packet(&self, packet: &Packet) {
-        let key_opt = self.current_room_key.read().clone();
-        if let Ok(bytes) = packet.encode_wire(key_opt.as_ref()) {
-            let sock_opt = self.active_socket.read().clone();
-            if let Some(sock) = sock_opt {
-                let client_addrs: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
-                for addr in client_addrs {
+        let sock_opt = self.active_socket.read().clone();
+        if let Some(sock) = sock_opt {
+            let client_addrs: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
+            for addr in client_addrs {
+                let peer_id_opt = self.peer_addrs.read().get(&addr).copied();
+                if let Ok(bytes) = self.encode_wire_for_peer(packet, peer_id_opt) {
                     let _ = sock.send_to(&bytes, addr).await;
                 }
-                let host_addr_opt = *self.host_socket_addr.read();
-                if let Some(host_addr) = host_addr_opt {
+            }
+            let host_addr_opt = *self.host_socket_addr.read();
+            if let Some(host_addr) = host_addr_opt {
+                let host_id = self.current_host_id.load(Ordering::Relaxed);
+                if let Ok(bytes) = self.encode_wire_for_peer(packet, Some(host_id)) {
                     let _ = sock.send_to(&bytes, host_addr).await;
                 }
             }
@@ -823,7 +920,6 @@ impl P2pNode {
         let chunk_total = ((bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
         let sock_opt = self.active_socket.read().clone();
         let endpoints: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
-        let key_opt = self.current_room_key.read().clone();
         if let Some(sock) = sock_opt {
             for (idx, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
                 let pkt = Packet::ImageChunk {
@@ -832,8 +928,9 @@ impl P2pNode {
                     chunk_total,
                     data: chunk.to_vec(),
                 };
-                if let Ok(b) = pkt.encode_wire(key_opt.as_ref()) {
-                    for &addr in &endpoints {
+                for &addr in &endpoints {
+                    let peer_id_opt = self.peer_addrs.read().get(&addr).copied();
+                    if let Ok(b) = self.encode_wire_for_peer(&pkt, peer_id_opt) {
                         let _ = sock.send_to(&b, addr).await;
                     }
                 }
@@ -1006,7 +1103,8 @@ impl P2pNode {
         *self.active_socket.write() = Some(arc_socket.clone());
 
         // 2. Gather candidates
-        let candidates = gather_candidates(arc_socket.clone(), actual_port, opt_physical_ip, &self.logger).await;
+        let hide_lan = self.hide_lan_addresses.load(Ordering::Relaxed);
+        let candidates = gather_candidates(arc_socket.clone(), actual_port, opt_physical_ip, hide_lan, &self.logger).await;
 
         let local_str = candidates.first().map(|a| a.to_string());
         let pub_str = candidates
@@ -1116,6 +1214,7 @@ async fn run_mesh_peer_loop(
     let mut last_cleanup = Instant::now();
     let mut last_known_punch = Instant::now();
     let mut ping_seq = 0u64;
+    let mut rate_limiter = IpRateLimiter::new(1200.0, 800.0);
 
     // Discovered remote peers' candidates: peer_id -> Vec<SocketAddr>
     let mut discovered_candidates: HashMap<u32, Vec<SocketAddr>> = HashMap::new();
@@ -1156,7 +1255,8 @@ async fn run_mesh_peer_loop(
             sender_id: my_id,
         };
         let key_opt = node.current_room_key.read().clone();
-        if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref()) {
+        let seq = node.next_packet_seq();
+        if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref(), seq) {
             for target in &known_unconnected_addrs {
                 let _ = socket.send_to(&pb, *target).await;
             }
@@ -1191,7 +1291,8 @@ async fn run_mesh_peer_loop(
                     data: audio_payload,
                 };
                 let key_opt = node_audio.current_room_key.read().clone();
-                if let Ok(b) = audio_pkt.encode_wire(key_opt.as_ref()) {
+                let seq = node_audio.next_packet_seq();
+                if let Ok(b) = audio_pkt.encode_wire(key_opt.as_ref(), seq) {
                     let endpoints: Vec<SocketAddr> = node_audio
                         .client_endpoints
                         .read()
@@ -1303,7 +1404,8 @@ async fn run_mesh_peer_loop(
                         sender_id: my_id,
                     };
                     let key_opt = node.current_room_key.read().clone();
-                    if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref()) {
+                    let seq = node.next_packet_seq();
+                    if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref(), seq) {
                         for target in &candidates {
                             let _ = socket.send_to(&pb, *target).await;
                         }
@@ -1328,7 +1430,8 @@ async fn run_mesh_peer_loop(
                         sender_id: my_id,
                     };
                     let key_opt = node.current_room_key.read().clone();
-                    if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref()) {
+                    let seq = node.next_packet_seq();
+                    if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref(), seq) {
                         for &target in cands {
                             let _ = socket.send_to(&pb, target).await;
                         }
@@ -1351,7 +1454,8 @@ async fn run_mesh_peer_loop(
                     sender_id: my_id,
                 };
                 let key_opt = node.current_room_key.read().clone();
-                if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref()) {
+                let seq = node.next_packet_seq();
+                if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref(), seq) {
                     for target in &known_unconnected_addrs {
                         let _ = socket.send_to(&pb, *target).await;
                     }
@@ -1369,7 +1473,8 @@ async fn run_mesh_peer_loop(
                 timestamp_ms: now_ms(),
             };
             let key_opt = node.current_room_key.read().clone();
-            if let Ok(b) = ping_pkt.encode_wire(key_opt.as_ref()) {
+            let seq = node.next_packet_seq();
+            if let Ok(b) = ping_pkt.encode_wire(key_opt.as_ref(), seq) {
                 let targets: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
                 for target in targets {
                     let _ = socket.send_to(&b, target).await;
@@ -1417,8 +1522,35 @@ async fn run_mesh_peer_loop(
             recv_res = socket.recv_from(&mut buf) => {
                 match recv_res {
                     Ok((len, sender_addr)) => {
-                        let key_opt = node.current_room_key.read().clone();
-                        if let Ok(packet) = Packet::decode_wire(&buf[..len], key_opt.as_ref()) {
+                        // Rate limiter: Token Bucket to protect against UDP flood
+                        if !rate_limiter.check(sender_addr.ip()) {
+                            continue;
+                        }
+
+                        let sender_id_opt = node.peer_addrs.read().get(&sender_addr).copied();
+                        let room_key_opt = node.current_room_key.read().clone();
+                        let pfs_key_opt = sender_id_opt.and_then(|id| node.peer_pfs_keys.read().get(&id).cloned());
+
+                        let decoded_res = if let Some(ref pfs_key) = pfs_key_opt {
+                            Packet::decode_wire(&buf[..len], Some(pfs_key))
+                                .or_else(|_| Packet::decode_wire(&buf[..len], room_key_opt.as_ref()))
+                        } else {
+                            Packet::decode_wire(&buf[..len], room_key_opt.as_ref())
+                        };
+
+                        if let Ok((seq, packet)) = decoded_res {
+                            if seq > 0 {
+                                let mut windows = node.peer_replay_windows.write();
+                                let window = windows.entry(sender_addr).or_default();
+                                if !window.check_and_update(seq) {
+                                    node.logger.warn(&format!(
+                                        "AntiReplay: отброшен повторный или устаревший пакет от {} (seq: {})",
+                                        sender_addr, seq
+                                    ));
+                                    continue;
+                                }
+                            }
+
                             handle_mesh_packet(
                                 packet,
                                 sender_addr,
@@ -1462,7 +1594,6 @@ async fn perform_peer_exchange(
     }
 
     let my_id = node.my_peer_id.load(Ordering::Relaxed);
-    let key_opt = node.current_room_key.read().clone();
     let existing_peers: Vec<(u32, String, SocketAddr)> = {
         let endpoints = node.client_endpoints.read();
         let peers = node.peers.read();
@@ -1496,7 +1627,7 @@ async fn perform_peer_exchange(
             peer_name: existing_name.clone(),
             endpoints: vec![existing_addr],
         };
-        if let Ok(b) = intro_to_newcomer.encode_wire(key_opt.as_ref()) {
+        if let Ok(b) = node.encode_wire_for_peer(&intro_to_newcomer, Some(newcomer_id)) {
             for _ in 0..2 {
                 let _ = socket.send_to(&b, newcomer_addr).await;
             }
@@ -1509,7 +1640,7 @@ async fn perform_peer_exchange(
             peer_name: newcomer_name.to_string(),
             endpoints: vec![newcomer_addr],
         };
-        if let Ok(b) = intro_to_existing.encode_wire(key_opt.as_ref()) {
+        if let Ok(b) = node.encode_wire_for_peer(&intro_to_existing, Some(existing_id)) {
             for _ in 0..2 {
                 let _ = socket.send_to(&b, existing_addr).await;
             }
@@ -1528,7 +1659,6 @@ async fn handle_mesh_packet(
 ) {
     let my_id = node.my_peer_id.load(Ordering::Relaxed);
     let my_name = node.my_nickname.read().clone();
-    let key_opt = node.current_room_key.read().clone();
 
     match packet {
         Packet::Punch { room_code, nonce, sender_name, sender_id } => {
@@ -1552,10 +1682,19 @@ async fn handle_mesh_packet(
                 sender_id: my_id,
             };
 
-            if let Ok(b) = ack.encode_wire(key_opt.as_ref()) {
+            if let Ok(b) = node.encode_wire_for_peer(&ack, Some(sender_id)) {
                 for _ in 0..2 {
                     let _ = socket.send_to(&b, sender_addr).await;
                 }
+            }
+
+            // Initiate X25519 Perfect Forward Secrecy key exchange
+            let kx = Packet::KeyExchange {
+                sender_id: my_id,
+                ephemeral_pubkey: node.ephemeral_kx.public_key_bytes(),
+            };
+            if let Ok(b) = node.encode_wire_for_peer(&kx, Some(sender_id)) {
+                let _ = socket.send_to(&b, sender_addr).await;
             }
 
             node.record_room_peer_endpoints(&current_code, &[sender_addr]);
@@ -1623,6 +1762,15 @@ async fn handle_mesh_packet(
             node.client_endpoints.write().insert(sender_id, sender_addr);
             node.peer_addrs.write().insert(sender_addr, sender_id);
 
+            // Send our X25519 ephemeral key in response to PunchAck
+            let kx = Packet::KeyExchange {
+                sender_id: my_id,
+                ephemeral_pubkey: node.ephemeral_kx.public_key_bytes(),
+            };
+            if let Ok(b) = node.encode_wire_for_peer(&kx, Some(sender_id)) {
+                let _ = socket.send_to(&b, sender_addr).await;
+            }
+
             {
                 let mut peers_guard = node.peers.write();
                 let peer = peers_guard.entry(sender_id).or_insert_with(|| {
@@ -1675,7 +1823,7 @@ async fn handle_mesh_packet(
                     seq,
                     timestamp_ms,
                 };
-                if let Ok(b) = pong.encode_wire(key_opt.as_ref()) {
+                if let Ok(b) = node.encode_wire_for_peer(&pong, Some(sender_id)) {
                     let _ = socket.send_to(&b, sender_addr).await;
                 }
             }
@@ -1771,14 +1919,14 @@ async fn handle_mesh_packet(
                                 image_id: img_id.clone(),
                                 requester_id: my_id,
                             };
-                            if let Ok(b) = req.encode_wire(key_opt.as_ref()) {
+                            if let Ok(b) = node.encode_wire_for_peer(&req, Some(sender_id)) {
                                 let _ = socket.send_to(&b, sender_addr).await;
                             }
                         }
                     }
                 }
                 let ack = Packet::TextAck { id };
-                if let Ok(b) = ack.encode_wire(key_opt.as_ref()) {
+                if let Ok(b) = node.encode_wire_for_peer(&ack, Some(sender_id)) {
                     let _ = socket.send_to(&b, sender_addr).await;
                 }
             }
@@ -1796,7 +1944,7 @@ async fn handle_mesh_packet(
                     ));
                     let sock_opt = node.active_socket.read().clone();
                     let target_addr = node.client_endpoints.read().get(&requester_id).cloned().unwrap_or(sender_addr);
-                    let key_opt_clone = key_opt.clone();
+                    let node_img = node.clone();
                     tokio::spawn(async move {
                         const CHUNK_SIZE: usize = 1200;
                         let chunk_total = ((bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
@@ -1807,7 +1955,7 @@ async fn handle_mesh_packet(
                                 chunk_total,
                                 data: chunk.to_vec(),
                             };
-                            if let Ok(b) = pkt.encode_wire(key_opt_clone.as_ref()) {
+                            if let Ok(b) = node_img.encode_wire_for_peer(&pkt, Some(requester_id)) {
                                 if let Some(sock) = &sock_opt {
                                     let _ = sock.send_to(&b, target_addr).await;
                                 }
@@ -1866,12 +2014,12 @@ async fn handle_mesh_packet(
                     ));
                     let sock_opt = node.active_socket.read().clone();
                     let target_addr = node.client_endpoints.read().get(&requester_id).cloned().unwrap_or(sender_addr);
-                    let key_opt_clone = key_opt.clone();
+                    let node_hist = node.clone();
                     tokio::spawn(async move {
                         let start_idx = msgs.len().saturating_sub(50);
                         for msg in &msgs[start_idx..] {
                             let pkt = Packet::HistoryMessage { message: msg.clone() };
-                            if let Ok(b) = pkt.encode_wire(key_opt_clone.as_ref()) {
+                            if let Ok(b) = node_hist.encode_wire_for_peer(&pkt, Some(requester_id)) {
                                 if let Some(sock) = &sock_opt {
                                     let _ = sock.send_to(&b, target_addr).await;
                                 }
@@ -2007,9 +2155,30 @@ async fn handle_mesh_packet(
                     sender_name: my_name.clone(),
                     sender_id: my_id,
                 };
-                if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref()) {
+                if let Ok(pb) = node.encode_wire_for_peer(&punch_pkt, Some(peer_id)) {
                     for target in &candidates {
                         let _ = socket.send_to(&pb, *target).await;
+                    }
+                }
+            }
+        }
+
+        Packet::KeyExchange { sender_id, ephemeral_pubkey } => {
+            if sender_id != my_id {
+                let session_key = node.ephemeral_kx.compute_session_key(&ephemeral_pubkey, my_id, sender_id);
+                let is_new = !node.peer_pfs_keys.read().contains_key(&sender_id);
+                node.peer_pfs_keys.write().insert(sender_id, session_key);
+                node.logger.info(&format!(
+                    "🔐 [X25519 PFS] Установлен сессионный ключ Perfect Forward Secrecy для пира #{}",
+                    sender_id
+                ));
+                if is_new {
+                    let kx_reply = Packet::KeyExchange {
+                        sender_id: my_id,
+                        ephemeral_pubkey: node.ephemeral_kx.public_key_bytes(),
+                    };
+                    if let Ok(b) = node.encode_wire_for_peer(&kx_reply, Some(sender_id)) {
+                        let _ = socket.send_to(&b, sender_addr).await;
                     }
                 }
             }
@@ -2096,30 +2265,28 @@ async fn gather_candidates(
     socket: Arc<UdpSocket>,
     port: u16,
     opt_physical_ip: Option<Ipv4Addr>,
+    hide_lan: bool,
     logger: &AppLogger,
 ) -> Vec<SocketAddr> {
     let mut list = Vec::new();
 
     let lan_ip = opt_physical_ip.map(IpAddr::V4).unwrap_or_else(detect_local_lan_ip);
     let local_addr = SocketAddr::new(lan_ip, port);
-    list.push(local_addr);
-    logger.info(&format!("Локальный адрес кандидата: {}", local_addr));
 
-    for extra_ip in find_all_local_physical_ips() {
-        let extra_addr = SocketAddr::new(IpAddr::V4(extra_ip), port);
-        if !list.contains(&extra_addr) {
-            list.push(extra_addr);
-            logger.info(&format!("Дополнительный локальный адрес: {}", extra_addr));
-        }
-    }
-
+    // Discover public reflexive address via STUN
     if let Some(pub_addr) = discover_public_ip_via_stun(socket, logger).await {
         logger.info(&format!("STUN публичный адрес кандидата: {}", pub_addr));
-        if !list.contains(&pub_addr) {
-            list.push(pub_addr);
+        list.push(pub_addr);
+        if !hide_lan {
+            list.push(local_addr);
+            logger.info(&format!("Локальный адрес кандидата (LAN включен): {}", local_addr));
+        } else {
+            logger.info("Режим повышенной анонимности: внутренний LAN адрес скрыт от собеседников");
         }
     } else {
-        logger.warn("STUN: не удалось определить публичный адрес (будет использован LAN адрес)");
+        // Fallback to local LAN address if STUN is not reachable (e.g. offline local network)
+        logger.warn("STUN: не удалось определить публичный адрес (используется локальный LAN адрес)");
+        list.push(local_addr);
     }
 
     list
@@ -2146,13 +2313,10 @@ fn expand_candidates_with_port_spray(candidates: &[SocketAddr]) -> Vec<SocketAdd
 }
 
 pub fn detect_local_lan_ip() -> IpAddr {
-    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                if !addr.ip().is_loopback() && !addr.ip().is_unspecified() {
-                    return addr.ip();
-                }
-            }
+    #[cfg(windows)]
+    {
+        if let Some((_if_idx, Some(ip))) = find_best_physical_interface() {
+            return IpAddr::V4(ip);
         }
     }
     IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))
@@ -2740,12 +2904,13 @@ mod tests {
             image_id: None,
         };
 
-        // 1. Encrypt with key
-        let wire_bytes = pkt.encode_wire(Some(&key)).expect("encode_wire encrypted");
+        // 1. Encrypt with key and seq = 42
+        let wire_bytes = pkt.encode_wire(Some(&key), 42).expect("encode_wire encrypted");
         assert!(wire_bytes.starts_with(b"BALA"));
 
         // 2. Decrypt with correct key
-        let decoded = Packet::decode_wire(&wire_bytes, Some(&key)).expect("decode_wire success");
+        let (seq, decoded) = Packet::decode_wire(&wire_bytes, Some(&key)).expect("decode_wire success");
+        assert_eq!(seq, 42);
         assert_eq!(decoded, pkt);
 
         // 3. Decrypt with wrong key should fail
@@ -2757,10 +2922,42 @@ mod tests {
         assert!(no_key_decrypt.is_err());
 
         // 5. Plaintext backward compatibility when key is None
-        let plain_wire = pkt.encode_wire(None).expect("encode_wire plain");
+        let plain_wire = pkt.encode_wire(None, 0).expect("encode_wire plain");
         assert!(!plain_wire.starts_with(b"BALA"));
-        let plain_decoded = Packet::decode_wire(&plain_wire, None).expect("decode_wire plain");
+        let (plain_seq, plain_decoded) = Packet::decode_wire(&plain_wire, None).expect("decode_wire plain");
+        assert_eq!(plain_seq, 0);
         assert_eq!(plain_decoded, pkt);
+    }
+
+    #[test]
+    fn test_ip_rate_limiter() {
+        use std::net::Ipv4Addr;
+        let mut limiter = IpRateLimiter::new(5.0, 10.0);
+        let test_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
+
+        // 5 tokens available: first 5 checks should succeed
+        for _ in 0..5 {
+            assert!(limiter.check(test_ip));
+        }
+
+        // 6th check immediately should fail (exhausted tokens)
+        assert!(!limiter.check(test_ip));
+    }
+
+    #[test]
+    fn test_x25519_pfs_in_node() {
+        let logger_a = AppLogger::init();
+        let logger_b = AppLogger::init();
+        let node_a = P2pNode::new(logger_a);
+        let node_b = P2pNode::new(logger_b);
+
+        let pub_a = node_a.ephemeral_kx.public_key_bytes();
+        let pub_b = node_b.ephemeral_kx.public_key_bytes();
+
+        let session_key_a = node_a.ephemeral_kx.compute_session_key(&pub_b, 10, 20);
+        let session_key_b = node_b.ephemeral_kx.compute_session_key(&pub_a, 20, 10);
+
+        assert_eq!(session_key_a, session_key_b);
     }
 }
 

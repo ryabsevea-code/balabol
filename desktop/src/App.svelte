@@ -153,6 +153,18 @@
   let isMicTesting = false;
   let audioRestartFeedback = "";
 
+  // Anonymity & Security Mode (LAN IP concealment)
+  let hideLanMode = localStorage.getItem("balabol_hide_lan") !== "false"; // default: true
+  async function toggleHideLanMode() {
+    hideLanMode = !hideLanMode;
+    localStorage.setItem("balabol_hide_lan", hideLanMode ? "true" : "false");
+    try {
+      await invoke("set_hide_lan_mode", { enabled: hideLanMode });
+    } catch (e) {
+      console.error("Failed to set hide LAN mode:", e);
+    }
+  }
+
   // Sound Notifications (Join / Leave Audio Cues)
   let previousStatusType = "Disconnected";
 
@@ -243,8 +255,9 @@
         sensitivity: micSensitivity / 100,
       });
       await invoke("set_mic_gain", { gain: micGain / 100 });
+      await invoke("set_hide_lan_mode", { enabled: hideLanMode });
     } catch (e) {
-      console.error("Audio parameters init error:", e);
+      console.error("Audio/security parameters init error:", e);
     }
 
     await pollState();
@@ -2450,6 +2463,46 @@
                     : ''}"
                 />
                 <span>{audioRestartFeedback || "Обновить устройства"}</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- 5. Security & Anonymity Settings -->
+          <div
+            class="bg-[#13141a] p-4 rounded-xl border border-[#252834] space-y-3"
+          >
+            <div
+              class="text-xs font-semibold text-white flex items-center justify-between"
+            >
+              <div class="flex items-center gap-2">
+                <Lock class="w-4 h-4 text-cyan-400" />
+                <span>Безопасность и анонимность</span>
+              </div>
+              <span
+                class="text-[10px] text-cyan-400 bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/20"
+              >
+                Argon2id & X25519 PFS
+              </span>
+            </div>
+
+            <div
+              class="flex items-center justify-between p-3 rounded-lg bg-[#0d0e12] border border-[#1f212a]"
+            >
+              <div class="space-y-0.5 pr-3">
+                <div class="text-xs font-semibold text-white">
+                  Сокрытие локальных LAN-адресов
+                </div>
+                <div class="text-[11px] text-[#8a8e98] leading-relaxed">
+                  Исключает передачу локальных IP-адресов (192.168.x.x, 10.x.x.x). Собеседники видят только публичный STUN-адрес.
+                </div>
+              </div>
+              <button
+                on:click={toggleHideLanMode}
+                class="px-3 py-1.5 rounded-lg text-xs font-semibold transition shrink-0 {hideLanMode
+                  ? 'bg-cyan-600 hover:bg-cyan-500 text-white shadow-md shadow-cyan-600/20'
+                  : 'bg-[#22242e] hover:bg-[#2b2d38] text-[#8a8e98]'}"
+              >
+                {hideLanMode ? "Включено" : "Выключено"}
               </button>
             </div>
           </div>

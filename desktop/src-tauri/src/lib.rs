@@ -213,6 +213,16 @@ async fn stop_screen_capture(state: State<'_, AppState>) -> Result<(), String> {
     state.node.stop_screen_capture().await
 }
 
+#[tauri::command]
+fn set_hide_lan_mode(enabled: bool, state: State<'_, AppState>) {
+    state.node.set_hide_lan_mode(enabled);
+}
+
+#[tauri::command]
+fn get_hide_lan_mode(state: State<'_, AppState>) -> bool {
+    state.node.is_hide_lan_mode()
+}
+
 pub fn run() {
     let logger = AppLogger::init();
     logger.info("Запуск приложения Balabol P2P...");
@@ -268,6 +278,8 @@ pub fn run() {
             request_history,
             start_screen_capture,
             stop_screen_capture,
+            set_hide_lan_mode,
+            get_hide_lan_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
