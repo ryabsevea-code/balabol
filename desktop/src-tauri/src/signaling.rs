@@ -190,9 +190,8 @@ impl Signaling {
                                     if let Some(arr) = parsed.as_array() {
                                         if arr.len() >= 3 && arr[0] == "EVENT" {
                                             if let Some(content) = arr[2].get("content").and_then(|c| c.as_str()) {
-                                                let raw_content = crate::crypto::decrypt_string(content, &room_key)
-                                                    .unwrap_or_else(|_| content.to_string());
-                                                if let Ok(incoming) = serde_json::from_str::<MeshAnnounce>(&raw_content) {
+                                                if let Ok(raw_content) = crate::crypto::decrypt_string(content, &room_key) {
+                                                    if let Ok(incoming) = serde_json::from_str::<MeshAnnounce>(&raw_content) {
                                                     if incoming.peer_id != my_id {
                                                         let should_emit = {
                                                             let mut map = last_announced.lock();
@@ -230,6 +229,7 @@ impl Signaling {
                                                     }
                                                 }
                                             }
+                                        }
                                         }
                                     }
                                 }

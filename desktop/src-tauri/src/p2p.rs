@@ -2050,6 +2050,9 @@ impl VideoReassembler {
         data: Vec<u8>,
     ) -> Option<RemoteVideoFrame> {
         use base64::Engine;
+        if chunk_total == 0 || chunk_total > 500 || data.len() > 4096 {
+            return None;
+        }
         if self.chunks.is_empty()
             || frame_id > self.current_frame_id
             || sender_id != self.sender_id
