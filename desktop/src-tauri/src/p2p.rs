@@ -478,7 +478,7 @@ impl P2pNode {
             peer_replay_windows: Arc::new(RwLock::new(HashMap::new())),
             ephemeral_kx: Arc::new(crate::crypto::EphemeralKeyExchange::new()),
             peer_pfs_keys: Arc::new(RwLock::new(HashMap::new())),
-            hide_lan_addresses: Arc::new(AtomicBool::new(true)),
+            hide_lan_addresses: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1381,7 +1381,21 @@ async fn run_mesh_peer_loop(
                     }
                 }
 
-                let candidates = expand_candidates_with_port_spray(&ann.candidates);
+                let mut candidates = expand_candidates_with_port_spray(&ann.candidates);
+
+                // Smart local loopback for single-machine or same-NAT testing:
+                // If peer shares our public IP, add 127.0.0.1 with peer's port so loopback bypasses router NAT hairpinning.
+                let shares_public_ip = ann.candidates.iter().any(|peer_c| {
+                    my_announce.candidates.iter().any(|my_c| my_c.ip() == peer_c.ip())
+                });
+                if shares_public_ip {
+                    for &peer_c in &ann.candidates {
+                        let loopback = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), peer_c.port());
+                        if !candidates.contains(&loopback) {
+                            candidates.push(loopback);
+                        }
+                    }
+                }
                 discovered_candidates.insert(ann.peer_id, candidates.clone());
 
                 let already_connected = node.client_endpoints.read().contains_key(&ann.peer_id);

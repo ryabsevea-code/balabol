@@ -154,7 +154,7 @@
   let audioRestartFeedback = "";
 
   // Anonymity & Security Mode (LAN IP concealment)
-  let hideLanMode = localStorage.getItem("balabol_hide_lan") !== "false"; // default: true
+  let hideLanMode = localStorage.getItem("balabol_hide_lan") === "true"; // default: false (opt-in for internet anonymity)
   async function toggleHideLanMode() {
     hideLanMode = !hideLanMode;
     localStorage.setItem("balabol_hide_lan", hideLanMode ? "true" : "false");
@@ -2493,7 +2493,7 @@
                   Сокрытие локальных LAN-адресов
                 </div>
                 <div class="text-[11px] text-[#8a8e98] leading-relaxed">
-                  Исключает передачу локальных IP-адресов (192.168.x.x, 10.x.x.x). Собеседники видят только публичный STUN-адрес.
+                  Исключает передачу локальных IP-адресов (192.168.x.x, 10.x.x.x) через интернет. Для тестирования на одном ПК или в общей домашней сети оставьте выключенным.
                 </div>
               </div>
               <button
