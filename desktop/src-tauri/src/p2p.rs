@@ -472,7 +472,7 @@ impl P2pNode {
 
     pub fn reopen_signaling(&self) -> Result<(), String> {
         if self.current_room_code.read().is_none() {
-            return Err("Узел не находится в комнате".into());
+            return Err("Имя не может быть пустым".into());
         }
         self.reopen_signaling_requested.store(true, Ordering::SeqCst);
         let my_name = self.my_nickname.read().clone();
@@ -895,7 +895,7 @@ impl P2pNode {
     pub async fn update_nickname(&self, new_nickname: String) -> Result<(), String> {
         let trimmed = new_nickname.trim().to_string();
         if trimmed.is_empty() {
-            return Err("РРјСЏ РЅРµ РјРѕР¶РµС‚ Р±С‹С‚СЊ РїСѓСЃС‚С‹Рј".into());
+            return Err("Имя не может быть пустым".into());
         }
 
         *self.my_nickname.write() = trimmed.clone();
@@ -916,7 +916,7 @@ impl P2pNode {
             new_nickname: trimmed.clone(),
         };
         self.broadcast_packet(&pkt).await;
-        self.logger.info(&format!("Р’Р°С€Рµ РёРјСЏ РѕР±РЅРѕРІР»РµРЅРѕ РЅР° '{}'", trimmed));
+        self.logger.info(&format!("Ваше имя обновлено на '{}'", trimmed));
         Ok(())
     }
 
@@ -2124,7 +2124,7 @@ async fn discover_public_ip_via_stun(socket: Arc<UdpSocket>, logger: &AppLogger)
     }
 
     if targets.is_empty() {
-        logger.warn("STUN: РќРµ СѓРґР°Р»РѕСЃСЊ СЂР°Р·СЂРµС€РёС‚СЊ STUN-СЃРµСЂРІРµСЂС‹");
+        logger.warn("STUN: Не удалось разрешить STUN-серверы");
         return None;
     }
 
@@ -2155,7 +2155,7 @@ async fn discover_public_ip_via_stun(socket: Arc<UdpSocket>, logger: &AppLogger)
                 if let Ok((len, from)) = res {
                     if len >= 20 {
                         if let Some(pub_addr) = parse_stun_response(&buf[..len], &tx_id) {
-                            logger.info(&format!("STUN: РїРѕР»СѓС‡РµРЅ РѕС‚РІРµС‚ РѕС‚ {} -> {}", from, pub_addr));
+                            logger.info(&format!("STUN: получен ответ от {} -> {}", from, pub_addr));
                             return Some(pub_addr);
                         }
                     }
@@ -2250,7 +2250,7 @@ pub fn configure_socket_physical_if(socket: &UdpSocket, logger: &AppLogger) -> O
             );
             if res == 0 {
                 logger.info(&format!(
-                    "UDP СЃРѕРєРµС‚ РїСЂРёРІСЏР·Р°РЅ Рє С„РёР·РёС‡РµСЃРєРѕРјСѓ РёРЅС‚РµСЂС„РµР№СЃСѓ #{} (LAN IP: {:?})",
+                    "UDP сокет привязан к физическому интерфейсу #{} (LAN IP: {:?})",
                     if_idx,
                     opt_ip.unwrap_or(Ipv4Addr::UNSPECIFIED)
                 ));

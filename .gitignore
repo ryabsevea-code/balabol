@@ -9,6 +9,14 @@ node_modules/
 dist/
 **/dist/
 
+# Release and distribution binaries
+dist-release/
+test_logs/
+*.exe
+*.dll
+*.pdb
+*.msi
+
 # SQLite runtime databases
 *.db
 *.db-wal
@@ -24,10 +32,14 @@ balabol_data.db*
 .env.local
 .env.*.local
 
-# Logs
+# Logs and runtime caches
 *.log
+**/*.log
 npm-debug.log*
 yarn-debug.log*
+*room_cache.json
+**/*room_cache.json
+balabol.log
 
 # Editor & OS files
 .vscode/
@@ -37,4 +49,3 @@ Thumbs.db
 
 # Pending deletion / temporary
 client_delete_pending/
-*room_cache.json

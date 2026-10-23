@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "build:dist": "tauri build --no-bundle && node -e \"const fs=require('fs'); fs.copyFileSync('src-tauri/target/release/balabol-desktop.exe', '../dist-release/balabol.exe'); console.log('[SUCCESS] dist-release/balabol.exe created');\""
+    "build:dist": "tauri build --no-bundle && node -e \"const fs=require('fs'); fs.mkdirSync('../dist-release', { recursive: true }); fs.copyFileSync('src-tauri/target/release/balabol-desktop.exe', '../dist-release/balabol.exe'); console.log('[SUCCESS] dist-release/balabol.exe created');\""
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.3",
