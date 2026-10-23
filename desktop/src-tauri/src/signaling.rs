@@ -67,12 +67,13 @@ impl Signaling {
         logger: &AppLogger,
     ) -> Result<MeshSignalingSession, String> {
         let clean_code = sanitize_room_code(room_code);
-        let room_tag = format!("balabol_mesh_v5_{}", clean_code);
+        let room_key = crate::crypto::derive_room_key(&clean_code);
+        let room_tag = crate::crypto::derive_nostr_topic(&clean_code);
 
         logger.info(&format!(
-            "Mesh сигналинг: параллельный запуск пула из {} WSS-релеев для комнаты '{}'...",
+            "Mesh сигналинг: защищенный запуск пула из {} WSS-релеев (тег: {}, шифрование: E2EE)...",
             RELAYS.len(),
-            clean_code
+            room_tag
         ));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<MeshAnnounce>(64);
@@ -87,6 +88,8 @@ impl Signaling {
         };
 
         let announce_json = serde_json::to_string(&my_announce).unwrap_or_default();
+        let encrypted_announce = crate::crypto::encrypt_string(&announce_json, &room_key)
+            .unwrap_or(announce_json);
         let mut join_handles = Vec::new();
         let mut relay_handles = Vec::new();
 
@@ -94,7 +97,8 @@ impl Signaling {
             let tx = tx.clone();
             let shutdown = shutdown.clone();
             let room_tag = room_tag.clone();
-            let announce_payload = announce_json.clone();
+            let announce_payload = encrypted_announce.clone();
+            let room_key = room_key;
             let keypair = keypair;
             let last_announced = last_announced.clone();
             let my_id = my_announce.peer_id;
@@ -186,7 +190,9 @@ impl Signaling {
                                     if let Some(arr) = parsed.as_array() {
                                         if arr.len() >= 3 && arr[0] == "EVENT" {
                                             if let Some(content) = arr[2].get("content").and_then(|c| c.as_str()) {
-                                                if let Ok(incoming) = serde_json::from_str::<MeshAnnounce>(content) {
+                                                let raw_content = crate::crypto::decrypt_string(content, &room_key)
+                                                    .unwrap_or_else(|_| content.to_string());
+                                                if let Ok(incoming) = serde_json::from_str::<MeshAnnounce>(&raw_content) {
                                                     if incoming.peer_id != my_id {
                                                         let should_emit = {
                                                             let mut map = last_announced.lock();

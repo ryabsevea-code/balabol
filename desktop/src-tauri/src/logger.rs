@@ -14,7 +14,13 @@ pub struct AppLogger {
 
 impl AppLogger {
     pub fn init() -> Self {
-        let app_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let app_dir = if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let dir = PathBuf::from(local_app_data).join("Balabol").join("logs");
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        };
         let file_path = app_dir.join("balabol.log");
 
         // Write session start marker

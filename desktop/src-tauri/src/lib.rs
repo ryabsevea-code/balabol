@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod crypto;
 mod logger;
 pub mod p2p;
 pub mod screen_capture;

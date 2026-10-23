@@ -138,6 +138,28 @@ impl Packet {
     pub fn decode(buf: &[u8]) -> Result<Self, bincode::Error> {
         bincode::deserialize(buf)
     }
+
+    pub fn encode_wire(&self, key_opt: Option<&[u8; 32]>) -> Result<Vec<u8>, String> {
+        let raw = self.encode().map_err(|e| e.to_string())?;
+        if let Some(key) = key_opt {
+            crate::crypto::encrypt_packet(&raw, key)
+        } else {
+            Ok(raw)
+        }
+    }
+
+    pub fn decode_wire(buf: &[u8], key_opt: Option<&[u8; 32]>) -> Result<Self, String> {
+        if let Some(key) = key_opt {
+            if buf.len() >= 32 && &buf[0..4] == b"BALA" {
+                let decrypted = crate::crypto::decrypt_packet(buf, key)?;
+                Self::decode(&decrypted).map_err(|e| e.to_string())
+            } else {
+                Err("Rejected unauthenticated packet (E2EE room key active)".into())
+            }
+        } else {
+            Self::decode(buf).map_err(|e| e.to_string())
+        }
+    }
 }
 
 pub fn now_ms() -> u64 {
@@ -257,15 +279,23 @@ pub struct ImageReassembler {
 }
 
 impl ImageReassembler {
-    pub fn new(chunk_total: u32) -> Self {
-        Self {
+    pub fn new(chunk_total: u32) -> Option<Self> {
+        // Enforce strict limit: chunk_total must be > 0 and <= 5000 (~6 MB) to prevent OOM DoS
+        if chunk_total == 0 || chunk_total > 5000 {
+            return None;
+        }
+        Some(Self {
             chunk_total,
             chunks: vec![None; chunk_total as usize],
             created_at: Instant::now(),
-        }
+        })
     }
 
     pub fn handle_chunk(&mut self, chunk_idx: u32, data: Vec<u8>) -> Option<Vec<u8>> {
+        // Reject chunks if transfer timed out (>15s) or chunk is abnormally large (>4 KB)
+        if self.created_at.elapsed() > Duration::from_secs(15) || data.len() > 4096 {
+            return None;
+        }
         if (chunk_idx as usize) < self.chunks.len() {
             self.chunks[chunk_idx as usize] = Some(data);
             if self.chunks.iter().all(|c| c.is_some()) {
@@ -283,9 +313,15 @@ impl ImageReassembler {
 }
 
 fn get_cache_file_path() -> std::path::PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join("balabol_room_cache.json")
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let dir = std::path::PathBuf::from(local_app_data).join("Balabol");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("balabol_room_cache.json")
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("balabol_room_cache.json")
+    }
 }
 
 pub fn load_room_peer_cache() -> HashMap<String, HashSet<SocketAddr>> {
@@ -334,6 +370,7 @@ pub struct P2pNode {
     pub remote_media_state: Arc<RwLock<RemoteMediaState>>,
     pub video_frame_seq: Arc<AtomicU32>,
     pub current_room_code: Arc<RwLock<Option<String>>>,
+    pub current_room_key: Arc<RwLock<Option<[u8; 32]>>>,
     pub image_store: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     pub image_reassemblers: Arc<RwLock<HashMap<String, ImageReassembler>>>,
     pub video_frame_callback: Arc<RwLock<Option<Box<dyn Fn(RemoteVideoFrame) + Send + Sync>>>>,
@@ -374,6 +411,7 @@ impl P2pNode {
             remote_media_state: Arc::new(RwLock::new(RemoteMediaState::default())),
             video_frame_seq: Arc::new(AtomicU32::new(1)),
             current_room_code: Arc::new(RwLock::new(None)),
+            current_room_key: Arc::new(RwLock::new(None)),
             image_store: Arc::new(RwLock::new(HashMap::new())),
             image_reassemblers: Arc::new(RwLock::new(HashMap::new())),
             video_frame_callback: Arc::new(RwLock::new(None)),
@@ -496,7 +534,8 @@ impl P2pNode {
             reason: "Пользователь вышел из комнаты".into(),
         };
 
-        if let Ok(bytes) = disc.encode() {
+        let key_opt = self.current_room_key.read().clone();
+        if let Ok(bytes) = disc.encode_wire(key_opt.as_ref()) {
             if let Some(sock) = self.active_socket.read().as_ref() {
                 let addrs: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
                 for addr in addrs {
@@ -529,6 +568,9 @@ impl P2pNode {
         self.peers.write().clear();
         self.seen_msg_ids.write().clear();
         self.pending_acks.write().clear();
+        self.image_store.write().clear();
+        self.image_reassemblers.write().clear();
+        *self.current_room_key.write() = None;
         self.is_host.store(false, Ordering::SeqCst);
         self.signaling_until_ms.store(0, Ordering::SeqCst);
         self.reopen_signaling_requested.store(false, Ordering::SeqCst);
@@ -704,7 +746,8 @@ impl P2pNode {
                 data: chunk.to_vec(),
             };
 
-            if let Ok(pkt_bytes) = pkt.encode() {
+            let key_opt = self.current_room_key.read().clone();
+            if let Ok(pkt_bytes) = pkt.encode_wire(key_opt.as_ref()) {
                 for &addr in &client_addrs {
                     let _ = sock.send_to(&pkt_bytes, addr).await;
                 }
@@ -759,7 +802,8 @@ impl P2pNode {
     }
 
     pub async fn broadcast_packet(&self, packet: &Packet) {
-        if let Ok(bytes) = packet.encode() {
+        let key_opt = self.current_room_key.read().clone();
+        if let Ok(bytes) = packet.encode_wire(key_opt.as_ref()) {
             let sock_opt = self.active_socket.read().clone();
             if let Some(sock) = sock_opt {
                 let client_addrs: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
@@ -779,6 +823,7 @@ impl P2pNode {
         let chunk_total = ((bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
         let sock_opt = self.active_socket.read().clone();
         let endpoints: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
+        let key_opt = self.current_room_key.read().clone();
         if let Some(sock) = sock_opt {
             for (idx, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
                 let pkt = Packet::ImageChunk {
@@ -787,7 +832,7 @@ impl P2pNode {
                     chunk_total,
                     data: chunk.to_vec(),
                 };
-                if let Ok(b) = pkt.encode() {
+                if let Ok(b) = pkt.encode_wire(key_opt.as_ref()) {
                     for &addr in &endpoints {
                         let _ = sock.send_to(&b, addr).await;
                     }
@@ -834,7 +879,7 @@ impl P2pNode {
             image_id: image_id.clone(),
         };
 
-        // Broadcast to all peers via direct UDP
+        // Broadcast to all peers via direct UDP (encrypted & authenticated)
         self.broadcast_packet(&packet).await;
 
         // Proactively send image chunks directly via UDP
@@ -857,9 +902,9 @@ impl P2pNode {
 
         self.chat_messages.write().push(msg.clone());
         if !trimmed.is_empty() {
-            self.logger.info(&format!("[ЧАТ] Я: {}", trimmed));
+            self.logger.info(&format!("[ЧАТ] Отправлено сообщение (длина: {} симв.)", trimmed.chars().count()));
         } else {
-            self.logger.info("[ЧАТ] Я отправил(а) изображение");
+            self.logger.info("[ЧАТ] Отправлено изображение");
         }
         Ok(msg)
     }
@@ -978,6 +1023,8 @@ impl P2pNode {
         *self.my_nickname.write() = nickname.clone();
         self.current_host_id.store(my_id, Ordering::SeqCst);
         *self.backup_host_id.write() = None;
+        let room_key = crate::crypto::derive_room_key(&clean_code);
+        *self.current_room_key.write() = Some(room_key);
         *self.current_room_code.write() = Some(clean_code.clone());
 
         *self.status.write() = ConnectionStatus::Connected {
@@ -1108,7 +1155,8 @@ async fn run_mesh_peer_loop(
             sender_name: my_name,
             sender_id: my_id,
         };
-        if let Ok(pb) = punch_pkt.encode() {
+        let key_opt = node.current_room_key.read().clone();
+        if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref()) {
             for target in &known_unconnected_addrs {
                 let _ = socket.send_to(&pb, *target).await;
             }
@@ -1142,7 +1190,8 @@ async fn run_mesh_peer_loop(
                     seq: audio_seq,
                     data: audio_payload,
                 };
-                if let Ok(b) = audio_pkt.encode() {
+                let key_opt = node_audio.current_room_key.read().clone();
+                if let Ok(b) = audio_pkt.encode_wire(key_opt.as_ref()) {
                     let endpoints: Vec<SocketAddr> = node_audio
                         .client_endpoints
                         .read()
@@ -1253,7 +1302,8 @@ async fn run_mesh_peer_loop(
                         sender_name: my_name.clone(),
                         sender_id: my_id,
                     };
-                    if let Ok(pb) = punch_pkt.encode() {
+                    let key_opt = node.current_room_key.read().clone();
+                    if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref()) {
                         for target in &candidates {
                             let _ = socket.send_to(&pb, *target).await;
                         }
@@ -1277,7 +1327,8 @@ async fn run_mesh_peer_loop(
                         sender_name: my_name.clone(),
                         sender_id: my_id,
                     };
-                    if let Ok(pb) = punch_pkt.encode() {
+                    let key_opt = node.current_room_key.read().clone();
+                    if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref()) {
                         for &target in cands {
                             let _ = socket.send_to(&pb, target).await;
                         }
@@ -1299,7 +1350,8 @@ async fn run_mesh_peer_loop(
                     sender_name: my_name.clone(),
                     sender_id: my_id,
                 };
-                if let Ok(pb) = punch_pkt.encode() {
+                let key_opt = node.current_room_key.read().clone();
+                if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref()) {
                     for target in &known_unconnected_addrs {
                         let _ = socket.send_to(&pb, *target).await;
                     }
@@ -1316,7 +1368,8 @@ async fn run_mesh_peer_loop(
                 seq: ping_seq,
                 timestamp_ms: now_ms(),
             };
-            if let Ok(b) = ping_pkt.encode() {
+            let key_opt = node.current_room_key.read().clone();
+            if let Ok(b) = ping_pkt.encode_wire(key_opt.as_ref()) {
                 let targets: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
                 for target in targets {
                     let _ = socket.send_to(&b, target).await;
@@ -1364,7 +1417,8 @@ async fn run_mesh_peer_loop(
             recv_res = socket.recv_from(&mut buf) => {
                 match recv_res {
                     Ok((len, sender_addr)) => {
-                        if let Ok(packet) = Packet::decode(&buf[..len]) {
+                        let key_opt = node.current_room_key.read().clone();
+                        if let Ok(packet) = Packet::decode_wire(&buf[..len], key_opt.as_ref()) {
                             handle_mesh_packet(
                                 packet,
                                 sender_addr,
@@ -1408,6 +1462,7 @@ async fn perform_peer_exchange(
     }
 
     let my_id = node.my_peer_id.load(Ordering::Relaxed);
+    let key_opt = node.current_room_key.read().clone();
     let existing_peers: Vec<(u32, String, SocketAddr)> = {
         let endpoints = node.client_endpoints.read();
         let peers = node.peers.read();
@@ -1441,7 +1496,7 @@ async fn perform_peer_exchange(
             peer_name: existing_name.clone(),
             endpoints: vec![existing_addr],
         };
-        if let Ok(b) = intro_to_newcomer.encode() {
+        if let Ok(b) = intro_to_newcomer.encode_wire(key_opt.as_ref()) {
             for _ in 0..2 {
                 let _ = socket.send_to(&b, newcomer_addr).await;
             }
@@ -1454,7 +1509,7 @@ async fn perform_peer_exchange(
             peer_name: newcomer_name.to_string(),
             endpoints: vec![newcomer_addr],
         };
-        if let Ok(b) = intro_to_existing.encode() {
+        if let Ok(b) = intro_to_existing.encode_wire(key_opt.as_ref()) {
             for _ in 0..2 {
                 let _ = socket.send_to(&b, existing_addr).await;
             }
@@ -1473,6 +1528,7 @@ async fn handle_mesh_packet(
 ) {
     let my_id = node.my_peer_id.load(Ordering::Relaxed);
     let my_name = node.my_nickname.read().clone();
+    let key_opt = node.current_room_key.read().clone();
 
     match packet {
         Packet::Punch { room_code, nonce, sender_name, sender_id } => {
@@ -1496,7 +1552,7 @@ async fn handle_mesh_packet(
                 sender_id: my_id,
             };
 
-            if let Ok(b) = ack.encode() {
+            if let Ok(b) = ack.encode_wire(key_opt.as_ref()) {
                 for _ in 0..2 {
                     let _ = socket.send_to(&b, sender_addr).await;
                 }
@@ -1619,7 +1675,7 @@ async fn handle_mesh_packet(
                     seq,
                     timestamp_ms,
                 };
-                if let Ok(b) = pong.encode() {
+                if let Ok(b) = pong.encode_wire(key_opt.as_ref()) {
                     let _ = socket.send_to(&b, sender_addr).await;
                 }
             }
@@ -1694,9 +1750,9 @@ async fn handle_mesh_packet(
                 let is_new = node.seen_msg_ids.write().insert(id);
                 if is_new {
                     if !text.is_empty() {
-                        node.logger.info(&format!("[ЧАТ] {}: {}", sender_name, text));
+                        node.logger.info(&format!("[ЧАТ] Сообщение от '{}' ({} симв.)", sender_name, text.chars().count()));
                     } else if image_id.is_some() || image_thumb.is_some() {
-                        node.logger.info(&format!("[ЧАТ] {}: [Изображение]", sender_name));
+                        node.logger.info(&format!("[ЧАТ] Изображение от '{}'", sender_name));
                     }
                     node.chat_messages.write().push(ChatMessage {
                         id,
@@ -1715,14 +1771,14 @@ async fn handle_mesh_packet(
                                 image_id: img_id.clone(),
                                 requester_id: my_id,
                             };
-                            if let Ok(b) = req.encode() {
+                            if let Ok(b) = req.encode_wire(key_opt.as_ref()) {
                                 let _ = socket.send_to(&b, sender_addr).await;
                             }
                         }
                     }
                 }
                 let ack = Packet::TextAck { id };
-                if let Ok(b) = ack.encode() {
+                if let Ok(b) = ack.encode_wire(key_opt.as_ref()) {
                     let _ = socket.send_to(&b, sender_addr).await;
                 }
             }
@@ -1740,6 +1796,7 @@ async fn handle_mesh_packet(
                     ));
                     let sock_opt = node.active_socket.read().clone();
                     let target_addr = node.client_endpoints.read().get(&requester_id).cloned().unwrap_or(sender_addr);
+                    let key_opt_clone = key_opt.clone();
                     tokio::spawn(async move {
                         const CHUNK_SIZE: usize = 1200;
                         let chunk_total = ((bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
@@ -1750,7 +1807,7 @@ async fn handle_mesh_packet(
                                 chunk_total,
                                 data: chunk.to_vec(),
                             };
-                            if let Ok(b) = pkt.encode() {
+                            if let Ok(b) = pkt.encode_wire(key_opt_clone.as_ref()) {
                                 if let Some(sock) = &sock_opt {
                                     let _ = sock.send_to(&b, target_addr).await;
                                 }
@@ -1764,16 +1821,36 @@ async fn handle_mesh_packet(
 
         Packet::ImageChunk { image_id, chunk_idx, chunk_total, data } => {
             let mut reassemblers = node.image_reassemblers.write();
-            let reassembler = reassemblers
-                .entry(image_id.clone())
-                .or_insert_with(|| ImageReassembler::new(chunk_total));
+            reassemblers.retain(|_, r| r.created_at.elapsed() < Duration::from_secs(15));
+            let current_count = reassemblers.len();
+            use std::collections::hash_map::Entry;
+            let entry = reassemblers.entry(image_id.clone());
+            let reassembler = match entry {
+                Entry::Occupied(o) => o.into_mut(),
+                Entry::Vacant(v) => {
+                    if current_count >= 20 {
+                        return;
+                    }
+                    if let Some(r) = ImageReassembler::new(chunk_total) {
+                        v.insert(r)
+                    } else {
+                        return;
+                    }
+                }
+            };
             if let Some(full_bytes) = reassembler.handle_chunk(chunk_idx, data) {
                 node.logger.info(&format!(
                     "🖼️ [Изображение] Полное изображение '{}' получено ({:.1} KB)",
                     image_id,
                     full_bytes.len() as f64 / 1024.0
                 ));
-                node.image_store.write().insert(image_id.clone(), full_bytes);
+                let mut store = node.image_store.write();
+                if store.len() >= 30 {
+                    if let Some(first_key) = store.keys().next().cloned() {
+                        store.remove(&first_key);
+                    }
+                }
+                store.insert(image_id.clone(), full_bytes);
                 reassemblers.remove(&image_id);
             }
         }
@@ -1789,11 +1866,12 @@ async fn handle_mesh_packet(
                     ));
                     let sock_opt = node.active_socket.read().clone();
                     let target_addr = node.client_endpoints.read().get(&requester_id).cloned().unwrap_or(sender_addr);
+                    let key_opt_clone = key_opt.clone();
                     tokio::spawn(async move {
                         let start_idx = msgs.len().saturating_sub(50);
                         for msg in &msgs[start_idx..] {
                             let pkt = Packet::HistoryMessage { message: msg.clone() };
-                            if let Ok(b) = pkt.encode() {
+                            if let Ok(b) = pkt.encode_wire(key_opt_clone.as_ref()) {
                                 if let Some(sock) = &sock_opt {
                                     let _ = sock.send_to(&b, target_addr).await;
                                 }
@@ -1929,7 +2007,7 @@ async fn handle_mesh_packet(
                     sender_name: my_name.clone(),
                     sender_id: my_id,
                 };
-                if let Ok(pb) = punch_pkt.encode() {
+                if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref()) {
                     for target in &candidates {
                         let _ = socket.send_to(&pb, *target).await;
                     }
@@ -2640,6 +2718,46 @@ mod tests {
         let known = node.get_known_endpoints_for_room("ROOM-TEST");
         assert!(known.contains(&ep1));
         assert!(known.contains(&ep2));
+    }
+
+    #[test]
+    fn test_wire_encryption_and_decryption() {
+        use crate::crypto::derive_room_key;
+
+        let key = derive_room_key("SECRET-ROOM-42");
+        let wrong_key = derive_room_key("WRONG-ROOM-99");
+
+        let pkt = Packet::TextMessage {
+            id: 12345,
+            sender_id: 1,
+            text: "Hello encrypted world!".to_string(),
+            sender_name: "Alice".to_string(),
+            timestamp_ms: 999999,
+            image_thumb: None,
+            image_id: None,
+        };
+
+        // 1. Encrypt with key
+        let wire_bytes = pkt.encode_wire(Some(&key)).expect("encode_wire encrypted");
+        assert!(wire_bytes.starts_with(b"BALA"));
+
+        // 2. Decrypt with correct key
+        let decoded = Packet::decode_wire(&wire_bytes, Some(&key)).expect("decode_wire success");
+        assert_eq!(decoded, pkt);
+
+        // 3. Decrypt with wrong key should fail
+        let wrong_decrypt = Packet::decode_wire(&wire_bytes, Some(&wrong_key));
+        assert!(wrong_decrypt.is_err());
+
+        // 4. Decrypt without key should fail because packet is encrypted
+        let no_key_decrypt = Packet::decode_wire(&wire_bytes, None);
+        assert!(no_key_decrypt.is_err());
+
+        // 5. Plaintext backward compatibility when key is None
+        let plain_wire = pkt.encode_wire(None).expect("encode_wire plain");
+        assert!(!plain_wire.starts_with(b"BALA"));
+        let plain_decoded = Packet::decode_wire(&plain_wire, None).expect("decode_wire plain");
+        assert_eq!(plain_decoded, pkt);
     }
 }
 
