@@ -106,6 +106,34 @@ fn get_log_file_path(state: State<'_, AppState>) -> String {
 }
 
 #[tauri::command]
+fn open_logs_folder(state: State<'_, AppState>) -> Result<String, String> {
+    let log_path = state.logger.log_file_path();
+    let folder = state.logger.log_dir();
+
+    #[cfg(target_os = "windows")]
+    {
+        if std::path::Path::new(&log_path).exists() {
+            let _ = std::process::Command::new("explorer")
+                .args(["/select,", &log_path])
+                .spawn();
+        } else {
+            let _ = std::process::Command::new("explorer")
+                .arg(&folder)
+                .spawn();
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(&folder)
+            .spawn();
+    }
+
+    Ok(log_path)
+}
+
+#[tauri::command]
 fn set_mic_muted(muted: bool, state: State<'_, AppState>) {
     state.node.set_mic_muted(muted);
 }
@@ -255,6 +283,7 @@ pub fn run() {
             reopen_signaling,
             get_logs,
             get_log_file_path,
+            open_logs_folder,
             set_mic_muted,
             set_deafened,
             set_master_volume,

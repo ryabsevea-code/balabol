@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 pub const VOICE_SAMPLE_RATE: u32 = 24000;
 /// 20ms frame = 480 samples at 24 kHz
 pub const SAMPLES_PER_FRAME: usize = 480;
-/// Target jitter buffer size: ~40ms (2 frames = 960 samples @ 24 kHz)
-pub const JITTER_TARGET_SAMPLES: usize = 960;
-/// Max jitter buffer limit: ~120ms (6 frames = 2880 samples @ 24 kHz) to prevent latency buildup
-pub const JITTER_MAX_SAMPLES: usize = 2880;
+/// Target jitter buffer size: ~60ms (3 frames = 1440 samples @ 24 kHz) to absorb WAN/internet jitter
+pub const JITTER_TARGET_SAMPLES: usize = 1440;
+/// Max jitter buffer limit: ~200ms (10 frames = 4800 samples @ 24 kHz) to prevent latency buildup
+pub const JITTER_MAX_SAMPLES: usize = 4800;
 /// VAD hangover frames: keep transmitting for 15 frames (300ms) after speech drops to prevent chopped words
 pub const VAD_HANGOVER_FRAMES: usize = 15;
 
@@ -1169,12 +1169,16 @@ mod tests {
     fn test_jitter_buffer_prebuffering_and_fadeout() {
         let mut jb = JitterBuffer::new(JITTER_TARGET_SAMPLES, JITTER_MAX_SAMPLES);
 
-        // While buffering < target (960 samples @ 24kHz), pop_sample should output silence (0.0)
+        // While buffering < target (1440 samples @ 24kHz = 60ms), pop_sample should output silence (0.0)
         let chunk = vec![1000i16; 480];
         jb.push_pcm_samples(&chunk);
         assert_eq!(jb.pop_sample(), 0.0);
 
-        // Second chunk brings total to 960 -> should start playback!
+        // Second chunk brings total to 960 < 1440 -> still buffering
+        jb.push_pcm_samples(&chunk);
+        assert_eq!(jb.pop_sample(), 0.0);
+
+        // Third chunk brings total to 1440 -> should start playback!
         jb.push_pcm_samples(&chunk);
         let s = jb.pop_sample();
         assert!(s > 0.0, "Jitter buffer must begin playback once target is reached");

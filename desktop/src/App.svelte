@@ -37,6 +37,8 @@
     Image as ImageIcon,
     Lock,
     Unlock,
+    FileText,
+    FolderOpen,
   } from "lucide-svelte";
 
   let status = { type: "Disconnected" };
@@ -165,6 +167,24 @@
     }
   }
 
+  // Diagnostic Logs
+  let logFilePath = "";
+  async function loadLogFilePath() {
+    try {
+      logFilePath = await invoke("get_log_file_path");
+    } catch (e) {
+      console.error("Failed to get log file path:", e);
+    }
+  }
+
+  async function handleOpenLogsFolder() {
+    try {
+      await invoke("open_logs_folder");
+    } catch (e) {
+      console.error("Failed to open logs folder:", e);
+    }
+  }
+
   // Sound Notifications (Join / Leave Audio Cues)
   let previousStatusType = "Disconnected";
 
@@ -256,6 +276,7 @@
       });
       await invoke("set_mic_gain", { gain: micGain / 100 });
       await invoke("set_hide_lan_mode", { enabled: hideLanMode });
+      await loadLogFilePath();
     } catch (e) {
       console.error("Audio/security parameters init error:", e);
     }
@@ -2503,6 +2524,48 @@
                   : 'bg-[#22242e] hover:bg-[#2b2d38] text-[#8a8e98]'}"
               >
                 {hideLanMode ? "Включено" : "Выключено"}
+              </button>
+            </div>
+          </div>
+
+          <!-- 6. Diagnostic Logs -->
+          <div
+            class="bg-[#13141a] p-4 rounded-xl border border-[#252834] space-y-3"
+          >
+            <div
+              class="text-xs font-semibold text-white flex items-center justify-between"
+            >
+              <div class="flex items-center gap-2">
+                <FileText class="w-4 h-4 text-emerald-400" />
+                <span>Диагностические логи</span>
+              </div>
+              <span
+                class="text-[10px] text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20 font-mono"
+              >
+                balabol.log
+              </span>
+            </div>
+
+            <div
+              class="flex items-center justify-between p-3 rounded-lg bg-[#0d0e12] border border-[#1f212a] gap-3"
+            >
+              <div class="space-y-0.5 min-w-0 flex-1">
+                <div class="text-xs font-semibold text-white">
+                  Файл журнала событий
+                </div>
+                <div
+                  class="text-[11px] text-[#8a8e98] leading-relaxed truncate font-mono select-all"
+                  title={logFilePath}
+                >
+                  {logFilePath || "Загрузка пути..."}
+                </div>
+              </div>
+              <button
+                on:click={handleOpenLogsFolder}
+                class="px-3 py-1.5 rounded-lg text-xs font-semibold transition shrink-0 bg-[#22242e] hover:bg-[#2b2d38] text-white border border-[#373b4d] flex items-center gap-1.5 shadow"
+              >
+                <FolderOpen class="w-3.5 h-3.5 text-blue-400" />
+                <span>Открыть папку</span>
               </button>
             </div>
           </div>

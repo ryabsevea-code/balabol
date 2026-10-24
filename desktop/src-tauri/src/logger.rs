@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone)]
 pub struct AppLogger {
     file_path: PathBuf,
+    local_file_path: Option<PathBuf>,
     recent_logs: Arc<RwLock<VecDeque<String>>>,
 }
 
@@ -23,7 +24,13 @@ impl AppLogger {
         };
         let file_path = app_dir.join("balabol.log");
 
-        // Write session start marker
+        // Also attempt writing to local directory (next to executable or cwd) if writable
+        let local_file_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("balabol.log")))
+            .or_else(|| std::env::current_dir().ok().map(|d| d.join("balabol.log")));
+
+        // Write session start marker to main log
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&file_path) {
             let _ = writeln!(
                 f,
@@ -33,8 +40,23 @@ impl AppLogger {
             let _ = f.flush();
         }
 
+        // Also write start marker to local log if different and writable
+        if let Some(ref local_p) = local_file_path {
+            if local_p != &file_path {
+                if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(local_p) {
+                    let _ = writeln!(
+                        f,
+                        "\n==================== BALABOL SESSION STARTED [{}] ====================",
+                        format_timestamp()
+                    );
+                    let _ = f.flush();
+                }
+            }
+        }
+
         Self {
             file_path,
+            local_file_path,
             recent_logs: Arc::new(RwLock::new(VecDeque::with_capacity(200))),
         }
     }
@@ -46,7 +68,7 @@ impl AppLogger {
         // 1. Output to stdout/terminal for dev mode
         println!("{}", formatted);
 
-        // 2. Append to external file balabol.log with immediate flush
+        // 2. Append to AppData balabol.log with immediate flush
         if let Ok(mut file) = OpenOptions::new()
             .create(true)
             .append(true)
@@ -54,6 +76,20 @@ impl AppLogger {
         {
             let _ = writeln!(file, "{}", formatted);
             let _ = file.flush();
+        }
+
+        // 2b. Append to local balabol.log if writable
+        if let Some(ref local_p) = self.local_file_path {
+            if local_p != &self.file_path {
+                if let Ok(mut file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(local_p)
+                {
+                    let _ = writeln!(file, "{}", formatted);
+                    let _ = file.flush();
+                }
+            }
         }
 
         // 3. Keep in recent memory buffer for UI live display
@@ -82,6 +118,13 @@ impl AppLogger {
 
     pub fn log_file_path(&self) -> String {
         self.file_path.to_string_lossy().to_string()
+    }
+
+    pub fn log_dir(&self) -> PathBuf {
+        self.file_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf()
     }
 }
 

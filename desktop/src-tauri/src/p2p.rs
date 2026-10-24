@@ -1214,7 +1214,7 @@ async fn run_mesh_peer_loop(
     let mut last_cleanup = Instant::now();
     let mut last_known_punch = Instant::now();
     let mut ping_seq = 0u64;
-    let mut rate_limiter = IpRateLimiter::new(1200.0, 800.0);
+    let mut rate_limiter = IpRateLimiter::new(2000.0, 1500.0);
 
     // Discovered remote peers' candidates: peer_id -> Vec<SocketAddr>
     let mut discovered_candidates: HashMap<u32, Vec<SocketAddr>> = HashMap::new();
@@ -1290,17 +1290,13 @@ async fn run_mesh_peer_loop(
                     seq: audio_seq,
                     data: audio_payload,
                 };
-                let key_opt = node_audio.current_room_key.read().clone();
-                let seq = node_audio.next_packet_seq();
-                if let Ok(b) = audio_pkt.encode_wire(key_opt.as_ref(), seq) {
-                    let endpoints: Vec<SocketAddr> = node_audio
-                        .client_endpoints
-                        .read()
-                        .values()
-                        .cloned()
-                        .collect();
-                    for caddr in &endpoints {
-                        let _ = audio_sock.send_to(&b, *caddr).await;
+                let endpoints: Vec<(u32, SocketAddr)> = {
+                    let eps = node_audio.client_endpoints.read();
+                    eps.iter().map(|(&id, &addr)| (id, addr)).collect()
+                };
+                for (peer_id, caddr) in endpoints {
+                    if let Ok(b) = node_audio.encode_wire_for_peer(&audio_pkt, Some(peer_id)) {
+                        let _ = audio_sock.send_to(&b, caddr).await;
                     }
                 }
             }
@@ -1486,11 +1482,12 @@ async fn run_mesh_peer_loop(
                 seq: ping_seq,
                 timestamp_ms: now_ms(),
             };
-            let key_opt = node.current_room_key.read().clone();
-            let seq = node.next_packet_seq();
-            if let Ok(b) = ping_pkt.encode_wire(key_opt.as_ref(), seq) {
-                let targets: Vec<SocketAddr> = node.client_endpoints.read().values().cloned().collect();
-                for target in targets {
+            let targets: Vec<(u32, SocketAddr)> = {
+                let eps = node.client_endpoints.read();
+                eps.iter().map(|(&id, &addr)| (id, addr)).collect()
+            };
+            for (peer_id, target) in targets {
+                if let Ok(b) = node.encode_wire_for_peer(&ping_pkt, Some(peer_id)) {
                     let _ = socket.send_to(&b, target).await;
                 }
             }

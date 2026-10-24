@@ -45,12 +45,16 @@ pub fn derive_nostr_topic(room_code: &str) -> String {
     format!("balabol_t_{}", &hex_str[..24])
 }
 
-/// RFC 4303 128-packet Anti-Replay Sliding Window.
-/// Tracks packet sequence numbers and drops duplicate or delayed packets outside the window.
+pub const REPLAY_WINDOW_SIZE: usize = 1024;
+const REPLAY_BITMAP_WORDS: usize = 16; // 16 * 64 = 1024 bits
+
+/// 1024-packet Anti-Replay Sliding Window (tolerant to WAN/internet jitter & reordering).
+/// Tracks packet sequence numbers and drops duplicate or delayed packets outside the 1024-packet window.
+/// Includes automatic session reset detection for peer reconnects.
 #[derive(Debug, Clone)]
 pub struct AntiReplayWindow {
     pub highest_seq: u64,
-    pub bitmap: u128,
+    pub bitmap: [u64; REPLAY_BITMAP_WORDS],
 }
 
 impl Default for AntiReplayWindow {
@@ -63,7 +67,45 @@ impl AntiReplayWindow {
     pub fn new() -> Self {
         Self {
             highest_seq: 0,
-            bitmap: 0,
+            bitmap: [0; REPLAY_BITMAP_WORDS],
+        }
+    }
+
+    fn set_bit(&mut self, diff: usize) {
+        if diff < REPLAY_WINDOW_SIZE {
+            let word = diff / 64;
+            let bit = diff % 64;
+            self.bitmap[word] |= 1u64 << bit;
+        }
+    }
+
+    fn is_bit_set(&self, diff: usize) -> bool {
+        if diff < REPLAY_WINDOW_SIZE {
+            let word = diff / 64;
+            let bit = diff % 64;
+            (self.bitmap[word] & (1u64 << bit)) != 0
+        } else {
+            true
+        }
+    }
+
+    fn shift_bitmap(&mut self, shift: usize) {
+        if shift >= REPLAY_WINDOW_SIZE {
+            self.bitmap = [0; REPLAY_BITMAP_WORDS];
+            return;
+        }
+        let word_shift = shift / 64;
+        let bit_shift = shift % 64;
+
+        for i in (0..REPLAY_BITMAP_WORDS).rev() {
+            let mut val = 0u64;
+            if i >= word_shift {
+                val = self.bitmap[i - word_shift] << bit_shift;
+                if bit_shift > 0 && i > word_shift {
+                    val |= self.bitmap[i - word_shift - 1] >> (64 - bit_shift);
+                }
+            }
+            self.bitmap[i] = val;
         }
     }
 
@@ -74,29 +116,38 @@ impl AntiReplayWindow {
             return false;
         }
 
-        if seq > self.highest_seq {
-            let diff = seq - self.highest_seq;
-            if diff >= 128 {
-                self.bitmap = 1;
-            } else {
-                self.bitmap = (self.bitmap << diff) | 1;
-            }
+        // First packet seen
+        if self.highest_seq == 0 {
             self.highest_seq = seq;
+            self.set_bit(0);
+            return true;
+        }
+
+        // Peer reconnected and restarted sequence from 1 while previous highest was high
+        if seq < self.highest_seq && self.highest_seq > 300 && seq <= 10 {
+            self.highest_seq = seq;
+            self.bitmap = [0; REPLAY_BITMAP_WORDS];
+            self.set_bit(0);
+            return true;
+        }
+
+        if seq > self.highest_seq {
+            let diff = (seq - self.highest_seq) as usize;
+            self.shift_bitmap(diff);
+            self.highest_seq = seq;
+            self.set_bit(0);
             true
         } else {
-            let diff = self.highest_seq - seq;
-            if diff >= 128 {
-                // Packet too old, outside the 128-packet window
+            let diff = (self.highest_seq - seq) as usize;
+            if diff >= REPLAY_WINDOW_SIZE {
+                // Packet too old, outside the 1024-packet window
+                false
+            } else if self.is_bit_set(diff) {
+                // Replay detected!
                 false
             } else {
-                let mask = 1u128 << diff;
-                if self.bitmap & mask != 0 {
-                    // Replay detected!
-                    false
-                } else {
-                    self.bitmap |= mask;
-                    true
-                }
+                self.set_bit(diff);
+                true
             }
         }
     }
@@ -266,17 +317,22 @@ mod tests {
         // Jump ahead to seq 100
         assert!(window.check_and_update(100));
 
-        // Older packet seq 50 (within 128 window of 100) must be accepted
+        // Older packet seq 50 (within 1024 window of 100) must be accepted
         assert!(window.check_and_update(50));
 
         // Replaying seq 50 must be rejected
         assert!(!window.check_and_update(50));
 
-        // Jump to seq 300
-        assert!(window.check_and_update(300));
+        // Jump to seq 2000
+        assert!(window.check_and_update(2000));
 
-        // seq 50 is now too old (300 - 50 = 250 >= 128) -> must be rejected
+        // seq 50 is now too old (2000 - 50 = 1950 >= 1024) -> must be rejected
         assert!(!window.check_and_update(50));
+
+        // Peer session reset / reconnect (seq <= 128 while highest was 2000) -> must be accepted!
+        assert!(window.check_and_update(1));
+        assert!(window.check_and_update(2));
+        assert!(!window.check_and_update(1)); // Duplicate of reset sequence rejected
     }
 
     #[test]
