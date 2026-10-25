@@ -380,7 +380,9 @@
         if (newChat.length !== chatMessages.length) {
           const lastMsg = newChat[newChat.length - 1];
           if (lastMsg && !lastMsg.is_me) {
-            invoke("play_notification_sound", { soundType: "chat" }).catch(() => {});
+            invoke("play_notification_sound", { soundType: "chat" }).catch(
+              () => {},
+            );
           }
           chatMessages = newChat;
           scrollToChatBottom();
@@ -389,13 +391,20 @@
         // Auto-fetch full images from P2P node for any messages missing full image
         for (const msg of newChat) {
           if (msg.image_id && !loadedImages[msg.image_id]) {
-            invoke("get_cached_image", { imageId: msg.image_id }).then((b64) => {
-              if (b64) {
-                loadedImages = { ...loadedImages, [msg.image_id]: "data:image/jpeg;base64," + b64 };
-              } else {
-                invoke("request_full_image", { imageId: msg.image_id }).catch(() => {});
-              }
-            }).catch(() => {});
+            invoke("get_cached_image", { imageId: msg.image_id })
+              .then((b64) => {
+                if (b64) {
+                  loadedImages = {
+                    ...loadedImages,
+                    [msg.image_id]: "data:image/jpeg;base64," + b64,
+                  };
+                } else {
+                  invoke("request_full_image", { imageId: msg.image_id }).catch(
+                    () => {},
+                  );
+                }
+              })
+              .catch(() => {});
           }
         }
         // Auto-fetch signaling status
@@ -422,7 +431,6 @@
       console.error("Poll error:", e);
     }
   }
-
 
   function scrollToChatBottom() {
     setTimeout(() => {
@@ -612,9 +620,10 @@
       const commaIdx = dataUrl.indexOf(",");
       if (commaIdx !== -1) {
         const base64 = dataUrl.substring(commaIdx + 1);
-        invoke("send_video_frame", { jpegBase64: base64, isScreen: false }).catch(
-          () => {},
-        );
+        invoke("send_video_frame", {
+          jpegBase64: base64,
+          isScreen: false,
+        }).catch(() => {});
       }
     } catch (e) {
       console.error("Capture camera frame error:", e);
@@ -807,7 +816,10 @@
       imgId = "img_" + Date.now() + "_" + Math.floor(Math.random() * 100000);
       imgThumb = attachedImage.thumbDataUrl;
       const commaIdx = attachedImage.fullDataUrl.indexOf(",");
-      fullB64 = commaIdx >= 0 ? attachedImage.fullDataUrl.slice(commaIdx + 1) : attachedImage.fullDataUrl;
+      fullB64 =
+        commaIdx >= 0
+          ? attachedImage.fullDataUrl.slice(commaIdx + 1)
+          : attachedImage.fullDataUrl;
       loadedImages = { ...loadedImages, [imgId]: attachedImage.fullDataUrl };
     }
 
@@ -870,7 +882,9 @@
     }
 
     try {
-      const cachedB64 = await invoke("get_cached_image", { imageId: msg.image_id });
+      const cachedB64 = await invoke("get_cached_image", {
+        imageId: msg.image_id,
+      });
       if (cachedB64) {
         const fullUrl = "data:image/jpeg;base64," + cachedB64;
         loadedImages = { ...loadedImages, [msg.image_id]: fullUrl };
@@ -898,7 +912,9 @@
         return;
       }
       try {
-        const cachedB64 = await invoke("get_cached_image", { imageId: msg.image_id });
+        const cachedB64 = await invoke("get_cached_image", {
+          imageId: msg.image_id,
+        });
         if (cachedB64) {
           clearInterval(lightboxPollTimer);
           const fullUrl = "data:image/jpeg;base64," + cachedB64;
@@ -1259,12 +1275,13 @@
                   bind:value={roomCodeInput}
                   on:input={handleRoomCodeInput}
                   on:keydown={handleRoomCodeKeyDown}
-                  placeholder="11 22 33"
+                  placeholder=""
                   class="w-full bg-[#101116] border border-[#282b36] rounded-lg px-3 py-1.5 text-white font-mono text-center tracking-widest text-sm focus:outline-none focus:border-emerald-500"
                 />
                 <button
                   on:click={handleJoinRoom}
-                  disabled={isSubmitting || roomCodeInput.replace(/\D/g, "").length < 6}
+                  disabled={isSubmitting ||
+                    roomCodeInput.replace(/\D/g, "").length < 6}
                   class="w-full py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white rounded-lg text-xs font-semibold transition shadow-md shadow-emerald-600/20"
                 >
                   Войти в звонок
@@ -1300,7 +1317,8 @@
                   {formatRoomCode(status.room_code) || "-- -- --"}
                 </span>
                 <button
-                  on:click={() => copyText(formatRoomCode(status.room_code), "code")}
+                  on:click={() =>
+                    copyText(formatRoomCode(status.room_code), "code")}
                   class="p-2.5 bg-purple-600 hover:bg-purple-500 text-white rounded-xl transition shadow-md"
                   title="Скопировать код"
                 >
@@ -1409,10 +1427,18 @@
                       >
                         {#if remoteVideoFrame.is_screen}
                           <Monitor class="w-4 h-4 text-purple-400" />
-                          <span>{peers.find((p) => p.id === remoteVideoFrame.sender_id)?.name || "Собеседник"} — Трансляция экрана</span>
+                          <span
+                            >{peers.find(
+                              (p) => p.id === remoteVideoFrame.sender_id,
+                            )?.name || "Собеседник"} — Трансляция экрана</span
+                          >
                         {:else}
                           <Video class="w-4 h-4 text-emerald-400" />
-                          <span>{peers.find((p) => p.id === remoteVideoFrame.sender_id)?.name || "Собеседник"} — Видеопоток камеры</span>
+                          <span
+                            >{peers.find(
+                              (p) => p.id === remoteVideoFrame.sender_id,
+                            )?.name || "Собеседник"} — Видеопоток камеры</span
+                          >
                         {/if}
                       </div>
 
@@ -1476,7 +1502,9 @@
                                 class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-medium"
                                 title="Сигналинг Nostr активен и ожидает подключения гостей"
                               >
-                                <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                                <span
+                                  class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"
+                                ></span>
                                 Вход открыт (ожидание)
                               </span>
                             {:else if signalingStatus.is_open}
@@ -1485,8 +1513,12 @@
                                   class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-medium"
                                   title="Окно Nostr-сигналинга активно для подключения новых гостей"
                                 >
-                                  <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
-                                  Вход открыт: {formatRemainingTime(signalingStatus.remaining_seconds)}
+                                  <span
+                                    class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"
+                                  ></span>
+                                  Вход открыт: {formatRemainingTime(
+                                    signalingStatus.remaining_seconds,
+                                  )}
                                 </span>
                                 <button
                                   on:click={handleReopenSignaling}
@@ -1513,14 +1545,21 @@
                                   title="Запустить Nostr-сигналинг на 5 минут, чтобы впустить нового участника"
                                 >
                                   <Unlock class="w-3.5 h-3.5 text-amber-300" />
-                                  <span>{isReopeningSignaling ? "Открываем..." : "Впустить (+5 мин)"}</span>
+                                  <span
+                                    >{isReopeningSignaling
+                                      ? "Открываем..."
+                                      : "Впустить (+5 мин)"}</span
+                                  >
                                 </button>
                               </div>
                             {/if}
 
                             <button
                               on:click={() =>
-                                copyText(formatRoomCode(status.room_code), "room_code_banner")}
+                                copyText(
+                                  formatRoomCode(status.room_code),
+                                  "room_code_banner",
+                                )}
                               class="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-semibold flex items-center gap-2 transition shadow-md shadow-purple-600/20 cursor-pointer"
                               title="Скопировать код комнаты в буфер обмена"
                             >
@@ -1547,7 +1586,6 @@
                             ? 'border-emerald-500/70 shadow-emerald-500/10'
                             : ''}"
                         >
-
                           <div class="relative mb-3 mt-1">
                             <div
                               class="w-20 h-20 rounded-full bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-2xl font-bold text-white shadow-lg transition-all duration-200 {voiceStatus.local_speaking
@@ -1576,7 +1614,8 @@
                             class="font-bold text-sm text-white flex items-center gap-1.5"
                           >
                             <span>{nickname || "Вы"}</span>
-                            <span class="text-[10px] bg-blue-500/20 text-blue-400 border border-blue-500/30 font-medium px-1.5 py-0.5 rounded-full"
+                            <span
+                              class="text-[10px] bg-blue-500/20 text-blue-400 border border-blue-500/30 font-medium px-1.5 py-0.5 rounded-full"
                               >Вы</span
                             >
                           </div>
@@ -1611,7 +1650,9 @@
                               ? 'border-emerald-500/70 shadow-emerald-500/10'
                               : ''}"
                           >
-                            <div class="absolute top-3 right-3 flex items-center gap-1.5">
+                            <div
+                              class="absolute top-3 right-3 flex items-center gap-1.5"
+                            >
                               <span
                                 class="text-[10px] font-mono text-[#8a8e98] bg-black/40 px-1.5 py-0.5 rounded border border-white/5"
                               >
@@ -1643,13 +1684,14 @@
                               {/if}
                             </div>
 
-                            
                             <div class="font-bold text-sm text-white">
                               {peer.name}
                             </div>
-                            
+
                             <div class="mt-4 w-full px-2">
-                              <div class="flex items-center justify-between text-[11px] text-[#8a8e98] mb-1.5">
+                              <div
+                                class="flex items-center justify-between text-[11px] text-[#8a8e98] mb-1.5"
+                              >
                                 <span>Громкость</span>
                                 <span>{peerVolumes[peer.id] ?? 100}%</span>
                               </div>
@@ -1660,13 +1702,17 @@
                                 step="5"
                                 value={peerVolumes[peer.id] ?? 100}
                                 on:input={(e) => {
-                                  peerVolumes[peer.id] = parseInt(e.target.value);
-                                  invoke("set_peer_volume", { peerId: peer.id, volume: peerVolumes[peer.id] / 100 });
+                                  peerVolumes[peer.id] = parseInt(
+                                    e.target.value,
+                                  );
+                                  invoke("set_peer_volume", {
+                                    peerId: peer.id,
+                                    volume: peerVolumes[peer.id] / 100,
+                                  });
                                 }}
                                 class="w-full accent-indigo-500 h-1.5 bg-[#232632] rounded-lg appearance-none cursor-pointer"
                               />
                             </div>
-
 
                             <div class="mt-2 flex items-center gap-2">
                               {#if peer.is_speaking}
@@ -1689,7 +1735,6 @@
                                 </span>
                               {/if}
                             </div>
-
                           </div>
                         {/each}
 
@@ -1715,7 +1760,10 @@
                             {#if status.room_code}
                               <button
                                 on:click={() =>
-                                  copyText(formatRoomCode(status.room_code), "invite_code")}
+                                  copyText(
+                                    formatRoomCode(status.room_code),
+                                    "invite_code",
+                                  )}
                                 class="px-3.5 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition shadow cursor-pointer"
                               >
                                 {#if copiedItem === "invite_code"}
@@ -1723,7 +1771,11 @@
                                   <span>Скопировано!</span>
                                 {:else}
                                   <Copy class="w-3.5 h-3.5" />
-                                  <span>Код: {formatRoomCode(status.room_code)}</span>
+                                  <span
+                                    >Код: {formatRoomCode(
+                                      status.room_code,
+                                    )}</span
+                                  >
                                 {/if}
                               </button>
                             {/if}
@@ -1757,10 +1809,18 @@
                           <Video class="w-3 h-3 text-blue-400" /> Вы
                         </div>
                       {:else if isScreenOn}
-                        <div class="w-48 h-28 bg-[#181a24] flex flex-col items-center justify-center p-3 text-center border border-purple-500/20">
-                          <Monitor class="w-7 h-7 text-purple-400 mb-1.5 animate-pulse" />
-                          <span class="text-xs font-semibold text-white">Вы делитесь экраном</span>
-                          <span class="text-[10px] text-[#8a8e98] mt-0.5">Трансляция активна</span>
+                        <div
+                          class="w-48 h-28 bg-[#181a24] flex flex-col items-center justify-center p-3 text-center border border-purple-500/20"
+                        >
+                          <Monitor
+                            class="w-7 h-7 text-purple-400 mb-1.5 animate-pulse"
+                          />
+                          <span class="text-xs font-semibold text-white"
+                            >Вы делитесь экраном</span
+                          >
+                          <span class="text-[10px] text-[#8a8e98] mt-0.5"
+                            >Трансляция активна</span
+                          >
                         </div>
                       {/if}
                     </div>
@@ -1950,7 +2010,8 @@
                               title="Нажмите для увеличения"
                             >
                               <img
-                                src={loadedImages[msg.image_id] || msg.image_thumb}
+                                src={loadedImages[msg.image_id] ||
+                                  msg.image_thumb}
                                 alt="Изображение"
                                 class="max-h-56 max-w-full rounded-xl object-contain bg-black/40 transition group-hover:scale-[1.02]"
                                 loading="lazy"
@@ -1964,7 +2025,11 @@
                             </button>
                           {/if}
                           {#if msg.text}
-                            <div class="{msg.image_thumb || msg.image_id ? 'mt-1' : ''}">
+                            <div
+                              class={msg.image_thumb || msg.image_id
+                                ? "mt-1"
+                                : ""}
+                            >
                               {msg.text}
                             </div>
                           {/if}
@@ -1975,19 +2040,30 @@
                 </div>
 
                 <!-- Chat Input Area -->
-                <div class="bg-[#13141a] border-t border-[#262832] flex flex-col">
+                <div
+                  class="bg-[#13141a] border-t border-[#262832] flex flex-col"
+                >
                   <!-- Attached Image Preview Chip -->
                   {#if attachedImage}
-                    <div class="px-3 py-2 bg-[#1b1d26] border-b border-[#262832] flex items-center justify-between text-xs animate-fadeIn">
+                    <div
+                      class="px-3 py-2 bg-[#1b1d26] border-b border-[#262832] flex items-center justify-between text-xs animate-fadeIn"
+                    >
                       <div class="flex items-center gap-2.5 overflow-hidden">
                         <img
-                          src={attachedImage.fullDataUrl || attachedImage.thumbDataUrl}
+                          src={attachedImage.fullDataUrl ||
+                            attachedImage.thumbDataUrl}
                           alt="Превью вложения"
                           class="w-10 h-10 object-cover rounded-lg border border-white/10 shrink-0"
                         />
                         <div class="truncate">
-                          <div class="font-semibold text-white truncate max-w-[200px]">{attachedImage.name}</div>
-                          <div class="text-[10px] text-[#707482]">{attachedImage.sizeStr} • Готово к отправке</div>
+                          <div
+                            class="font-semibold text-white truncate max-w-[200px]"
+                          >
+                            {attachedImage.name}
+                          </div>
+                          <div class="text-[10px] text-[#707482]">
+                            {attachedImage.sizeStr} • Готово к отправке
+                          </div>
                         </div>
                       </div>
                       <button
@@ -2038,7 +2114,9 @@
                       bind:value={chatInput}
                       on:keydown={handleChatKeyDown}
                       on:paste={handleChatPaste}
-                      placeholder={attachedImage ? "Добавьте подпись (Enter для отправки)..." : "Сообщение..."}
+                      placeholder={attachedImage
+                        ? "Добавьте подпись (Enter для отправки)..."
+                        : "Сообщение..."}
                       class="flex-1 bg-[#1a1c24] border border-[#2b2d38] rounded-xl px-3 py-2 text-xs text-white placeholder-[#555866] focus:outline-none focus:border-blue-500 transition"
                     />
 
@@ -2173,7 +2251,8 @@
               />
             </div>
             <button
-              disabled={isSubmitting || roomCodeInput.replace(/\D/g, "").length < 6}
+              disabled={isSubmitting ||
+                roomCodeInput.replace(/\D/g, "").length < 6}
               on:click={handleJoinRoom}
               class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white rounded-lg font-semibold transition shadow-md shadow-emerald-600/20"
             >
@@ -2385,7 +2464,6 @@
             </div>
           </div>
 
-
           <!-- 3. Master Volume (Общая громкость приложения 0 - 100) -->
           <div
             class="space-y-3 bg-[#13141a] p-4 rounded-xl border border-[#252834]"
@@ -2406,7 +2484,8 @@
             </div>
 
             <p class="text-[11px] text-[#8a8e98] leading-relaxed">
-              Регулирует громкость всех входящих голосов и звуковых сигналов приложения (0 - 100%).
+              Регулирует громкость всех входящих голосов и звуковых сигналов
+              приложения (0 - 100%).
             </p>
 
             <div class="pt-1">
@@ -2540,7 +2619,9 @@
                   Сокрытие локальных LAN-адресов
                 </div>
                 <div class="text-[11px] text-[#8a8e98] leading-relaxed">
-                  Исключает передачу локальных IP-адресов (192.168.x.x, 10.x.x.x) через интернет. Для тестирования на одном ПК или в общей домашней сети оставьте выключенным.
+                  Исключает передачу локальных IP-адресов (192.168.x.x,
+                  10.x.x.x) через интернет. Для тестирования на одном ПК или в
+                  общей домашней сети оставьте выключенным.
                 </div>
               </div>
               <button
@@ -2626,13 +2707,17 @@
       on:click|self={closeLightbox}
     >
       <!-- Top header bar -->
-      <div class="w-full max-w-5xl flex items-center justify-between py-2 text-xs text-white/80">
+      <div
+        class="w-full max-w-5xl flex items-center justify-between py-2 text-xs text-white/80"
+      >
         <div class="flex items-center gap-2">
           <span class="font-bold text-white">{lightboxImage.sender}</span>
           <span class="text-white/40">•</span>
           <span class="text-white/60">{lightboxImage.time}</span>
           {#if lightboxImage.loading}
-            <span class="bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[10px] px-2 py-0.5 rounded-full flex items-center gap-1.5 ml-2">
+            <span
+              class="bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[10px] px-2 py-0.5 rounded-full flex items-center gap-1.5 ml-2"
+            >
               <RefreshCw class="w-3 h-3 animate-spin" />
               <span>Загрузка оригинала...</span>
             </span>
@@ -2674,7 +2759,10 @@
 
       <!-- Bottom hints -->
       <div class="text-[11px] text-white/40 pb-2">
-        Нажмите <kbd class="px-1.5 py-0.5 bg-white/10 rounded text-white/70 font-mono text-[10px]">Esc</kbd> или кликните за пределами изображения, чтобы закрыть
+        Нажмите <kbd
+          class="px-1.5 py-0.5 bg-white/10 rounded text-white/70 font-mono text-[10px]"
+          >Esc</kbd
+        > или кликните за пределами изображения, чтобы закрыть
       </div>
     </div>
   {/if}
