@@ -143,8 +143,19 @@ impl JitterBuffer {
     }
 
     pub fn push_pcm_samples(&mut self, pcm: &[i16]) {
-        // Discard oldest samples if buffer is overflowing to keep latency bounded
-        if self.queue.len() + pcm.len() > self.max_samples {
+        // Burst Drop protection:
+        // If buffer depth exceeds 8 frames (3840 samples = 160ms) after a network burst,
+        // force-drain down to 2-3 frames (1440 samples = 60ms) so audio remains real-time with zero delay accumulation.
+        const BURST_DROP_THRESHOLD: usize = 3840; // 8 frames @ 24kHz = 160ms
+        const BURST_RESUME_TARGET: usize = 1440;  // 3 frames @ 24kHz = 60ms
+
+        if self.queue.len() + pcm.len() > BURST_DROP_THRESHOLD {
+            let target_keep = BURST_RESUME_TARGET.min(self.queue.len());
+            let drop_count = self.queue.len().saturating_sub(target_keep);
+            if drop_count > 0 {
+                self.queue.drain(..drop_count);
+            }
+        } else if self.queue.len() + pcm.len() > self.max_samples {
             let excess = (self.queue.len() + pcm.len()).saturating_sub(self.target_samples);
             self.queue.drain(..excess.min(self.queue.len()));
         }
@@ -622,8 +633,10 @@ impl AudioEngine {
                 if recent.contains(&seq) {
                     return; // Exact duplicate packet received, drop
                 }
-                if seq + 64 < *max_seq && seq > 0 && max_seq.saturating_sub(seq) < 3000 {
-                    return; // Stale delayed packet outside sequence window, drop
+                // Hard age limit: if packet is older than current playout/max by > 8 frames (160ms),
+                // discard it immediately since PLC (Packet Loss Concealment) has already played that slot.
+                if seq + 8 < *max_seq && seq > 0 && max_seq.saturating_sub(seq) < 3000 {
+                    return; // Stale delayed packet older than 160ms, drop
                 }
             }
             if seq > *max_seq || max_seq.saturating_sub(seq) >= 3000 {

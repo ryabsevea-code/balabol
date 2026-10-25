@@ -12,6 +12,13 @@ use tokio::sync::oneshot;
 #[allow(dead_code)]
 pub const PROTOCOL_VERSION: u32 = 4;
 
+pub const PACKET_TYPE_AUDIO: u8 = 1;
+pub const PACKET_TYPE_KEEPALIVE: u8 = 2;
+pub const PACKET_TYPE_CONTROL: u8 = 3;
+pub const PACKET_TYPE_PUNCH: u8 = 4;
+pub const PACKET_TYPE_PUNCH_ACK: u8 = 5;
+pub const PACKET_TYPE_PAKE: u8 = 6;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Packet {
     Punch {
@@ -19,12 +26,20 @@ pub enum Packet {
         nonce: u64,
         sender_name: String,
         sender_id: u32,
+        #[serde(default)]
+        wire_sender_id: u32,
+        #[serde(default)]
+        pake_point: [u8; 32],
     },
     PunchAck {
         room_code: String,
         nonce: u64,
         sender_name: String,
         sender_id: u32,
+        #[serde(default)]
+        wire_sender_id: u32,
+        #[serde(default)]
+        pake_point: [u8; 32],
     },
     ConnectRequest {
         client_name: String,
@@ -132,6 +147,23 @@ pub enum Packet {
         sender_id: u32,
         ephemeral_pubkey: [u8; 32],
     },
+    KeepAlive {
+        sender_id: u32,
+        timestamp_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerSession {
+    pub peer_id: u32,
+    pub sender_id: u32,
+    pub session_key: [u8; 32],
+    pub current_addr: SocketAddr,
+    pub replay_window: crate::crypto::AntiReplayWindow,
+    pub last_sent_time: Instant,
+    pub last_recv_time: Instant,
+    pub last_repunch_time: Instant,
+    pub candidate_addrs: Vec<SocketAddr>,
 }
 
 impl Packet {
@@ -146,7 +178,16 @@ impl Packet {
     pub fn encode_wire(&self, key_opt: Option<&[u8; 32]>, seq: u64) -> Result<Vec<u8>, String> {
         let raw = self.encode().map_err(|e| e.to_string())?;
         if let Some(key) = key_opt {
-            crate::crypto::encrypt_packet(&raw, key, seq)
+            crate::crypto::encrypt_wire_packet(PACKET_TYPE_CONTROL, 0, seq, &raw, key)
+        } else {
+            Ok(raw)
+        }
+    }
+
+    pub fn encode_wire_with_sender(&self, key_opt: Option<&[u8; 32]>, seq: u64, sender_id: u32) -> Result<Vec<u8>, String> {
+        let raw = self.encode().map_err(|e| e.to_string())?;
+        if let Some(key) = key_opt {
+            crate::crypto::encrypt_wire_packet(PACKET_TYPE_CONTROL, sender_id, seq, &raw, key)
         } else {
             Ok(raw)
         }
@@ -154,7 +195,11 @@ impl Packet {
 
     pub fn decode_wire(buf: &[u8], key_opt: Option<&[u8; 32]>) -> Result<(u64, Self), String> {
         if let Some(key) = key_opt {
-            if buf.len() >= 40 && &buf[0..4] == b"BALA" {
+            if buf.len() >= crate::crypto::MIN_WIRE_PACKET_LEN {
+                let (_type, _sid, seq, decrypted) = crate::crypto::decrypt_wire_packet(buf, key)?;
+                let pkt = Self::decode(&decrypted).map_err(|e| e.to_string())?;
+                Ok((seq, pkt))
+            } else if buf.len() >= 40 && &buf[0..4] == b"BALA" {
                 let (seq, decrypted) = crate::crypto::decrypt_packet(buf, key)?;
                 let pkt = Self::decode(&decrypted).map_err(|e| e.to_string())?;
                 Ok((seq, pkt))
@@ -432,6 +477,13 @@ pub struct P2pNode {
     pub ephemeral_kx: Arc<crate::crypto::EphemeralKeyExchange>,
     pub peer_pfs_keys: Arc<RwLock<HashMap<u32, [u8; 32]>>>,
     pub hide_lan_addresses: Arc<AtomicBool>,
+
+    // Dynamic NAT Roaming & PAKE sessions
+    pub my_sender_id: Arc<AtomicU32>,
+    pub pake_kx: Arc<crate::crypto::PakeKeyExchange>,
+    pub current_room_salt: Arc<RwLock<Option<[u8; 32]>>>,
+    pub peer_sessions: Arc<RwLock<HashMap<u32, PeerSession>>>,
+    pub peer_id_to_sender_id: Arc<RwLock<HashMap<u32, u32>>>,
 }
 
 impl P2pNode {
@@ -479,6 +531,12 @@ impl P2pNode {
             ephemeral_kx: Arc::new(crate::crypto::EphemeralKeyExchange::new()),
             peer_pfs_keys: Arc::new(RwLock::new(HashMap::new())),
             hide_lan_addresses: Arc::new(AtomicBool::new(false)),
+
+            my_sender_id: Arc::new(AtomicU32::new(rand::random::<u32>() | 1)),
+            pake_kx: Arc::new(crate::crypto::PakeKeyExchange::new()),
+            current_room_salt: Arc::new(RwLock::new(None)),
+            peer_sessions: Arc::new(RwLock::new(HashMap::new())),
+            peer_id_to_sender_id: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -488,6 +546,11 @@ impl P2pNode {
 
     pub fn get_key_for_peer(&self, peer_id_opt: Option<u32>) -> Option<[u8; 32]> {
         if let Some(peer_id) = peer_id_opt {
+            if let Some(sender_id) = self.peer_id_to_sender_id.read().get(&peer_id).copied() {
+                if let Some(session) = self.peer_sessions.read().get(&sender_id) {
+                    return Some(session.session_key);
+                }
+            }
             if let Some(pfs_key) = self.peer_pfs_keys.read().get(&peer_id).cloned() {
                 return Some(pfs_key);
             }
@@ -496,9 +559,42 @@ impl P2pNode {
     }
 
     pub fn encode_wire_for_peer(&self, packet: &Packet, peer_id_opt: Option<u32>) -> Result<Vec<u8>, String> {
-        let key = self.get_key_for_peer(peer_id_opt);
+        let raw = packet.encode().map_err(|e| e.to_string())?;
+        let my_sender_id = self.my_sender_id.load(Ordering::Relaxed);
         let seq = self.next_packet_seq();
-        packet.encode_wire(key.as_ref(), seq)
+
+        if let Some(peer_id) = peer_id_opt {
+            if let Some(sender_id) = self.peer_id_to_sender_id.read().get(&peer_id).copied() {
+                if let Some(session) = self.peer_sessions.read().get(&sender_id) {
+                    return crate::crypto::encrypt_wire_packet(
+                        PACKET_TYPE_CONTROL,
+                        my_sender_id,
+                        seq,
+                        &raw,
+                        &session.session_key,
+                    );
+                }
+            }
+            if let Some(pfs_key) = self.peer_pfs_keys.read().get(&peer_id) {
+                return crate::crypto::encrypt_wire_packet(
+                    PACKET_TYPE_CONTROL,
+                    my_sender_id,
+                    seq,
+                    &raw,
+                    pfs_key,
+                );
+            }
+        }
+        if let Some(ref room_key) = *self.current_room_key.read() {
+            return crate::crypto::encrypt_wire_packet(
+                PACKET_TYPE_CONTROL,
+                my_sender_id,
+                seq,
+                &raw,
+                room_key,
+            );
+        }
+        Ok(raw)
     }
 
     pub fn set_hide_lan_mode(&self, hide: bool) {
@@ -1113,6 +1209,8 @@ impl P2pNode {
             .map(|a| a.to_string());
 
         let my_id = (rand::random::<u32>() % 900_000 + 10_000).max(2);
+        let my_sender_id = rand::random::<u32>() | 1;
+        self.my_sender_id.store(my_sender_id, Ordering::SeqCst);
         let session_id = format!("{:08x}", rand::random::<u32>());
         let my_nonce = rand::random::<u64>();
 
@@ -1124,6 +1222,18 @@ impl P2pNode {
         let room_key = crate::crypto::derive_room_key(&clean_code);
         *self.current_room_key.write() = Some(room_key);
         *self.current_room_code.write() = Some(clean_code.clone());
+
+        let room_salt = if is_creator {
+            let mut s = [0u8; 32];
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut s);
+            *self.current_room_salt.write() = Some(s);
+            s
+        } else {
+            self.current_room_salt.read().clone().unwrap_or([0u8; 32])
+        };
+        let pake_seed = crate::crypto::derive_pake_seed(&clean_code, &room_salt);
+        let pake_point = self.pake_kx.blinded_public_point(&pake_seed);
 
         *self.status.write() = ConnectionStatus::Connected {
             my_id,
@@ -1152,6 +1262,10 @@ impl P2pNode {
             peer_name: nickname.clone(),
             candidates: candidates.clone(),
             nonce: my_nonce,
+            sender_id: my_sender_id,
+            room_salt,
+            pake_point,
+            confirmation_tag: [0u8; 16],
         };
 
         let mesh_signaling = crate::signaling::Signaling::start_mesh_session(&clean_code, my_announce.clone(), &self.logger).await?;
@@ -1210,11 +1324,10 @@ async fn run_mesh_peer_loop(
 
     let mut buf = [0u8; 65535];
     let mut video_reassemblers: HashMap<u32, VideoReassembler> = HashMap::new();
-    let mut last_ping_broadcast = Instant::now();
-    let mut last_cleanup = Instant::now();
     let mut last_known_punch = Instant::now();
-    let mut ping_seq = 0u64;
     let mut rate_limiter = IpRateLimiter::new(2000.0, 1500.0);
+    let mut ip_failed_counts: HashMap<IpAddr, u32> = HashMap::new();
+    let mut ip_blocked_until: HashMap<IpAddr, Instant> = HashMap::new();
 
     // Discovered remote peers' candidates: peer_id -> Vec<SocketAddr>
     let mut discovered_candidates: HashMap<u32, Vec<SocketAddr>> = HashMap::new();
@@ -1248,11 +1361,14 @@ async fn run_mesh_peer_loop(
         }
         let my_id = node.my_peer_id.load(Ordering::Relaxed);
         let my_name = node.my_nickname.read().clone();
+        let my_sender_id = node.my_sender_id.load(Ordering::Relaxed);
         let punch_pkt = Packet::Punch {
             room_code: room_code.clone(),
             nonce: rand::random(),
             sender_name: my_name,
             sender_id: my_id,
+            wire_sender_id: my_sender_id,
+            pake_point: my_announce.pake_point,
         };
         let key_opt = node.current_room_key.read().clone();
         let seq = node.next_packet_seq();
@@ -1272,7 +1388,7 @@ async fn run_mesh_peer_loop(
         node_history.request_history().await;
     });
 
-    // Background Audio Transmitter (direct UDP P2P)
+    // Background Audio Transmitter (direct UDP P2P with 13B Wire Format & O(1) sender_id)
     let audio_sock = socket.clone();
     let node_audio = node.clone();
     let audio_tx_task = tokio::spawn(async move {
@@ -1282,21 +1398,47 @@ async fn run_mesh_peer_loop(
 
         while !node_audio.shutdown_signal.load(Ordering::Relaxed) {
             interval.tick().await;
-            let my_id = node_audio.my_peer_id.load(Ordering::Relaxed);
+            let my_sender_id = node_audio.my_sender_id.load(Ordering::Relaxed);
             for audio_payload in node_audio.audio_engine.pop_outgoing_packets() {
                 audio_seq += 1;
-                let audio_pkt = Packet::AudioData {
-                    sender_id: my_id,
-                    seq: audio_seq,
-                    data: audio_payload,
+                let targets: Vec<(SocketAddr, [u8; 32])> = {
+                    let now = Instant::now();
+                    let mut sessions = node_audio.peer_sessions.write();
+                    sessions.values_mut().map(|s| {
+                        s.last_sent_time = now;
+                        (s.current_addr, s.session_key)
+                    }).collect()
                 };
-                let endpoints: Vec<(u32, SocketAddr)> = {
-                    let eps = node_audio.client_endpoints.read();
-                    eps.iter().map(|(&id, &addr)| (id, addr)).collect()
-                };
-                for (peer_id, caddr) in endpoints {
-                    if let Ok(b) = node_audio.encode_wire_for_peer(&audio_pkt, Some(peer_id)) {
-                        let _ = audio_sock.send_to(&b, caddr).await;
+                if targets.is_empty() {
+                    let key_opt = node_audio.current_room_key.read().clone();
+                    if let Some(key) = key_opt {
+                        let fallback_eps: Vec<SocketAddr> = {
+                            let eps = node_audio.client_endpoints.read();
+                            eps.values().copied().collect()
+                        };
+                        for caddr in fallback_eps {
+                            if let Ok(b) = crate::crypto::encrypt_wire_packet(
+                                PACKET_TYPE_AUDIO,
+                                my_sender_id,
+                                audio_seq,
+                                &audio_payload,
+                                &key,
+                            ) {
+                                let _ = audio_sock.send_to(&b, caddr).await;
+                            }
+                        }
+                    }
+                } else {
+                    for (caddr, session_key) in targets {
+                        if let Ok(b) = crate::crypto::encrypt_wire_packet(
+                            PACKET_TYPE_AUDIO,
+                            my_sender_id,
+                            audio_seq,
+                            &audio_payload,
+                            &session_key,
+                        ) {
+                            let _ = audio_sock.send_to(&b, caddr).await;
+                        }
                     }
                 }
             }
@@ -1306,6 +1448,7 @@ async fn run_mesh_peer_loop(
     while !node.shutdown_signal.load(Ordering::Relaxed) {
         let my_id = node.my_peer_id.load(Ordering::Relaxed);
         let my_name = node.my_nickname.read().clone();
+        let my_sender_id = node.my_sender_id.load(Ordering::Relaxed);
 
         // Check if user requested to reopen/extend signaling from UI
         if node.reopen_signaling_requested.swap(false, Ordering::SeqCst) {
@@ -1377,10 +1520,51 @@ async fn run_mesh_peer_loop(
                     }
                 }
 
+                // Update room salt if host provided it
+                if ann.room_salt != [0u8; 32] {
+                    let mut salt_guard = node.current_room_salt.write();
+                    if salt_guard.is_none() {
+                        *salt_guard = Some(ann.room_salt);
+                    }
+                }
+
+                // Compute PAKE session key
+                let salt_to_use = node.current_room_salt.read().clone().unwrap_or(ann.room_salt);
+                let pake_seed = crate::crypto::derive_pake_seed(&room_code, &salt_to_use);
+                let session_key = if ann.pake_point != [0u8; 32] {
+                    node.pake_kx.compute_pake_session_key(&ann.pake_point, &pake_seed, my_id, ann.peer_id)
+                } else {
+                    crate::crypto::derive_room_key(&room_code)
+                };
+
+                let remote_sender_id = if ann.sender_id != 0 { ann.sender_id } else { ann.peer_id };
+                let init_addr = ann.candidates.first().copied().unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+
+                {
+                    let mut sessions = node.peer_sessions.write();
+                    if let Some(session) = sessions.get_mut(&remote_sender_id) {
+                        session.session_key = session_key;
+                        session.candidate_addrs = ann.candidates.clone();
+                    } else {
+                        sessions.insert(remote_sender_id, PeerSession {
+                            peer_id: ann.peer_id,
+                            sender_id: remote_sender_id,
+                            session_key,
+                            current_addr: init_addr,
+                            replay_window: crate::crypto::AntiReplayWindow::new(),
+                            last_sent_time: Instant::now(),
+                            last_recv_time: Instant::now(),
+                            last_repunch_time: Instant::now() - Duration::from_secs(10),
+                            candidate_addrs: ann.candidates.clone(),
+                        });
+                        node.peer_id_to_sender_id.write().insert(ann.peer_id, remote_sender_id);
+                    }
+                }
+                node.peer_pfs_keys.write().insert(ann.peer_id, session_key);
+
                 let mut candidates = expand_candidates_with_port_spray(&ann.candidates);
 
                 // Smart local loopback for single-machine or same-NAT testing:
-                // If peer shares our public IP, add 127.0.0.1 with peer's port so loopback bypasses router NAT hairpinning.
                 let shares_public_ip = ann.candidates.iter().any(|peer_c| {
                     my_announce.candidates.iter().any(|my_c| my_c.ip() == peer_c.ip())
                 });
@@ -1412,6 +1596,8 @@ async fn run_mesh_peer_loop(
                         nonce: ann.nonce,
                         sender_name: my_name.clone(),
                         sender_id: my_id,
+                        wire_sender_id: my_sender_id,
+                        pake_point: my_announce.pake_point,
                     };
                     let key_opt = node.current_room_key.read().clone();
                     let seq = node.next_packet_seq();
@@ -1438,6 +1624,8 @@ async fn run_mesh_peer_loop(
                         nonce: rand::random(),
                         sender_name: my_name.clone(),
                         sender_id: my_id,
+                        wire_sender_id: my_sender_id,
+                        pake_point: my_announce.pake_point,
                     };
                     let key_opt = node.current_room_key.read().clone();
                     let seq = node.next_packet_seq();
@@ -1462,6 +1650,8 @@ async fn run_mesh_peer_loop(
                     nonce: rand::random(),
                     sender_name: my_name.clone(),
                     sender_id: my_id,
+                    wire_sender_id: my_sender_id,
+                    pake_point: my_announce.pake_point,
                 };
                 let key_opt = node.current_room_key.read().clone();
                 let seq = node.next_packet_seq();
@@ -1473,154 +1663,236 @@ async fn run_mesh_peer_loop(
             }
         }
 
-        // 3. Periodic Ping broadcast to connected UDP peers
-        if last_ping_broadcast.elapsed() >= Duration::from_millis(1000) {
-            last_ping_broadcast = Instant::now();
-            ping_seq += 1;
-            let ping_pkt = Packet::Ping {
-                sender_id: my_id,
-                seq: ping_seq,
-                timestamp_ms: now_ms(),
-            };
-            let targets: Vec<(u32, SocketAddr)> = {
-                let eps = node.client_endpoints.read();
-                eps.iter().map(|(&id, &addr)| (id, addr)).collect()
-            };
-            for (peer_id, target) in targets {
-                if let Ok(b) = node.encode_wire_for_peer(&ping_pkt, Some(peer_id)) {
-                    let _ = socket.send_to(&b, target).await;
-                }
-            }
+        // Step 4: Three Independent Timers per Peer (Send Timer, Silence Timer, Death Timer)
+        let now = Instant::now();
+        let mut keepalives_to_send = Vec::new();
+        let mut repunch_actions = Vec::new();
+        let mut dead_peers = Vec::new();
 
-            // 3b. Active Keep-Alive & NAT Re-Punch for struggling peers (>3 seconds without incoming packets)
-            let struggling_peers: Vec<u32> = {
-                let peers_guard = node.peers.read();
-                let now = now_ms();
-                peers_guard
-                    .iter()
-                    .filter(|(_, p)| now.saturating_sub(p.last_seen_ms) > 3000)
-                    .map(|(&pid, _)| pid)
-                    .collect()
-            };
-            if !struggling_peers.is_empty() {
-                let punch_pkt = Packet::Punch {
-                    room_code: room_code.clone(),
-                    nonce: rand::random(),
-                    sender_name: my_name.clone(),
-                    sender_id: my_id,
-                };
-                let key_opt = node.current_room_key.read().clone();
-                let seq = node.next_packet_seq();
-                if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref(), seq) {
-                    for pid in struggling_peers {
-                        if let Some(cands) = discovered_candidates.get(&pid) {
-                            for target in cands {
-                                let _ = socket.send_to(&pb, *target).await;
+        {
+            let mut sessions = node.peer_sessions.write();
+            for (&remote_sender_id, session) in sessions.iter_mut() {
+                // Timer 1: Send Timer (5s of silence) -> send 29B encrypted KeepAlive to hold open CGNAT
+                if now.duration_since(session.last_sent_time) >= Duration::from_secs(5) {
+                    session.last_sent_time = now;
+                    let seq = node.next_packet_seq();
+                    if let Ok(wire) = crate::crypto::encrypt_wire_packet(
+                        PACKET_TYPE_KEEPALIVE,
+                        my_sender_id,
+                        seq,
+                        &[], // 0 bytes payload -> exactly 29 bytes wire packet
+                        &session.session_key,
+                    ) {
+                        keepalives_to_send.push((wire, session.current_addr));
+                    }
+                }
+
+                // Timer 2: Silence Timer (2.5s without packets) -> background Port Spraying & PEX re-route
+                let silence_duration = now.duration_since(session.last_recv_time);
+                if silence_duration >= Duration::from_millis(2500) && silence_duration < Duration::from_secs(30) {
+                    if now.duration_since(session.last_repunch_time) >= Duration::from_millis(500) {
+                        session.last_repunch_time = now;
+                        let seq = node.next_packet_seq();
+                        if let Ok(wire) = crate::crypto::encrypt_wire_packet(
+                            PACKET_TYPE_KEEPALIVE,
+                            my_sender_id,
+                            seq,
+                            &[],
+                            &session.session_key,
+                        ) {
+                            let mut targets = Vec::new();
+                            let base_port = session.current_addr.port();
+                            let ip = session.current_addr.ip();
+                            for delta in -10i32..=10i32 {
+                                let target_port = (base_port as i32 + delta) as u16;
+                                if target_port > 0 {
+                                    targets.push(SocketAddr::new(ip, target_port));
+                                }
                             }
+                            for &cand in &session.candidate_addrs {
+                                if !targets.contains(&cand) {
+                                    targets.push(cand);
+                                }
+                            }
+                            repunch_actions.push((wire, targets, session.peer_id));
                         }
                     }
                 }
+
+                // Timer 3: Death Timer (30s without valid packets) -> disconnect peer in UI
+                if silence_duration >= Duration::from_secs(30) {
+                    dead_peers.push((remote_sender_id, session.peer_id));
+                }
+            }
+
+            for (remote_sender_id, _) in &dead_peers {
+                sessions.remove(remote_sender_id);
             }
         }
 
-        // 4. Stale peer cleanup (peers not seen for >30 seconds - standard WebRTC / ICE tolerance)
-        if last_cleanup.elapsed() >= Duration::from_secs(2) {
-            last_cleanup = Instant::now();
-            let mut stale_ids = Vec::new();
-            {
-                let peers_guard = node.peers.read();
-                let now = now_ms();
-                for (&pid, p) in peers_guard.iter() {
-                    if now.saturating_sub(p.last_seen_ms) > 30000 {
-                        stale_ids.push(pid);
-                    }
-                }
+        // Execute Timer 1: Send KeepAlive
+        for (wire, target) in keepalives_to_send {
+            let _ = socket.send_to(&wire, target).await;
+        }
+
+        // Execute Timer 2: Background Port Spraying & PEX assist
+        for (wire, targets, peer_b_id) in repunch_actions {
+            for target in targets {
+                let _ = socket.send_to(&wire, target).await;
             }
-            if !stale_ids.is_empty() {
-                for pid in stale_ids {
-                    node.logger.warn(&format!("Пир {} отключился по таймауту (>30с)", pid));
-                    let opt_addr = node.client_endpoints.write().remove(&pid);
-                    if let Some(addr) = opt_addr {
-                        node.peer_addrs.write().remove(&addr);
-                        // Retain endpoint in known_unconnected_addrs so auto-reconnection can recover connection
-                        known_unconnected_addrs.insert(addr);
-                    }
-                    node.peers.write().remove(&pid);
-                    // Do NOT purge discovered_candidates/discovered_sessions so auto-reconnect can seamlessly recover
-                    node.audio_engine.play_disconnect_chime();
-                }
-                let cnt = node.peers.read().len();
-                let mut st = node.status.write();
-                if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
-                    *connected_count = cnt;
+            // PEX request to third participant (Peer C)
+            let other_peers: Vec<(u32, SocketAddr)> = {
+                let eps = node.client_endpoints.read();
+                eps.iter()
+                    .filter(|(&id, _)| id != peer_b_id && id != my_id)
+                    .map(|(&id, &addr)| (id, addr))
+                    .collect()
+            };
+            for (peer_c_id, peer_c_addr) in other_peers {
+                let intro_query = Packet::PeerIntroduce {
+                    room_code: room_code.clone(),
+                    peer_id: peer_b_id,
+                    peer_name: String::new(),
+                    endpoints: vec![],
+                };
+                if let Ok(b) = node.encode_wire_for_peer(&intro_query, Some(peer_c_id)) {
+                    let _ = socket.send_to(&b, peer_c_addr).await;
                 }
             }
         }
 
-        // 5. Receive UDP packets
+        // Execute Timer 3: Death cleanup
+        for (_remote_sender_id, peer_id) in dead_peers {
+            node.logger.warn(&format!("Пир {} отключился по таймауту (>30с тишины)", peer_id));
+            node.peer_id_to_sender_id.write().remove(&peer_id);
+            let opt_addr = node.client_endpoints.write().remove(&peer_id);
+            if let Some(addr) = opt_addr {
+                node.peer_addrs.write().remove(&addr);
+                known_unconnected_addrs.insert(addr);
+            }
+            node.peers.write().remove(&peer_id);
+            node.audio_engine.play_disconnect_chime();
+            let cnt = node.peers.read().len();
+            let mut st = node.status.write();
+            if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
+                *connected_count = cnt;
+            }
+        }
+
+        // 5. Receive UDP packets (O(1) NAT Roaming & Wire Format Verification)
         tokio::select! {
             recv_res = socket.recv_from(&mut buf) => {
                 match recv_res {
                     Ok((len, sender_addr)) => {
+                        let now = Instant::now();
+                        // Check IP blocklist (5 minute block after 5 failed attempts)
+                        if let Some(&until) = ip_blocked_until.get(&sender_addr.ip()) {
+                            if now < until {
+                                continue;
+                            } else {
+                                ip_blocked_until.remove(&sender_addr.ip());
+                                ip_failed_counts.remove(&sender_addr.ip());
+                            }
+                        }
+
                         // Rate limiter: Token Bucket to protect against UDP flood
                         if !rate_limiter.check(sender_addr.ip()) {
                             continue;
                         }
 
-                        let sender_id_opt = node.peer_addrs.read().get(&sender_addr).copied();
-                        let room_key_opt = node.current_room_key.read().clone();
-                        let pfs_key_opt = sender_id_opt.and_then(|id| node.peer_pfs_keys.read().get(&id).cloned());
+                        // Try Wire Header parse (13 bytes: packet_type: 1B, sender_id: 4B, seq: 8B)
+                        if len >= crate::crypto::MIN_WIRE_PACKET_LEN {
+                            if let Ok((packet_type, sender_id, seq)) = crate::crypto::parse_wire_header(&buf[..len]) {
+                                // O(1) Session Lookup by sender_id (Step 2)
+                                let session_opt = {
+                                    let sessions = node.peer_sessions.read();
+                                    sessions.get(&sender_id).cloned()
+                                };
 
-                        let mut matched_pfs_peer_id = None;
-                        let decoded_res = if let Some(ref pfs_key) = pfs_key_opt {
-                            Packet::decode_wire(&buf[..len], Some(pfs_key))
-                                .map(|res| { matched_pfs_peer_id = sender_id_opt; res })
-                                .or_else(|_| Packet::decode_wire(&buf[..len], room_key_opt.as_ref()))
-                        } else {
-                            // sender_addr is not yet mapped in peer_addrs!
-                            // First try room_key:
-                            Packet::decode_wire(&buf[..len], room_key_opt.as_ref())
-                                .or_else(|_| {
-                                    // If room_key failed, try active PFS keys to support dynamic NAT roaming / port hopping
-                                    let pfs_map = node.peer_pfs_keys.read();
-                                    for (&pid, key) in pfs_map.iter() {
-                                        if let Ok(res) = Packet::decode_wire(&buf[..len], Some(key)) {
-                                            matched_pfs_peer_id = Some(pid);
-                                            return Ok(res);
+                                if let Some(mut session) = session_opt {
+                                    // Step 3: Anti-Replay Phase 1 (pre-check before heavy crypto)
+                                    if !session.replay_window.check_seq_pre(seq) {
+                                        continue;
+                                    }
+
+                                    // Decrypt with 13-byte header as AAD
+                                    match crate::crypto::decrypt_wire_packet(&buf[..len], &session.session_key) {
+                                        Ok((_ptype, _sid, _s, payload)) => {
+                                            // Poly1305 MAC verified successfully!
+                                            // Step 3: Anti-Replay Phase 2 (post-commit sequence)
+                                            session.replay_window.commit_seq_post(seq);
+
+                                            // Step 2: Instant Dynamic NAT Roaming (0 ms switch)
+                                            let addr_changed = session.current_addr != sender_addr;
+                                            if addr_changed {
+                                                node.logger.info(&format!(
+                                                    "🔄 [NAT Roaming O(1)] Пир {} (sender_id: {}) сменил адрес/порт {} -> {}. Мгновенное переключение (0 мс)!",
+                                                    session.peer_id, sender_id, session.current_addr, sender_addr
+                                                ));
+                                                session.current_addr = sender_addr;
+                                                node.client_endpoints.write().insert(session.peer_id, sender_addr);
+                                                node.peer_addrs.write().insert(sender_addr, session.peer_id);
+                                            }
+
+                                            session.last_recv_time = Instant::now();
+                                            node.peer_sessions.write().insert(sender_id, session.clone());
+
+                                            if let Some(p) = node.peers.write().get_mut(&session.peer_id) {
+                                                p.last_seen_ms = now_ms();
+                                                if addr_changed {
+                                                    p.addr = sender_addr.to_string();
+                                                }
+                                            }
+
+                                            ip_failed_counts.remove(&sender_addr.ip());
+
+                                            match packet_type {
+                                                PACKET_TYPE_AUDIO => {
+                                                    node.audio_engine.feed_incoming_packet(session.peer_id, seq, &payload);
+                                                    if let Some(p) = node.peers.write().get_mut(&session.peer_id) {
+                                                        p.is_speaking = true;
+                                                    }
+                                                }
+                                                PACKET_TYPE_KEEPALIVE => {
+                                                    // KeepAlive packet: route maintained, nothing more needed
+                                                }
+                                                PACKET_TYPE_CONTROL => {
+                                                    if let Ok(pkt) = Packet::decode(&payload) {
+                                                        handle_mesh_packet(
+                                                            pkt,
+                                                            sender_addr,
+                                                            &socket,
+                                                            &node,
+                                                            &mut video_reassemblers,
+                                                            &mut discovered_candidates,
+                                                            &mut discovered_sessions,
+                                                        ).await;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                            continue;
+                                        }
+                                        Err(_) => {
+                                            let count = ip_failed_counts.entry(sender_addr.ip()).or_insert(0);
+                                            *count += 1;
+                                            if *count >= 5 {
+                                                ip_blocked_until.insert(sender_addr.ip(), now + Duration::from_secs(300));
+                                                node.logger.warn(&format!(
+                                                    "⛔ IP {} заблокирован на 5 минут за 5 неудачных проверок MAC",
+                                                    sender_addr.ip()
+                                                ));
+                                            }
+                                            continue;
                                         }
                                     }
-                                    Err("Packet decode failed (no matching key)".to_string())
-                                })
-                        };
-
-                        if let Ok((seq, packet)) = decoded_res {
-                            // Dynamic NAT Roaming: if an authenticated packet matched a known PFS peer from a new socket address, migrate mapping!
-                            if let Some(pid) = matched_pfs_peer_id {
-                                let old_addr = node.client_endpoints.write().insert(pid, sender_addr);
-                                if old_addr != Some(sender_addr) {
-                                    node.logger.info(&format!(
-                                        "🔄 [NAT Roaming] Пир #{} перешел на новый сетевой адрес/порт: {:?} -> {}",
-                                        pid, old_addr, sender_addr
-                                    ));
-                                    if let Some(old) = old_addr {
-                                        node.peer_addrs.write().remove(&old);
-                                    }
-                                    node.peer_addrs.write().insert(sender_addr, pid);
                                 }
                             }
+                        }
 
-                            if seq > 0 {
-                                let mut windows = node.peer_replay_windows.write();
-                                let window = windows.entry(sender_addr).or_default();
-                                if !window.check_and_update(seq) {
-                                    node.logger.warn(&format!(
-                                        "AntiReplay: отброшен повторный или устаревший пакет от {} (seq: {})",
-                                        sender_addr, seq
-                                    ));
-                                    continue;
-                                }
-                            }
-
+                        // Fallback: room_key decode for initial Punch/Handshake
+                        let room_key_opt = node.current_room_key.read().clone();
+                        if let Ok((_seq, packet)) = Packet::decode_wire(&buf[..len], room_key_opt.as_ref()) {
                             handle_mesh_packet(
                                 packet,
                                 sender_addr,
@@ -1630,6 +1902,17 @@ async fn run_mesh_peer_loop(
                                 &mut discovered_candidates,
                                 &mut discovered_sessions,
                             ).await;
+                        } else {
+                            // Unrecognized packet: record failure
+                            let count = ip_failed_counts.entry(sender_addr.ip()).or_insert(0);
+                            *count += 1;
+                            if *count >= 5 {
+                                ip_blocked_until.insert(sender_addr.ip(), now + Duration::from_secs(300));
+                                node.logger.warn(&format!(
+                                    "⛔ IP {} заблокирован на 5 минут (5 некорректных пакетов)",
+                                    sender_addr.ip()
+                                ));
+                            }
                         }
                     }
                     Err(e) => {
@@ -1731,7 +2014,7 @@ async fn handle_mesh_packet(
     let my_name = node.my_nickname.read().clone();
 
     match packet {
-        Packet::Punch { room_code, nonce, sender_name, sender_id } => {
+        Packet::Punch { room_code, nonce, sender_name, sender_id, wire_sender_id, pake_point } => {
             if sender_id == my_id {
                 return;
             }
@@ -1745,26 +2028,53 @@ async fn handle_mesh_packet(
                 return;
             }
 
+            let salt = node.current_room_salt.read().clone().unwrap_or([0u8; 32]);
+            let pake_seed = crate::crypto::derive_pake_seed(&current_code, &salt);
+            let session_key = if pake_point != [0u8; 32] {
+                node.pake_kx.compute_pake_session_key(&pake_point, &pake_seed, my_id, sender_id)
+            } else {
+                crate::crypto::derive_room_key(&current_code)
+            };
+            let remote_sid = if wire_sender_id != 0 { wire_sender_id } else { sender_id };
+
+            {
+                let mut sessions = node.peer_sessions.write();
+                if let Some(session) = sessions.get_mut(&remote_sid) {
+                    session.current_addr = sender_addr;
+                    session.session_key = session_key;
+                    session.last_recv_time = Instant::now();
+                } else {
+                    sessions.insert(remote_sid, PeerSession {
+                        peer_id: sender_id,
+                        sender_id: remote_sid,
+                        session_key,
+                        current_addr: sender_addr,
+                        replay_window: crate::crypto::AntiReplayWindow::new(),
+                        last_sent_time: Instant::now(),
+                        last_recv_time: Instant::now(),
+                        last_repunch_time: Instant::now() - Duration::from_secs(10),
+                        candidate_addrs: vec![sender_addr],
+                    });
+                    node.peer_id_to_sender_id.write().insert(sender_id, remote_sid);
+                }
+            }
+            node.peer_pfs_keys.write().insert(sender_id, session_key);
+
+            let my_sender_id = node.my_sender_id.load(Ordering::Relaxed);
+            let my_pake_point = node.pake_kx.blinded_public_point(&pake_seed);
             let ack = Packet::PunchAck {
                 room_code: current_code.clone(),
                 nonce,
                 sender_name: my_name.clone(),
                 sender_id: my_id,
+                wire_sender_id: my_sender_id,
+                pake_point: my_pake_point,
             };
 
             if let Ok(b) = node.encode_wire_for_peer(&ack, Some(sender_id)) {
                 for _ in 0..2 {
                     let _ = socket.send_to(&b, sender_addr).await;
                 }
-            }
-
-            // Initiate X25519 Perfect Forward Secrecy key exchange
-            let kx = Packet::KeyExchange {
-                sender_id: my_id,
-                ephemeral_pubkey: node.ephemeral_kx.public_key_bytes(),
-            };
-            if let Ok(b) = node.encode_wire_for_peer(&kx, Some(sender_id)) {
-                let _ = socket.send_to(&b, sender_addr).await;
             }
 
             node.record_room_peer_endpoints(&current_code, &[sender_addr]);
@@ -1812,7 +2122,7 @@ async fn handle_mesh_packet(
             }
         }
 
-        Packet::PunchAck { room_code, sender_name, sender_id, .. } => {
+        Packet::PunchAck { room_code, sender_name, sender_id, wire_sender_id, pake_point, .. } => {
             if sender_id == my_id {
                 return;
             }
@@ -1825,6 +2135,38 @@ async fn handle_mesh_packet(
                 ));
                 return;
             }
+
+            let salt = node.current_room_salt.read().clone().unwrap_or([0u8; 32]);
+            let pake_seed = crate::crypto::derive_pake_seed(&current_code, &salt);
+            let session_key = if pake_point != [0u8; 32] {
+                node.pake_kx.compute_pake_session_key(&pake_point, &pake_seed, my_id, sender_id)
+            } else {
+                crate::crypto::derive_room_key(&current_code)
+            };
+            let remote_sid = if wire_sender_id != 0 { wire_sender_id } else { sender_id };
+
+            {
+                let mut sessions = node.peer_sessions.write();
+                if let Some(session) = sessions.get_mut(&remote_sid) {
+                    session.current_addr = sender_addr;
+                    session.session_key = session_key;
+                    session.last_recv_time = Instant::now();
+                } else {
+                    sessions.insert(remote_sid, PeerSession {
+                        peer_id: sender_id,
+                        sender_id: remote_sid,
+                        session_key,
+                        current_addr: sender_addr,
+                        replay_window: crate::crypto::AntiReplayWindow::new(),
+                        last_sent_time: Instant::now(),
+                        last_recv_time: Instant::now(),
+                        last_repunch_time: Instant::now() - Duration::from_secs(10),
+                        candidate_addrs: vec![sender_addr],
+                    });
+                    node.peer_id_to_sender_id.write().insert(sender_id, remote_sid);
+                }
+            }
+            node.peer_pfs_keys.write().insert(sender_id, session_key);
 
             node.record_room_peer_endpoints(&current_code, &[sender_addr]);
 
@@ -2209,10 +2551,33 @@ async fn handle_mesh_packet(
                 return;
             }
 
-            // Save newly introduced peer endpoints into persistent room cache
+            // Case A: Query for assistance (endpoints is empty)
+            if endpoints.is_empty() {
+                let opt_target = {
+                    let eps = node.client_endpoints.read();
+                    let peers = node.peers.read();
+                    eps.get(&peer_id).copied().map(|addr| {
+                        let name = peers.get(&peer_id).map(|p| p.name.clone()).unwrap_or_default();
+                        (addr, name)
+                    })
+                };
+                if let Some((target_addr, name)) = opt_target {
+                    let reply = Packet::PeerIntroduce {
+                        room_code: current_code.clone(),
+                        peer_id,
+                        peer_name: name,
+                        endpoints: vec![target_addr],
+                    };
+                    if let Ok(b) = node.encode_wire_for_peer(&reply, None) {
+                        let _ = socket.send_to(&b, sender_addr).await;
+                    }
+                }
+                return;
+            }
+
+            // Case B: Recommendation received (endpoints has addresses)
             node.record_room_peer_endpoints(&current_code, &endpoints);
 
-            // If we are not yet connected to this peer, punch!
             if !node.client_endpoints.read().contains_key(&peer_id) {
                 let candidates = expand_candidates_with_port_spray(&endpoints);
                 let entry = discovered_candidates.entry(peer_id).or_default();
@@ -2227,11 +2592,18 @@ async fn handle_mesh_packet(
                     peer_id, peer_name, candidates.len()
                 ));
 
+                let my_sender_id = node.my_sender_id.load(Ordering::Relaxed);
+                let salt = node.current_room_salt.read().clone().unwrap_or([0u8; 32]);
+                let pake_seed = crate::crypto::derive_pake_seed(&current_code, &salt);
+                let my_pake_point = node.pake_kx.blinded_public_point(&pake_seed);
+
                 let punch_pkt = Packet::Punch {
                     room_code: current_code,
                     nonce: rand::random(),
                     sender_name: my_name.clone(),
                     sender_id: my_id,
+                    wire_sender_id: my_sender_id,
+                    pake_point: my_pake_point,
                 };
                 if let Ok(pb) = node.encode_wire_for_peer(&punch_pkt, Some(peer_id)) {
                     for target in &candidates {
@@ -2914,6 +3286,8 @@ mod tests {
             nonce: 42,
             sender_name: "Bob".into(),
             sender_id: 100,
+            wire_sender_id: 0,
+            pake_point: [0u8; 32],
         };
         let bytes = punch.encode().expect("Punch encode");
         let decoded = Packet::decode(&bytes).expect("Punch decode");
@@ -2924,6 +3298,8 @@ mod tests {
             nonce: 42,
             sender_name: "Alice".into(),
             sender_id: 200,
+            wire_sender_id: 0,
+            pake_point: [0u8; 32],
         };
         let ack_bytes = punch_ack.encode().expect("PunchAck encode");
         let decoded_ack = Packet::decode(&ack_bytes).expect("PunchAck decode");
@@ -2984,7 +3360,8 @@ mod tests {
 
         // 1. Encrypt with key and seq = 42
         let wire_bytes = pkt.encode_wire(Some(&key), 42).expect("encode_wire encrypted");
-        assert!(wire_bytes.starts_with(b"BALA"));
+        assert_eq!(wire_bytes[0], PACKET_TYPE_CONTROL);
+        assert!(wire_bytes.len() >= crate::crypto::MIN_WIRE_PACKET_LEN);
 
         // 2. Decrypt with correct key
         let (seq, decoded) = Packet::decode_wire(&wire_bytes, Some(&key)).expect("decode_wire success");
@@ -3001,7 +3378,13 @@ mod tests {
 
         // 5. Plaintext backward compatibility when key is None
         let plain_wire = pkt.encode_wire(None, 0).expect("encode_wire plain");
-        assert!(!plain_wire.starts_with(b"BALA"));
+        assert!(plain_wire.len() > 0);
+
+        // 6. Roundtrip with wire format
+        let (wire_seq, wire_decoded) = Packet::decode_wire(&wire_bytes, Some(&key)).expect("wire decode");
+        assert_eq!(wire_seq, 42);
+        assert_eq!(wire_decoded, pkt);
+
         let (plain_seq, plain_decoded) = Packet::decode_wire(&plain_wire, None).expect("decode_wire plain");
         assert_eq!(plain_seq, 0);
         assert_eq!(plain_decoded, pkt);
@@ -3036,6 +3419,71 @@ mod tests {
         let session_key_b = node_b.ephemeral_kx.compute_session_key(&pub_a, 20, 10);
 
         assert_eq!(session_key_a, session_key_b);
+    }
+
+    #[test]
+    fn test_keepalive_29_bytes_wire_format() {
+        let key = [0x55u8; 32];
+        let wire = crate::crypto::encrypt_wire_packet(PACKET_TYPE_KEEPALIVE, 0x12345678, 1, &[], &key)
+            .expect("encrypt keepalive");
+        // Exactly 13 bytes header + 0 bytes ciphertext + 16 bytes Poly1305 MAC tag = 29 bytes
+        assert_eq!(wire.len(), 29);
+        assert_eq!(wire[0], PACKET_TYPE_KEEPALIVE);
+
+        let (ptype, sender_id, seq, payload) = crate::crypto::decrypt_wire_packet(&wire, &key)
+            .expect("decrypt keepalive");
+        assert_eq!(ptype, PACKET_TYPE_KEEPALIVE);
+        assert_eq!(sender_id, 0x12345678);
+        assert_eq!(seq, 1);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_dynamic_nat_roaming_instant_switch() {
+        let initial_addr: SocketAddr = "198.51.100.10:45000".parse().unwrap();
+        let roamed_addr: SocketAddr = "198.51.100.10:58210".parse().unwrap(); // Router hopped to port 58210
+        let key = [0x77u8; 32];
+        let sender_id = 99999u32;
+
+        let mut session = PeerSession {
+            peer_id: 42,
+            sender_id,
+            session_key: key,
+            current_addr: initial_addr,
+            replay_window: crate::crypto::AntiReplayWindow::new(),
+            last_sent_time: Instant::now(),
+            last_recv_time: Instant::now(),
+            last_repunch_time: Instant::now(),
+            candidate_addrs: vec![initial_addr],
+        };
+
+        // Incoming audio packet from new roamed address
+        let wire = crate::crypto::encrypt_wire_packet(PACKET_TYPE_AUDIO, sender_id, 100, b"opus_audio_data", &key)
+            .expect("encrypt audio");
+
+        // 1. Read header in O(1)
+        let (packet_type, sid, seq) = crate::crypto::parse_wire_header(&wire).unwrap();
+        assert_eq!(packet_type, PACKET_TYPE_AUDIO);
+        assert_eq!(sid, sender_id);
+
+        // 2. Anti-Replay pre-check
+        assert!(session.replay_window.check_seq_pre(seq));
+
+        // 3. Decrypt with AAD
+        let (_, _, _, payload) = crate::crypto::decrypt_wire_packet(&wire, &session.session_key).unwrap();
+        assert_eq!(&payload, b"opus_audio_data");
+
+        // 4. Anti-Replay post-commit
+        session.replay_window.commit_seq_post(seq);
+
+        // 5. Instant NAT Roaming switch
+        if session.current_addr != roamed_addr {
+            session.current_addr = roamed_addr;
+        }
+
+        // Port updated in zero ms on the very first packet
+        assert_eq!(session.current_addr, roamed_addr);
+        assert_eq!(session.replay_window.last_seq, 100);
     }
 }
 

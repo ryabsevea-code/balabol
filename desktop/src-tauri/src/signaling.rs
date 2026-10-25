@@ -30,6 +30,14 @@ pub struct MeshAnnounce {
     pub peer_name: String,
     pub candidates: Vec<std::net::SocketAddr>,
     pub nonce: u64,
+    #[serde(default)]
+    pub sender_id: u32,
+    #[serde(default)]
+    pub room_salt: [u8; 32],
+    #[serde(default)]
+    pub pake_point: [u8; 32],
+    #[serde(default)]
+    pub confirmation_tag: [u8; 16],
 }
 
 pub struct MeshSignalingSession {
@@ -55,8 +63,62 @@ impl Drop for MeshSignalingSession {
     }
 }
 
-pub struct Signaling;
+/// Rate limiter for Nostr handshake requests:
+/// Max 1 attempt per second per pubkey.
+/// After 5 failed MAC / decryption attempts, block pubkey for 5 minutes (300 seconds).
+#[derive(Default)]
+pub struct NostrRateLimiter {
+    last_seen: std::collections::HashMap<String, std::time::Instant>,
+    failed_counts: std::collections::HashMap<String, u32>,
+    blocked_until: std::collections::HashMap<String, std::time::Instant>,
+}
 
+impl NostrRateLimiter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn check_allowed(&mut self, pubkey: &str, now: std::time::Instant) -> bool {
+        if let Some(&until) = self.blocked_until.get(pubkey) {
+            if now < until {
+                return false;
+            } else {
+                self.blocked_until.remove(pubkey);
+                self.failed_counts.remove(pubkey);
+            }
+        }
+
+        if let Some(&last) = self.last_seen.get(pubkey) {
+            if now.duration_since(last) < Duration::from_secs(1) {
+                return false;
+            }
+        }
+        self.last_seen.insert(pubkey.to_string(), now);
+        true
+    }
+
+    pub fn record_failure(&mut self, pubkey: &str, now: std::time::Instant) -> bool {
+        let count = self.failed_counts.entry(pubkey.to_string()).or_insert(0);
+        *count += 1;
+        if *count >= 5 {
+            self.blocked_until.insert(pubkey.to_string(), now + Duration::from_secs(300));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn record_success(&mut self, pubkey: &str) {
+        self.failed_counts.remove(pubkey);
+    }
+
+    #[allow(dead_code)]
+    pub fn is_blocked(&self, pubkey: &str, now: std::time::Instant) -> bool {
+        self.blocked_until.get(pubkey).map(|&u| now < u).unwrap_or(false)
+    }
+}
+
+pub struct Signaling;
 
 impl Signaling {
     /// Starts symmetric decentralized Full Mesh signaling for a room.
@@ -67,13 +129,25 @@ impl Signaling {
         logger: &AppLogger,
     ) -> Result<MeshSignalingSession, String> {
         let clean_code = sanitize_room_code(room_code);
+        let (prefix, _pin) = crate::crypto::split_room_code(&clean_code);
         let room_key = crate::crypto::derive_room_key(&clean_code);
-        let room_tag = crate::crypto::derive_nostr_topic(&clean_code);
+
+        // Calculate current and previous UTC hour slots for blind routing
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let curr_hour = now_secs / 3600;
+        let prev_hour = curr_hour.saturating_sub(1);
+        let topic_curr = crate::crypto::derive_blind_nostr_topic(&prefix, curr_hour);
+        let topic_prev = crate::crypto::derive_blind_nostr_topic(&prefix, prev_hour);
 
         logger.info(&format!(
-            "Mesh сигналинг: защищенный запуск пула из {} WSS-релеев (тег: {}, шифрование: E2EE)...",
-            RELAYS.len(),
-            room_tag
+            "Mesh сигналинг: слепой роутинг (префикс: '{}', теги часа: [{}, {}], релеев: {})...",
+            prefix,
+            topic_curr,
+            topic_prev,
+            RELAYS.len()
         ));
 
         let (tx, rx) = tokio::sync::mpsc::channel::<MeshAnnounce>(64);
@@ -81,6 +155,7 @@ impl Signaling {
         let last_announced = Arc::new(parking_lot::Mutex::new(
             std::collections::HashMap::<u32, (u64, tokio::time::Instant)>::new(),
         ));
+        let rate_limiter = Arc::new(parking_lot::Mutex::new(NostrRateLimiter::new()));
 
         let keypair = {
             let mut rng = secp256k1::rand::rng();
@@ -96,11 +171,13 @@ impl Signaling {
         for &relay in RELAYS {
             let tx = tx.clone();
             let shutdown = shutdown.clone();
-            let room_tag = room_tag.clone();
+            let topic_curr = topic_curr.clone();
+            let topic_prev = topic_prev.clone();
             let announce_payload = encrypted_announce.clone();
             let room_key = room_key;
             let keypair = keypair;
             let last_announced = last_announced.clone();
+            let rate_limiter = rate_limiter.clone();
             let my_id = my_announce.peer_id;
             let logger = logger.clone();
 
@@ -126,7 +203,7 @@ impl Signaling {
 
                     let sub_id = format!("sub_mesh_{}", rand::random::<u32>());
                     let sub_filter = json!(["REQ", sub_id, {
-                        "#t": [room_tag],
+                        "#t": [topic_curr.clone(), topic_prev.clone()],
                         "limit": 30
                     }]);
                     if ws.send(WsMessage::Text(sub_filter.to_string().into())).await.is_err() {
@@ -139,7 +216,7 @@ impl Signaling {
                         &keypair,
                         1,
                         vec![
-                            vec!["t".into(), room_tag.clone()],
+                            vec!["t".into(), topic_curr.clone()],
                             vec!["type".into(), "mesh_announce".into()],
                         ],
                         &announce_payload,
@@ -164,7 +241,7 @@ impl Signaling {
                                 &keypair,
                                 1,
                                 vec![
-                                    vec!["t".into(), room_tag.clone()],
+                                    vec!["t".into(), topic_curr.clone()],
                                     vec!["type".into(), "mesh_announce".into()],
                                 ],
                                 &announce_payload,
@@ -189,47 +266,69 @@ impl Signaling {
                                 if let Ok(parsed) = serde_json::from_str::<Value>(&txt) {
                                     if let Some(arr) = parsed.as_array() {
                                         if arr.len() >= 3 && arr[0] == "EVENT" {
+                                            let pubkey = arr[2].get("pubkey").and_then(|p| p.as_str()).unwrap_or("");
+                                            let now = std::time::Instant::now();
+
+                                            // Rate limiting & DoS defense: max 1/sec per pubkey, block after 5 failed decrypts
+                                            let allowed = rate_limiter.lock().check_allowed(pubkey, now);
+                                            if !allowed {
+                                                continue;
+                                            }
+
                                             if let Some(content) = arr[2].get("content").and_then(|c| c.as_str()) {
-                                                if let Ok(raw_content) = crate::crypto::decrypt_string(content, &room_key) {
-                                                    if let Ok(incoming) = serde_json::from_str::<MeshAnnounce>(&raw_content) {
-                                                    if incoming.peer_id != my_id {
-                                                        let should_emit = {
-                                                            let mut map = last_announced.lock();
-                                                            match map.get_mut(&incoming.peer_id) {
-                                                                Some((last_nonce, last_time)) => {
-                                                                    if *last_nonce != incoming.nonce
-                                                                        || last_time.elapsed() >= Duration::from_secs(15)
-                                                                    {
-                                                                        *last_nonce = incoming.nonce;
-                                                                        *last_time = tokio::time::Instant::now();
-                                                                        true
-                                                                    } else {
-                                                                        false
+                                                match crate::crypto::decrypt_string(content, &room_key) {
+                                                    Ok(raw_content) => {
+                                                        rate_limiter.lock().record_success(pubkey);
+                                                        if let Ok(incoming) = serde_json::from_str::<MeshAnnounce>(&raw_content) {
+                                                            if incoming.peer_id != my_id {
+                                                                let should_emit = {
+                                                                    let mut map = last_announced.lock();
+                                                                    match map.get_mut(&incoming.peer_id) {
+                                                                        Some((last_nonce, last_time)) => {
+                                                                            if *last_nonce != incoming.nonce
+                                                                                || last_time.elapsed() >= Duration::from_secs(15)
+                                                                            {
+                                                                                *last_nonce = incoming.nonce;
+                                                                                *last_time = tokio::time::Instant::now();
+                                                                                true
+                                                                            } else {
+                                                                                false
+                                                                            }
+                                                                        }
+                                                                        None => {
+                                                                            map.insert(
+                                                                                incoming.peer_id,
+                                                                                (incoming.nonce, tokio::time::Instant::now()),
+                                                                            );
+                                                                            true
+                                                                        }
                                                                     }
-                                                                }
-                                                                None => {
-                                                                    map.insert(
+                                                                };
+                                                                if should_emit {
+                                                                    logger.info(&format!(
+                                                                        "📡 [Mesh Сигналинг] Получен анонс от пира {} ('{}', sender_id: {}) через {}, кандидаты: {:?}",
                                                                         incoming.peer_id,
-                                                                        (incoming.nonce, tokio::time::Instant::now()),
-                                                                    );
-                                                                    true
+                                                                        incoming.peer_name,
+                                                                        incoming.sender_id,
+                                                                        relay,
+                                                                        incoming.candidates
+                                                                    ));
+                                                                    let _ = tx.send(incoming).await;
                                                                 }
                                                             }
-                                                        };
-                                                        if should_emit {
-                                                            logger.info(&format!(
-                                                                "📡 [Mesh Сигналинг] Получен анонс от пира {} ('{}') через {}, кандидаты: {:?}",
-                                                                incoming.peer_id,
-                                                                incoming.peer_name,
-                                                                relay,
-                                                                incoming.candidates
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        let newly_blocked = rate_limiter.lock().record_failure(pubkey, now);
+                                                        if newly_blocked {
+                                                            logger.warn(&format!(
+                                                                "⛔ [Mesh Сигналинг] Pubkey {} заблокирован на 5 минут (5 неудачных попыток расшифровки/MAC)",
+                                                                pubkey
                                                             ));
-                                                            let _ = tx.send(incoming).await;
                                                         }
                                                     }
                                                 }
                                             }
-                                        }
                                         }
                                     }
                                 }
@@ -320,5 +419,36 @@ mod tests {
         assert!(evt.get("id").is_some());
         assert!(evt.get("sig").is_some());
         assert_eq!(evt.get("content").unwrap(), "test_content");
+    }
+
+    #[test]
+    fn test_nostr_rate_limiter() {
+        let mut limiter = NostrRateLimiter::new();
+        let pubkey = "test_pubkey_12345";
+        let t0 = std::time::Instant::now();
+
+        // First attempt allowed
+        assert!(limiter.check_allowed(pubkey, t0));
+
+        // Rapid second attempt (< 1s) must be rate-limited
+        let t_fast = t0 + Duration::from_millis(200);
+        assert!(!limiter.check_allowed(pubkey, t_fast));
+
+        // Attempt after >= 1s allowed
+        let t1 = t0 + Duration::from_millis(1100);
+        assert!(limiter.check_allowed(pubkey, t1));
+
+        // Test 5 failed attempts leading to block
+        for i in 1..=4 {
+            let t = t1 + Duration::from_secs(i * 2);
+            assert!(!limiter.record_failure(pubkey, t));
+        }
+        let t5 = t1 + Duration::from_secs(10);
+        let newly_blocked = limiter.record_failure(pubkey, t5);
+        assert!(newly_blocked);
+        assert!(limiter.is_blocked(pubkey, t5 + Duration::from_secs(100)));
+
+        // Unblocked after 300 seconds
+        assert!(!limiter.is_blocked(pubkey, t5 + Duration::from_secs(301)));
     }
 }
