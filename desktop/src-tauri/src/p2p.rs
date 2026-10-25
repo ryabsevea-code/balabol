@@ -432,6 +432,42 @@ pub fn save_room_peer_cache(cache: &HashMap<String, HashSet<SocketAddr>>) {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct NodeIdentity {
+    peer_id: u32,
+    sender_id: u32,
+}
+
+fn get_identity_file_path() -> std::path::PathBuf {
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let dir = std::path::PathBuf::from(local_app_data).join("Balabol");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join("balabol_node_identity.json")
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("balabol_node_identity.json")
+    }
+}
+
+pub fn get_or_create_node_identity() -> (u32, u32) {
+    let path = get_identity_file_path();
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Ok(ident) = serde_json::from_slice::<NodeIdentity>(&bytes) {
+            if ident.peer_id >= 2 && ident.sender_id != 0 {
+                return (ident.peer_id, ident.sender_id);
+            }
+        }
+    }
+    let peer_id = (rand::random::<u32>() % 900_000 + 10_000).max(2);
+    let sender_id = rand::random::<u32>() | 1;
+    let ident = NodeIdentity { peer_id, sender_id };
+    if let Ok(json) = serde_json::to_vec_pretty(&ident) {
+        let _ = std::fs::write(&path, json);
+    }
+    (peer_id, sender_id)
+}
+
 #[derive(Clone)]
 pub struct P2pNode {
     logger: AppLogger,
@@ -994,18 +1030,30 @@ impl P2pNode {
     pub async fn broadcast_packet(&self, packet: &Packet) {
         let sock_opt = self.active_socket.read().clone();
         if let Some(sock) = sock_opt {
-            let client_addrs: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
-            for addr in client_addrs {
-                let peer_id_opt = self.peer_addrs.read().get(&addr).copied();
-                if let Ok(bytes) = self.encode_wire_for_peer(packet, peer_id_opt) {
-                    let _ = sock.send_to(&bytes, addr).await;
+            let targets: Vec<(SocketAddr, u32)> = {
+                let sessions = self.peer_sessions.read();
+                sessions.values().map(|s| (s.current_addr, s.peer_id)).collect()
+            };
+            if !targets.is_empty() {
+                for (addr, peer_id) in targets {
+                    if let Ok(bytes) = self.encode_wire_for_peer(packet, Some(peer_id)) {
+                        let _ = sock.send_to(&bytes, addr).await;
+                    }
                 }
-            }
-            let host_addr_opt = *self.host_socket_addr.read();
-            if let Some(host_addr) = host_addr_opt {
-                let host_id = self.current_host_id.load(Ordering::Relaxed);
-                if let Ok(bytes) = self.encode_wire_for_peer(packet, Some(host_id)) {
-                    let _ = sock.send_to(&bytes, host_addr).await;
+            } else {
+                let client_addrs: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
+                for addr in client_addrs {
+                    let peer_id_opt = self.peer_addrs.read().get(&addr).copied();
+                    if let Ok(bytes) = self.encode_wire_for_peer(packet, peer_id_opt) {
+                        let _ = sock.send_to(&bytes, addr).await;
+                    }
+                }
+                let host_addr_opt = *self.host_socket_addr.read();
+                if let Some(host_addr) = host_addr_opt {
+                    let host_id = self.current_host_id.load(Ordering::Relaxed);
+                    if let Ok(bytes) = self.encode_wire_for_peer(packet, Some(host_id)) {
+                        let _ = sock.send_to(&bytes, host_addr).await;
+                    }
                 }
             }
         }
@@ -1015,8 +1063,11 @@ impl P2pNode {
         const CHUNK_SIZE: usize = 1200;
         let chunk_total = ((bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE) as u32;
         let sock_opt = self.active_socket.read().clone();
-        let endpoints: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
         if let Some(sock) = sock_opt {
+            let targets: Vec<(SocketAddr, u32)> = {
+                let sessions = self.peer_sessions.read();
+                sessions.values().map(|s| (s.current_addr, s.peer_id)).collect()
+            };
             for (idx, chunk) in bytes.chunks(CHUNK_SIZE).enumerate() {
                 let pkt = Packet::ImageChunk {
                     image_id: image_id.to_string(),
@@ -1024,10 +1075,19 @@ impl P2pNode {
                     chunk_total,
                     data: chunk.to_vec(),
                 };
-                for &addr in &endpoints {
-                    let peer_id_opt = self.peer_addrs.read().get(&addr).copied();
-                    if let Ok(b) = self.encode_wire_for_peer(&pkt, peer_id_opt) {
-                        let _ = sock.send_to(&b, addr).await;
+                if !targets.is_empty() {
+                    for &(addr, peer_id) in &targets {
+                        if let Ok(b) = self.encode_wire_for_peer(&pkt, Some(peer_id)) {
+                            let _ = sock.send_to(&b, addr).await;
+                        }
+                    }
+                } else {
+                    let endpoints: Vec<SocketAddr> = self.client_endpoints.read().values().cloned().collect();
+                    for &addr in &endpoints {
+                        let peer_id_opt = self.peer_addrs.read().get(&addr).copied();
+                        if let Ok(b) = self.encode_wire_for_peer(&pkt, peer_id_opt) {
+                            let _ = sock.send_to(&b, addr).await;
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(3)).await;
@@ -1213,8 +1273,7 @@ impl P2pNode {
             .find(|a| !a.ip().is_loopback() && a.to_string() != local_str.clone().unwrap_or_default())
             .map(|a| a.to_string());
 
-        let my_id = (rand::random::<u32>() % 900_000 + 10_000).max(2);
-        let my_sender_id = rand::random::<u32>() | 1;
+        let (my_id, my_sender_id) = get_or_create_node_identity();
         self.my_sender_id.store(my_sender_id, Ordering::SeqCst);
         let session_id = format!("{:08x}", rand::random::<u32>());
         let my_nonce = rand::random::<u64>();
@@ -1224,20 +1283,12 @@ impl P2pNode {
         *self.my_nickname.write() = nickname.clone();
         self.current_host_id.store(my_id, Ordering::SeqCst);
         *self.backup_host_id.write() = None;
-        let room_key = crate::crypto::derive_room_key(&clean_code);
-        *self.current_room_key.write() = Some(room_key);
-        *self.current_room_code.write() = Some(clean_code.clone());
 
-        let room_salt = if is_creator {
-            let mut s = [0u8; 32];
-            use rand::RngCore;
-            rand::thread_rng().fill_bytes(&mut s);
-            *self.current_room_salt.write() = Some(s);
-            s
-        } else {
-            self.current_room_salt.read().clone().unwrap_or([0u8; 32])
-        };
+        let room_salt = crate::crypto::derive_deterministic_room_salt(&clean_code);
+        *self.current_room_salt.write() = Some(room_salt);
         let pake_seed = crate::crypto::derive_pake_seed(&clean_code, &room_salt);
+        *self.current_room_key.write() = Some(pake_seed);
+        *self.current_room_code.write() = Some(clean_code.clone());
         let pake_point = self.pake_kx.blinded_public_point(&pake_seed);
 
         *self.status.write() = ConnectionStatus::Connected {
@@ -1331,8 +1382,6 @@ async fn run_mesh_peer_loop(
     let mut video_reassemblers: HashMap<u32, VideoReassembler> = HashMap::new();
     let mut last_known_punch = Instant::now();
     let mut rate_limiter = IpRateLimiter::new(2000.0, 1500.0);
-    let mut ip_failed_counts: HashMap<IpAddr, u32> = HashMap::new();
-    let mut ip_blocked_until: HashMap<IpAddr, Instant> = HashMap::new();
 
     // Discovered remote peers' candidates: peer_id -> Vec<SocketAddr>
     let mut discovered_candidates: HashMap<u32, Vec<SocketAddr>> = HashMap::new();
@@ -1399,13 +1448,20 @@ async fn run_mesh_peer_loop(
     let audio_tx_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(10));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut audio_seq = 0u64;
+        let mut audio_frame_seq = 0u32;
 
         while !node_audio.shutdown_signal.load(Ordering::Relaxed) {
             interval.tick().await;
             let my_sender_id = node_audio.my_sender_id.load(Ordering::Relaxed);
             for audio_payload in node_audio.audio_engine.pop_outgoing_packets() {
-                audio_seq += 1;
+                audio_frame_seq = audio_frame_seq.wrapping_add(1);
+                let transport_seq = node_audio.next_packet_seq();
+
+                // Pack [audio_frame_seq: 4B] + audio_payload for JitterBuffer
+                let mut framed_payload = Vec::with_capacity(4 + audio_payload.len());
+                framed_payload.extend_from_slice(&audio_frame_seq.to_be_bytes());
+                framed_payload.extend_from_slice(&audio_payload);
+
                 let targets: Vec<(SocketAddr, [u8; 32])> = {
                     let now = Instant::now();
                     let mut sessions = node_audio.peer_sessions.write();
@@ -1425,8 +1481,8 @@ async fn run_mesh_peer_loop(
                             if let Ok(b) = crate::crypto::encrypt_wire_packet(
                                 PACKET_TYPE_AUDIO,
                                 my_sender_id,
-                                audio_seq,
-                                &audio_payload,
+                                transport_seq,
+                                &framed_payload,
                                 &key,
                             ) {
                                 let _ = audio_sock.send_to(&b, caddr).await;
@@ -1438,8 +1494,8 @@ async fn run_mesh_peer_loop(
                         if let Ok(b) = crate::crypto::encrypt_wire_packet(
                             PACKET_TYPE_AUDIO,
                             my_sender_id,
-                            audio_seq,
-                            &audio_payload,
+                            transport_seq,
+                            &framed_payload,
                             &session_key,
                         ) {
                             let _ = audio_sock.send_to(&b, caddr).await;
@@ -1775,8 +1831,10 @@ async fn run_mesh_peer_loop(
                 node.peer_addrs.write().remove(&addr);
                 known_unconnected_addrs.insert(addr);
             }
-            node.peers.write().remove(&peer_id);
-            node.audio_engine.play_disconnect_chime();
+            let was_connected = node.peers.write().remove(&peer_id).is_some();
+            if was_connected {
+                node.audio_engine.play_disconnect_chime();
+            }
             let cnt = node.peers.read().len();
             let mut st = node.status.write();
             if let ConnectionStatus::Connected { connected_count, .. } = &mut *st {
@@ -1789,17 +1847,6 @@ async fn run_mesh_peer_loop(
             recv_res = socket.recv_from(&mut buf) => {
                 match recv_res {
                     Ok((len, sender_addr)) => {
-                        let now = Instant::now();
-                        // Check IP blocklist (5 minute block after 5 failed attempts)
-                        if let Some(&until) = ip_blocked_until.get(&sender_addr.ip()) {
-                            if now < until {
-                                continue;
-                            } else {
-                                ip_blocked_until.remove(&sender_addr.ip());
-                                ip_failed_counts.remove(&sender_addr.ip());
-                            }
-                        }
-
                         // Rate limiter: Token Bucket to protect against UDP flood
                         if !rate_limiter.check(sender_addr.ip()) {
                             continue;
@@ -1849,11 +1896,18 @@ async fn run_mesh_peer_loop(
                                                 }
                                             }
 
-                                            ip_failed_counts.remove(&sender_addr.ip());
-
                                             match packet_type {
                                                 PACKET_TYPE_AUDIO => {
-                                                    node.audio_engine.feed_incoming_packet(session.peer_id, seq, &payload);
+                                                    let (frame_seq, audio_data) = if payload.len() >= 5
+                                                        && (payload[4] == crate::audio::CODEC_PCM24K
+                                                            || payload[4] == crate::audio::CODEC_PCM16K)
+                                                    {
+                                                        let fseq = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) as u64;
+                                                        (fseq, &payload[4..])
+                                                    } else {
+                                                        (seq, payload.as_slice())
+                                                    };
+                                                    node.audio_engine.feed_incoming_packet(session.peer_id, frame_seq, audio_data);
                                                     if let Some(p) = node.peers.write().get_mut(&session.peer_id) {
                                                         p.is_speaking = true;
                                                     }
@@ -1879,15 +1933,8 @@ async fn run_mesh_peer_loop(
                                             continue;
                                         }
                                         Err(_) => {
-                                            let count = ip_failed_counts.entry(sender_addr.ip()).or_insert(0);
-                                            *count += 1;
-                                            if *count >= 5 {
-                                                ip_blocked_until.insert(sender_addr.ip(), now + Duration::from_secs(300));
-                                                node.logger.warn(&format!(
-                                                    "⛔ IP {} заблокирован на 5 минут за 5 неудачных проверок MAC",
-                                                    sender_addr.ip()
-                                                ));
-                                            }
+                                            // Invalid MAC / decryption error (e.g. peer restarted and session keys differ):
+                                            // Silently drop without banning IP
                                             continue;
                                         }
                                     }
@@ -1908,16 +1955,8 @@ async fn run_mesh_peer_loop(
                                 &mut discovered_sessions,
                             ).await;
                         } else {
-                            // Unrecognized packet: record failure
-                            let count = ip_failed_counts.entry(sender_addr.ip()).or_insert(0);
-                            *count += 1;
-                            if *count >= 5 {
-                                ip_blocked_until.insert(sender_addr.ip(), now + Duration::from_secs(300));
-                                node.logger.warn(&format!(
-                                    "⛔ IP {} заблокирован на 5 минут (5 некорректных пакетов)",
-                                    sender_addr.ip()
-                                ));
-                            }
+                            // Unrecognized packet or legacy format: silently drop without banning IP
+                            continue;
                         }
                     }
                     Err(e) => {
@@ -2033,7 +2072,23 @@ async fn handle_mesh_packet(
                 return;
             }
 
-            let salt = node.current_room_salt.read().clone().unwrap_or([0u8; 32]);
+            // Clean up any stale ghost sessions from the same IP with a different peer_id
+            let stale_ids: Vec<u32> = {
+                let peers_guard = node.peers.read();
+                peers_guard.iter()
+                    .filter(|(&pid, p)| pid != sender_id && p.addr.starts_with(&format!("{}:", sender_addr.ip())))
+                    .map(|(&pid, _)| pid)
+                    .collect()
+            };
+            for stale_id in stale_ids {
+                node.peers.write().remove(&stale_id);
+                node.client_endpoints.write().remove(&stale_id);
+                if let Some(sid) = node.peer_id_to_sender_id.write().remove(&stale_id) {
+                    node.peer_sessions.write().remove(&sid);
+                }
+            }
+
+            let salt = node.current_room_salt.read().clone().unwrap_or_else(|| crate::crypto::derive_deterministic_room_salt(&current_code));
             let pake_seed = crate::crypto::derive_pake_seed(&current_code, &salt);
             let session_key = if pake_point != [0u8; 32] {
                 node.pake_kx.compute_pake_session_key(&pake_point, &pake_seed, my_id, sender_id)
@@ -2141,7 +2196,23 @@ async fn handle_mesh_packet(
                 return;
             }
 
-            let salt = node.current_room_salt.read().clone().unwrap_or([0u8; 32]);
+            // Clean up any stale ghost sessions from the same IP with a different peer_id
+            let stale_ids: Vec<u32> = {
+                let peers_guard = node.peers.read();
+                peers_guard.iter()
+                    .filter(|(&pid, p)| pid != sender_id && p.addr.starts_with(&format!("{}:", sender_addr.ip())))
+                    .map(|(&pid, _)| pid)
+                    .collect()
+            };
+            for stale_id in stale_ids {
+                node.peers.write().remove(&stale_id);
+                node.client_endpoints.write().remove(&stale_id);
+                if let Some(sid) = node.peer_id_to_sender_id.write().remove(&stale_id) {
+                    node.peer_sessions.write().remove(&sid);
+                }
+            }
+
+            let salt = node.current_room_salt.read().clone().unwrap_or_else(|| crate::crypto::derive_deterministic_room_salt(&current_code));
             let pake_seed = crate::crypto::derive_pake_seed(&current_code, &salt);
             let session_key = if pake_point != [0u8; 32] {
                 node.pake_kx.compute_pake_session_key(&pake_point, &pake_seed, my_id, sender_id)
@@ -2940,21 +3011,11 @@ pub fn configure_socket_physical_if(socket: &UdpSocket, logger: &AppLogger) -> O
         let _ = setsockopt(raw_sock, 0xFFFF, 0x1001, &buf_size as *const _ as *const u8, 4);
 
         if let Some((if_idx, opt_ip)) = find_best_physical_interface() {
-            let if_index_be: u32 = if_idx.to_be();
-            let res = setsockopt(
-                raw_sock,
-                0,
-                31,
-                &if_index_be as *const _ as *const u8,
-                4,
-            );
-            if res == 0 {
-                logger.info(&format!(
-                    "UDP сокет привязан к физическому интерфейсу #{} (LAN IP: {:?})",
-                    if_idx,
-                    opt_ip.unwrap_or(Ipv4Addr::UNSPECIFIED)
-                ));
-            }
+            logger.info(&format!(
+                "Обнаружен основной сетевой интерфейс #{} (LAN IP: {:?}), сокет слушает 0.0.0.0:0 для поддержки VPN и физических сетей",
+                if_idx,
+                opt_ip.unwrap_or(Ipv4Addr::UNSPECIFIED)
+            ));
             return opt_ip;
         }
     }
@@ -3114,7 +3175,6 @@ pub fn find_all_local_physical_ips() -> Vec<Ipv4Addr> {
     }
 
     let blacklist = &[
-        "tap", "tun", "wireguard", "wintun", "v2ray", "sing-box", "openvpn", "tailscale",
         "vethernet", "hyper-v", "virtual", "docker", "vmware", "virtualbox", "wsl",
         "loopback", "bluetooth", "pseudo", "teredo", "isatap", "npcap", "pcap",
     ];

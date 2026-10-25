@@ -379,7 +379,11 @@
         const newChat = await invoke("get_chat_messages");
         if (newChat.length !== chatMessages.length) {
           const lastMsg = newChat[newChat.length - 1];
-          if (lastMsg && !lastMsg.is_me) {
+          const isFresh =
+            lastMsg &&
+            !lastMsg.is_me &&
+            Date.now() - (lastMsg.timestamp_ms || 0) < 6000;
+          if (isFresh && (chatMessages.length > 0 || newChat.length === 1)) {
             invoke("play_notification_sound", { soundType: "chat" }).catch(
               () => {},
             );

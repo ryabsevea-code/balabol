@@ -161,6 +161,7 @@ impl Signaling {
             let mut rng = secp256k1::rand::rng();
             Keypair::new(&mut rng)
         };
+        let my_pubkey_hex = keypair.x_only_public_key().0.to_string();
 
         let announce_json = serde_json::to_string(&my_announce).unwrap_or_default();
         let encrypted_announce = crate::crypto::encrypt_string(&announce_json, &room_key)
@@ -176,6 +177,7 @@ impl Signaling {
             let announce_payload = encrypted_announce.clone();
             let room_key = room_key;
             let keypair = keypair;
+            let my_pubkey_hex = my_pubkey_hex.clone();
             let last_announced = last_announced.clone();
             let rate_limiter = rate_limiter.clone();
             let my_id = my_announce.peer_id;
@@ -201,10 +203,17 @@ impl Signaling {
                         }
                     };
 
+                    let now_ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let since_ts = now_ts.saturating_sub(90);
+
                     let sub_id = format!("sub_mesh_{}", rand::random::<u32>());
                     let sub_filter = json!(["REQ", sub_id, {
                         "#t": [topic_curr.clone(), topic_prev.clone()],
-                        "limit": 30
+                        "since": since_ts,
+                        "limit": 10
                     }]);
                     if ws.send(WsMessage::Text(sub_filter.to_string().into())).await.is_err() {
                         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -253,7 +262,7 @@ impl Signaling {
                             last_pub = tokio::time::Instant::now();
                         }
 
-                        if last_ping.elapsed() >= Duration::from_secs(12) {
+                        if last_ping.elapsed() >= Duration::from_secs(30) {
                             if ws.send(WsMessage::Ping(vec![].into())).await.is_err() {
                                 break;
                             }
@@ -261,70 +270,86 @@ impl Signaling {
                         }
 
                         let read_fut = tokio::time::timeout(Duration::from_millis(150), ws.next());
-                        if let Ok(Some(Ok(msg))) = read_fut.await {
-                            if let WsMessage::Text(txt) = msg {
-                                if let Ok(parsed) = serde_json::from_str::<Value>(&txt) {
-                                    if let Some(arr) = parsed.as_array() {
-                                        if arr.len() >= 3 && arr[0] == "EVENT" {
-                                            let pubkey = arr[2].get("pubkey").and_then(|p| p.as_str()).unwrap_or("");
-                                            let now = std::time::Instant::now();
+                        match read_fut.await {
+                            Ok(Some(Ok(msg))) => {
+                                if let WsMessage::Text(txt) = msg {
+                                    if let Ok(parsed) = serde_json::from_str::<Value>(&txt) {
+                                        if let Some(arr) = parsed.as_array() {
+                                            if arr.len() >= 3 && arr[0] == "EVENT" {
+                                                let pubkey = arr[2].get("pubkey").and_then(|p| p.as_str()).unwrap_or("");
+                                                if pubkey == my_pubkey_hex {
+                                                    continue; // Discard our own echo
+                                                }
 
-                                            // Rate limiting & DoS defense: max 1/sec per pubkey, block after 5 failed decrypts
-                                            let allowed = rate_limiter.lock().check_allowed(pubkey, now);
-                                            if !allowed {
-                                                continue;
-                                            }
+                                                if let Some(created_at) = arr[2].get("created_at").and_then(|c| c.as_u64()) {
+                                                    let current_epoch_sec = std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap_or_default()
+                                                        .as_secs();
+                                                    if created_at + 90 < current_epoch_sec {
+                                                        continue; // Discard stale announcements older than 90 seconds
+                                                    }
+                                                }
 
-                                            if let Some(content) = arr[2].get("content").and_then(|c| c.as_str()) {
-                                                match crate::crypto::decrypt_string(content, &room_key) {
-                                                    Ok(raw_content) => {
-                                                        rate_limiter.lock().record_success(pubkey);
-                                                        if let Ok(incoming) = serde_json::from_str::<MeshAnnounce>(&raw_content) {
-                                                            if incoming.peer_id != my_id {
-                                                                let should_emit = {
-                                                                    let mut map = last_announced.lock();
-                                                                    match map.get_mut(&incoming.peer_id) {
-                                                                        Some((last_nonce, last_time)) => {
-                                                                            if *last_nonce != incoming.nonce
-                                                                                || last_time.elapsed() >= Duration::from_secs(15)
-                                                                            {
-                                                                                *last_nonce = incoming.nonce;
-                                                                                *last_time = tokio::time::Instant::now();
+                                                let now = std::time::Instant::now();
+
+                                                // Rate limiting & DoS defense: max 1/sec per pubkey, block after 5 failed decrypts
+                                                let allowed = rate_limiter.lock().check_allowed(pubkey, now);
+                                                if !allowed {
+                                                    continue;
+                                                }
+
+                                                if let Some(content) = arr[2].get("content").and_then(|c| c.as_str()) {
+                                                    match crate::crypto::decrypt_string(content, &room_key) {
+                                                        Ok(raw_content) => {
+                                                            rate_limiter.lock().record_success(pubkey);
+                                                            if let Ok(incoming) = serde_json::from_str::<MeshAnnounce>(&raw_content) {
+                                                                if incoming.peer_id != my_id {
+                                                                    let should_emit = {
+                                                                        let mut map = last_announced.lock();
+                                                                        match map.get_mut(&incoming.peer_id) {
+                                                                            Some((last_nonce, last_time)) => {
+                                                                                if *last_nonce != incoming.nonce
+                                                                                    || last_time.elapsed() >= Duration::from_secs(15)
+                                                                                {
+                                                                                    *last_nonce = incoming.nonce;
+                                                                                    *last_time = tokio::time::Instant::now();
+                                                                                    true
+                                                                                } else {
+                                                                                    false
+                                                                                }
+                                                                            }
+                                                                            None => {
+                                                                                map.insert(
+                                                                                    incoming.peer_id,
+                                                                                    (incoming.nonce, tokio::time::Instant::now()),
+                                                                                );
                                                                                 true
-                                                                            } else {
-                                                                                false
                                                                             }
                                                                         }
-                                                                        None => {
-                                                                            map.insert(
-                                                                                incoming.peer_id,
-                                                                                (incoming.nonce, tokio::time::Instant::now()),
-                                                                            );
-                                                                            true
-                                                                        }
+                                                                    };
+                                                                    if should_emit {
+                                                                        logger.info(&format!(
+                                                                            "📡 [Mesh Сигналинг] Получен анонс от пира {} ('{}', sender_id: {}) через {}, кандидаты: {:?}",
+                                                                            incoming.peer_id,
+                                                                            incoming.peer_name,
+                                                                            incoming.sender_id,
+                                                                            relay,
+                                                                            incoming.candidates
+                                                                        ));
+                                                                        let _ = tx.send(incoming).await;
                                                                     }
-                                                                };
-                                                                if should_emit {
-                                                                    logger.info(&format!(
-                                                                        "📡 [Mesh Сигналинг] Получен анонс от пира {} ('{}', sender_id: {}) через {}, кандидаты: {:?}",
-                                                                        incoming.peer_id,
-                                                                        incoming.peer_name,
-                                                                        incoming.sender_id,
-                                                                        relay,
-                                                                        incoming.candidates
-                                                                    ));
-                                                                    let _ = tx.send(incoming).await;
                                                                 }
                                                             }
                                                         }
-                                                    }
-                                                    Err(_) => {
-                                                        let newly_blocked = rate_limiter.lock().record_failure(pubkey, now);
-                                                        if newly_blocked {
-                                                            logger.warn(&format!(
-                                                                "⛔ [Mesh Сигналинг] Pubkey {} заблокирован на 5 минут (5 неудачных попыток расшифровки/MAC)",
-                                                                pubkey
-                                                            ));
+                                                        Err(_) => {
+                                                            let newly_blocked = rate_limiter.lock().record_failure(pubkey, now);
+                                                            if newly_blocked {
+                                                                logger.warn(&format!(
+                                                                    "⛔ [Mesh Сигналинг] Pubkey {} заблокирован на 5 минут (5 неудачных попыток расшифровки/MAC)",
+                                                                    pubkey
+                                                                ));
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -332,6 +357,13 @@ impl Signaling {
                                         }
                                     }
                                 }
+                            }
+                            Ok(Some(Err(_))) | Ok(None) => {
+                                // Relay closed the connection or stream errored, break to reconnect cleanly
+                                break;
+                            }
+                            Err(_) => {
+                                // 150ms timeout: idle poll, continue normal loop
                             }
                         }
                     }

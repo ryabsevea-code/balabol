@@ -67,6 +67,29 @@ pub fn derive_room_key(room_code: &str) -> [u8; 32] {
     derive_pake_seed(room_code, &s32)
 }
 
+/// Derives a deterministic hourly salt for Argon2id PAKE:
+/// SHA256("balabol_pake_salt_" + room_code + current_utc_date_hour)
+/// Ensures all participants (creator and guests, even when reconnecting from cache)
+/// derive the exact same salt and pake_seed from the very first millisecond.
+pub fn derive_deterministic_room_salt(room_code: &str) -> [u8; 32] {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let hour_slot = now_secs / 3600;
+    derive_room_salt_for_slot(room_code, hour_slot)
+}
+
+pub fn derive_room_salt_for_slot(room_code: &str, hour_slot: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"balabol_pake_salt_v2:");
+    hasher.update(room_code.as_bytes());
+    hasher.update(&hour_slot.to_be_bytes());
+    let mut salt = [0u8; 32];
+    salt.copy_from_slice(&hasher.finalize());
+    salt
+}
+
 /// Curve25519 Password-Authenticated Key Exchange (PAKE) helper.
 /// Blinds ephemeral public points with Argon2id seed stream.
 #[derive(Clone)]
@@ -180,13 +203,18 @@ impl PakeKeyExchange {
 // Alias for EphemeralKeyExchange
 pub type EphemeralKeyExchange = PakeKeyExchange;
 
-/// RFC 6479 Sliding Anti-Replay Window (128 packets) with Two-Phase Verification.
+/// RFC 6479 Sliding Anti-Replay Window (1024 packets = 16 * 64-bit words) with Two-Phase Verification.
+/// Large 1024-packet capacity guarantees bursts of image chunks (70-150 packets) or NAT punch bursts
+/// never push parallel incoming voice packets out of the sliding window.
 /// Phase 1 (pre-decrypt, read-only): checks if seq is acceptable before running heavy crypto.
 /// Phase 2 (post-decrypt, commit): updates last_seq and bitmap strictly after Poly1305 MAC succeeds.
+pub const REPLAY_WINDOW_WORDS: usize = 16;
+pub const REPLAY_WINDOW_BITS: u64 = (REPLAY_WINDOW_WORDS as u64) * 64; // 1024 packets
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AntiReplayWindow {
     pub last_seq: u64,
-    pub bitmap: u128,
+    pub bitmap: [u64; REPLAY_WINDOW_WORDS],
 }
 
 impl Default for AntiReplayWindow {
@@ -199,7 +227,7 @@ impl AntiReplayWindow {
     pub fn new() -> Self {
         Self {
             last_seq: 0,
-            bitmap: 0,
+            bitmap: [0u64; REPLAY_WINDOW_WORDS],
         }
     }
 
@@ -210,14 +238,15 @@ impl AntiReplayWindow {
             return false;
         }
         if seq > self.last_seq {
-            return true; // Packet is ahead (even if jump +5000), allow to Poly1305 verification
+            return true; // Packet is ahead, allow to Poly1305 verification
         }
         let diff = self.last_seq - seq;
-        if diff >= 128 {
-            return false; // Too old, outside 128-packet window
+        if diff >= REPLAY_WINDOW_BITS {
+            return false; // Too old, outside 1024-packet window
         }
-        let bit = 1u128 << diff;
-        (self.bitmap & bit) == 0 // Reject if already seen
+        let word_idx = (diff / 64) as usize;
+        let bit_idx = (diff % 64) as usize;
+        (self.bitmap[word_idx] & (1u64 << bit_idx)) == 0 // Reject if already seen
     }
 
     /// Phase 2: Post-decryption commit.
@@ -225,16 +254,46 @@ impl AntiReplayWindow {
     pub fn commit_seq_post(&mut self, seq: u64) {
         if seq > self.last_seq {
             let diff = seq - self.last_seq;
-            if diff >= 128 {
-                self.bitmap = 1;
+            if diff >= REPLAY_WINDOW_BITS {
+                self.bitmap = [0u64; REPLAY_WINDOW_WORDS];
+                self.bitmap[0] = 1;
             } else {
-                self.bitmap = (self.bitmap << diff) | 1;
+                let word_shift = (diff / 64) as usize;
+                let bit_shift = (diff % 64) as usize;
+
+                // Step 1: Word shift towards higher index (older sequence positions)
+                if word_shift > 0 {
+                    for i in (0..REPLAY_WINDOW_WORDS).rev() {
+                        self.bitmap[i] = if i >= word_shift {
+                            self.bitmap[i - word_shift]
+                        } else {
+                            0
+                        };
+                    }
+                }
+
+                // Step 2: Bit shift across word boundaries
+                if bit_shift > 0 {
+                    for i in (0..REPLAY_WINDOW_WORDS).rev() {
+                        let high = self.bitmap[i] << bit_shift;
+                        let low = if i > 0 {
+                            self.bitmap[i - 1] >> (64 - bit_shift)
+                        } else {
+                            0
+                        };
+                        self.bitmap[i] = high | low;
+                    }
+                }
+
+                self.bitmap[0] |= 1; // Mark newly advanced last_seq
             }
             self.last_seq = seq;
         } else {
             let diff = self.last_seq - seq;
-            if diff < 128 {
-                self.bitmap |= 1u128 << diff;
+            if diff < REPLAY_WINDOW_BITS {
+                let word_idx = (diff / 64) as usize;
+                let bit_idx = (diff % 64) as usize;
+                self.bitmap[word_idx] |= 1u64 << bit_idx;
             }
         }
     }
@@ -460,24 +519,31 @@ mod tests {
         assert!(window.check_seq_pre(100));
         window.commit_seq_post(100);
 
-        // Older packet seq 50 (within 128 window of 100: 100 - 50 = 50 < 128) must be accepted
+        // Older packet seq 50 (within 1024 window of 100: 100 - 50 = 50 < 1024) must be accepted
         assert!(window.check_seq_pre(50));
         window.commit_seq_post(50);
 
         // Duplicate seq 50 rejected
         assert!(!window.check_seq_pre(50));
 
+        // Jump ahead to seq 1000: seq 500 (diff = 500 < 1024) should still be accepted!
+        assert!(window.check_seq_pre(1000));
+        window.commit_seq_post(1000);
+        assert!(window.check_seq_pre(500));
+        window.commit_seq_post(500);
+        assert!(!window.check_seq_pre(500));
+
         // Large jump forward after 5-10 seconds network pause (+5000)
-        assert!(window.check_seq_pre(5100));
-        window.commit_seq_post(5100);
+        assert!(window.check_seq_pre(6100));
+        window.commit_seq_post(6100);
 
-        // seq 50 is now too old (5100 - 50 = 5050 >= 128) -> rejected
-        assert!(!window.check_seq_pre(50));
+        // seq 500 is now too old (6100 - 500 = 5600 >= 1024) -> rejected
+        assert!(!window.check_seq_pre(500));
 
-        // Packet 5050 is within 128 window of 5100 (5100 - 5050 = 50 < 128) -> accepted
-        assert!(window.check_seq_pre(5050));
-        window.commit_seq_post(5050);
-        assert!(!window.check_seq_pre(5050)); // Duplicate rejected
+        // Packet 5500 is within 1024 window of 6100 (6100 - 5500 = 600 < 1024) -> accepted
+        assert!(window.check_seq_pre(5500));
+        window.commit_seq_post(5500);
+        assert!(!window.check_seq_pre(5500)); // Duplicate rejected
     }
 
     #[test]
