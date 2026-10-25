@@ -1182,8 +1182,13 @@ impl P2pNode {
             room_code, clean_code, nickname
         ));
 
+        let display_code = if clean_code.len() == 6 {
+            format!("{} {} {}", &clean_code[0..2], &clean_code[2..4], &clean_code[4..6])
+        } else {
+            clean_code.clone()
+        };
         *self.status.write() = ConnectionStatus::Connecting {
-            target_str: format!("Комната {}", clean_code),
+            target_str: format!("Комната {}", display_code),
             attempt: 1,
             max_attempts: 1,
             mode: "Поиск участников через релей-пул...".into(),

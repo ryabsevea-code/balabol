@@ -95,6 +95,28 @@
   let isEditingNick = false;
   let roomCodeInput = "";
 
+  function formatRoomCode(code) {
+    if (!code) return "";
+    const digits = String(code).replace(/\D/g, "").slice(0, 6);
+    if (!digits) return code;
+    return digits.match(/.{1,2}/g)?.join(" ") || digits;
+  }
+
+  function handleRoomCodeInput(e) {
+    const raw = e.target.value;
+    const digits = raw.replace(/\D/g, "").slice(0, 6);
+    roomCodeInput = formatRoomCode(digits);
+    e.target.value = roomCodeInput;
+  }
+
+  function handleRoomCodeKeyDown(e) {
+    if (e.key === "Enter") {
+      handleJoinRoom();
+    } else if (e.key === " ") {
+      e.preventDefault();
+    }
+  }
+
   function getInitials(name) {
     if (!name || !name.trim()) return "??";
     const parts = name.trim().split(/\s+/);
@@ -635,8 +657,9 @@
   }
 
   async function handleJoinRoom() {
-    if (!roomCodeInput.trim()) {
-      alert("Пожалуйста, введите 6-значный код комнаты (например, 742918)");
+    const cleanCode = roomCodeInput.replace(/\D/g, "");
+    if (cleanCode.length !== 6) {
+      alert("Пожалуйста, введите 6-значный код комнаты (например, 74 29 18)");
       return;
     }
 
@@ -661,7 +684,7 @@
     try {
       saveNickname(currentNick);
       await invoke("join_room", {
-        roomCode: roomCodeInput.trim(),
+        roomCode: cleanCode,
         nickname: currentNick,
       });
       showConnectModal = false;
@@ -1029,7 +1052,7 @@
         >
           <div class="w-2 h-2 rounded-full bg-purple-400 animate-pulse"></div>
           Комната:<span class="font-mono font-bold text-white tracking-widest"
-            >{status.room_code || ""}</span
+            >{formatRoomCode(status.room_code)}</span
           >
         </div>
         <button
@@ -1234,13 +1257,14 @@
                 <input
                   type="text"
                   bind:value={roomCodeInput}
-                  placeholder="6 цифр кода"
-                  maxlength="8"
+                  on:input={handleRoomCodeInput}
+                  on:keydown={handleRoomCodeKeyDown}
+                  placeholder="11 22 33"
                   class="w-full bg-[#101116] border border-[#282b36] rounded-lg px-3 py-1.5 text-white font-mono text-center tracking-widest text-sm focus:outline-none focus:border-emerald-500"
                 />
                 <button
                   on:click={handleJoinRoom}
-                  disabled={isSubmitting || !roomCodeInput.trim()}
+                  disabled={isSubmitting || roomCodeInput.replace(/\D/g, "").length < 6}
                   class="w-full py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white rounded-lg text-xs font-semibold transition shadow-md shadow-emerald-600/20"
                 >
                   Войти в звонок
@@ -1273,10 +1297,10 @@
                 <span
                   class="text-4xl font-mono font-extrabold text-white tracking-[0.25em]"
                 >
-                  {status.room_code || "------"}
+                  {formatRoomCode(status.room_code) || "-- -- --"}
                 </span>
                 <button
-                  on:click={() => copyText(status.room_code, "code")}
+                  on:click={() => copyText(formatRoomCode(status.room_code), "code")}
                   class="p-2.5 bg-purple-600 hover:bg-purple-500 text-white rounded-xl transition shadow-md"
                   title="Скопировать код"
                 >
@@ -1436,7 +1460,7 @@
                                 <span>Код этой комнаты:</span>
                                 <span
                                   class="font-mono font-extrabold text-white text-base tracking-widest"
-                                  >{status.room_code}</span
+                                  >{formatRoomCode(status.room_code)}</span
                                 >
                               </div>
                               <div class="text-[11px] text-[#6b6f7e]">
@@ -1496,7 +1520,7 @@
 
                             <button
                               on:click={() =>
-                                copyText(status.room_code, "room_code_banner")}
+                                copyText(formatRoomCode(status.room_code), "room_code_banner")}
                               class="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-semibold flex items-center gap-2 transition shadow-md shadow-purple-600/20 cursor-pointer"
                               title="Скопировать код комнаты в буфер обмена"
                             >
@@ -1691,7 +1715,7 @@
                             {#if status.room_code}
                               <button
                                 on:click={() =>
-                                  copyText(status.room_code, "invite_code")}
+                                  copyText(formatRoomCode(status.room_code), "invite_code")}
                                 class="px-3.5 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition shadow cursor-pointer"
                               >
                                 {#if copiedItem === "invite_code"}
@@ -1699,7 +1723,7 @@
                                   <span>Скопировано!</span>
                                 {:else}
                                   <Copy class="w-3.5 h-3.5" />
-                                  <span>Код: {status.room_code}</span>
+                                  <span>Код: {formatRoomCode(status.room_code)}</span>
                                 {/if}
                               </button>
                             {/if}
@@ -2142,12 +2166,14 @@
               <input
                 id="room-code-input-modal"
                 bind:value={roomCodeInput}
-                placeholder="Например, 742918"
+                on:input={handleRoomCodeInput}
+                on:keydown={handleRoomCodeKeyDown}
+                placeholder="Например, 11 22 33"
                 class="w-full bg-[#101116] border border-[#282b36] rounded-lg px-3 py-2 text-white font-mono text-center text-base tracking-widest focus:outline-none focus:border-blue-500"
               />
             </div>
             <button
-              disabled={isSubmitting || !roomCodeInput.trim()}
+              disabled={isSubmitting || roomCodeInput.replace(/\D/g, "").length < 6}
               on:click={handleJoinRoom}
               class="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white rounded-lg font-semibold transition shadow-md shadow-emerald-600/20"
             >
