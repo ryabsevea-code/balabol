@@ -1491,9 +1491,39 @@ async fn run_mesh_peer_loop(
                     let _ = socket.send_to(&b, target).await;
                 }
             }
+
+            // 3b. Active Keep-Alive & NAT Re-Punch for struggling peers (>3 seconds without incoming packets)
+            let struggling_peers: Vec<u32> = {
+                let peers_guard = node.peers.read();
+                let now = now_ms();
+                peers_guard
+                    .iter()
+                    .filter(|(_, p)| now.saturating_sub(p.last_seen_ms) > 3000)
+                    .map(|(&pid, _)| pid)
+                    .collect()
+            };
+            if !struggling_peers.is_empty() {
+                let punch_pkt = Packet::Punch {
+                    room_code: room_code.clone(),
+                    nonce: rand::random(),
+                    sender_name: my_name.clone(),
+                    sender_id: my_id,
+                };
+                let key_opt = node.current_room_key.read().clone();
+                let seq = node.next_packet_seq();
+                if let Ok(pb) = punch_pkt.encode_wire(key_opt.as_ref(), seq) {
+                    for pid in struggling_peers {
+                        if let Some(cands) = discovered_candidates.get(&pid) {
+                            for target in cands {
+                                let _ = socket.send_to(&pb, *target).await;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        // 4. Stale peer cleanup (peers not seen for >12 seconds)
+        // 4. Stale peer cleanup (peers not seen for >30 seconds - standard WebRTC / ICE tolerance)
         if last_cleanup.elapsed() >= Duration::from_secs(2) {
             last_cleanup = Instant::now();
             let mut stale_ids = Vec::new();
@@ -1501,14 +1531,14 @@ async fn run_mesh_peer_loop(
                 let peers_guard = node.peers.read();
                 let now = now_ms();
                 for (&pid, p) in peers_guard.iter() {
-                    if now.saturating_sub(p.last_seen_ms) > 12000 {
+                    if now.saturating_sub(p.last_seen_ms) > 30000 {
                         stale_ids.push(pid);
                     }
                 }
             }
             if !stale_ids.is_empty() {
                 for pid in stale_ids {
-                    node.logger.warn(&format!("Пир {} отключился по таймауту (>12с)", pid));
+                    node.logger.warn(&format!("Пир {} отключился по таймауту (>30с)", pid));
                     let opt_addr = node.client_endpoints.write().remove(&pid);
                     if let Some(addr) = opt_addr {
                         node.peer_addrs.write().remove(&addr);
@@ -1516,8 +1546,7 @@ async fn run_mesh_peer_loop(
                         known_unconnected_addrs.insert(addr);
                     }
                     node.peers.write().remove(&pid);
-                    discovered_candidates.remove(&pid);
-                    discovered_sessions.remove(&pid);
+                    // Do NOT purge discovered_candidates/discovered_sessions so auto-reconnect can seamlessly recover
                     node.audio_engine.play_disconnect_chime();
                 }
                 let cnt = node.peers.read().len();
@@ -1542,14 +1571,44 @@ async fn run_mesh_peer_loop(
                         let room_key_opt = node.current_room_key.read().clone();
                         let pfs_key_opt = sender_id_opt.and_then(|id| node.peer_pfs_keys.read().get(&id).cloned());
 
+                        let mut matched_pfs_peer_id = None;
                         let decoded_res = if let Some(ref pfs_key) = pfs_key_opt {
                             Packet::decode_wire(&buf[..len], Some(pfs_key))
+                                .map(|res| { matched_pfs_peer_id = sender_id_opt; res })
                                 .or_else(|_| Packet::decode_wire(&buf[..len], room_key_opt.as_ref()))
                         } else {
+                            // sender_addr is not yet mapped in peer_addrs!
+                            // First try room_key:
                             Packet::decode_wire(&buf[..len], room_key_opt.as_ref())
+                                .or_else(|_| {
+                                    // If room_key failed, try active PFS keys to support dynamic NAT roaming / port hopping
+                                    let pfs_map = node.peer_pfs_keys.read();
+                                    for (&pid, key) in pfs_map.iter() {
+                                        if let Ok(res) = Packet::decode_wire(&buf[..len], Some(key)) {
+                                            matched_pfs_peer_id = Some(pid);
+                                            return Ok(res);
+                                        }
+                                    }
+                                    Err("Packet decode failed (no matching key)".to_string())
+                                })
                         };
 
                         if let Ok((seq, packet)) = decoded_res {
+                            // Dynamic NAT Roaming: if an authenticated packet matched a known PFS peer from a new socket address, migrate mapping!
+                            if let Some(pid) = matched_pfs_peer_id {
+                                let old_addr = node.client_endpoints.write().insert(pid, sender_addr);
+                                if old_addr != Some(sender_addr) {
+                                    node.logger.info(&format!(
+                                        "🔄 [NAT Roaming] Пир #{} перешел на новый сетевой адрес/порт: {:?} -> {}",
+                                        pid, old_addr, sender_addr
+                                    ));
+                                    if let Some(old) = old_addr {
+                                        node.peer_addrs.write().remove(&old);
+                                    }
+                                    node.peer_addrs.write().insert(sender_addr, pid);
+                                }
+                            }
+
                             if seq > 0 {
                                 let mut windows = node.peer_replay_windows.write();
                                 let window = windows.entry(sender_addr).or_default();
@@ -1823,10 +1882,13 @@ async fn handle_mesh_packet(
 
         Packet::Ping { sender_id, seq, timestamp_ms } => {
             if sender_id != my_id {
+                node.client_endpoints.write().insert(sender_id, sender_addr);
+                node.peer_addrs.write().insert(sender_addr, sender_id);
                 {
                     let mut peers_guard = node.peers.write();
                     if let Some(peer) = peers_guard.get_mut(&sender_id) {
                         peer.last_seen_ms = now_ms();
+                        peer.addr = sender_addr.to_string();
                     }
                 }
                 let pong = Packet::Pong {
@@ -1842,17 +1904,22 @@ async fn handle_mesh_packet(
 
         Packet::Pong { sender_id, timestamp_ms, .. } => {
             if sender_id != my_id {
+                node.client_endpoints.write().insert(sender_id, sender_addr);
+                node.peer_addrs.write().insert(sender_addr, sender_id);
                 let rtt = (now_ms().saturating_sub(timestamp_ms) as u32).min(9999);
                 let mut peers_guard = node.peers.write();
                 if let Some(peer) = peers_guard.get_mut(&sender_id) {
                     peer.ping_ms = rtt;
                     peer.last_seen_ms = now_ms();
+                    peer.addr = sender_addr.to_string();
                 }
             }
         }
 
         Packet::AudioData { sender_id, seq, data } => {
             if sender_id != my_id {
+                node.client_endpoints.write().insert(sender_id, sender_addr);
+                node.peer_addrs.write().insert(sender_addr, sender_id);
                 {
                     let mut peers_guard = node.peers.write();
                     if let Some(peer) = peers_guard.get_mut(&sender_id) {
